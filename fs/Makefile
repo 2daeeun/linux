@@ -102,6 +102,9 @@ obj-$(CONFIG_QNX6FS_FS)		+= qnx6/
 obj-$(CONFIG_AUTOFS_FS)		+= autofs/
 obj-$(CONFIG_ADFS_FS)		+= adfs/
 obj-$(CONFIG_FUSE_FS)		+= fuse/
+# Ensure fs/fuse/ is descended into (and its built-in.a linked into
+# vmlinux) for the always-built-in extfuse.o even when CONFIG_FUSE_FS=m.
+obj-$(CONFIG_EXTFUSE)		+= fuse/
 obj-$(CONFIG_OVERLAY_FS)	+= overlayfs/
 obj-$(CONFIG_ORANGEFS_FS)       += orangefs/
 obj-$(CONFIG_UDF_FS)		+= udf/

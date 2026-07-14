@@ -1072,6 +1072,7 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_SK_LOOKUP,
 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
 	BPF_PROG_TYPE_NETFILTER,
+	BPF_PROG_TYPE_EXTFUSE,
 	__MAX_BPF_PROG_TYPE
 };
 
@@ -5870,6 +5871,24 @@ union bpf_attr {
  *		0 on success.
  *
  *		**-ENOENT** if the bpf_local_storage cannot be found.
+ *
+ * long bpf_extfuse_read_args(void *ctx, u32 type, void *dst, u32 size)
+ *	Description
+ *		Copy the ExtFUSE request field selected by *type* into *dst*.
+ *		The full *size* byte destination is initialized on every return
+ *		path. Input values may be copied into a larger destination, with
+ *		the unused suffix zero-filled. Output values are readable only
+ *		after a successful **bpf_extfuse_write_args**\ () call for the
+ *		same output argument during this invocation.
+ *	Return
+ *		0 on success, or a negative error code on failure.
+ *
+ * long bpf_extfuse_write_args(void *ctx, u32 type, const void *src, u32 size)
+ *	Description
+ *		Copy *size* bytes from *src* into the ExtFUSE output argument
+ *		selected by *type*. The size must exactly match that argument.
+ *	Return
+ *		0 on success, or a negative error code on failure.
  */
 #define ___BPF_FUNC_MAPPER(FN, ctx...)			\
 	FN(unspec, 0, ##ctx)				\
@@ -6084,9 +6103,16 @@ union bpf_attr {
 	FN(user_ringbuf_drain, 209, ##ctx)		\
 	FN(cgrp_storage_get, 210, ##ctx)		\
 	FN(cgrp_storage_delete, 211, ##ctx)		\
+	FN(extfuse_read_args, 212, ##ctx)		\
+	FN(extfuse_write_args, 213, ##ctx)		\
 	/* This helper list is effectively frozen. If you are trying to	\
 	 * add a new helper, you should add a kfunc instead which has	\
 	 * less stability guarantees. See Documentation/bpf/kfuncs.rst	\
+	 *								\
+	 * NOTE: extfuse_read_args/extfuse_write_args are appended here	\
+	 * as an out-of-tree extension for CONFIG_EXTFUSE. If you rebase	\
+	 * onto a kernel that has assigned 212/213 to other helpers, you	\
+	 * must renumber these to avoid a UAPI clash.			\
 	 */
 
 /* backwards-compatibility macros for users of __BPF_FUNC_MAPPER that don't

@@ -5,6 +5,9 @@
 #define _LINUX_BPF_H 1
 
 #include <uapi/linux/bpf.h>
+#ifdef CONFIG_EXTFUSE
+#include <uapi/linux/extfuse_types.h>
+#endif
 #include <uapi/linux/filter.h>
 
 #include <crypto/sha2.h>

@@ -9,6 +9,7 @@
 #include "dev_uring_i.h"
 #include "fuse_i.h"
 #include "fuse_dev_i.h"
+#include "extfuse_i.h"
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -464,6 +465,14 @@ void fuse_request_end(struct fuse_req *req)
 	if (test_and_set_bit(FR_FINISHED, &req->flags))
 		goto put_request;
 
+	if (req->in.h.opcode == FUSE_INIT && !req->out.h.error &&
+	    fc->iq.ops == &fuse_dev_fiq_ops) {
+		int err = extfuse_init_reply(fc, req->args);
+
+		if (err)
+			req->out.h.error = err;
+	}
+
 	trace_fuse_request_end(req);
 	/*
 	 * test_and_set_bit() implies smp_mb() between bit
@@ -686,6 +695,16 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
 
 	/* Needs to be done after fuse_get_req() so that fc->minor is valid */
 	fuse_adjust_compat(fc, args);
+
+	/*
+	 * Run ExtFUSE after request admission and compatibility adjustment.
+	 * This preserves connection errors and legacy argument layouts.
+	 */
+	ret = extfuse_request_send(fc, args);
+	if (ret != -ENOSYS) {
+		fuse_put_request(req);
+		return ret;
+	}
 	fuse_args_to_req(req, args);
 
 	if (!args->noreply)

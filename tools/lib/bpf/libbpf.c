@@ -227,6 +227,7 @@ static const char * const prog_type_name[] = {
 	[BPF_PROG_TYPE_SK_LOOKUP]		= "sk_lookup",
 	[BPF_PROG_TYPE_SYSCALL]			= "syscall",
 	[BPF_PROG_TYPE_NETFILTER]		= "netfilter",
+	[BPF_PROG_TYPE_EXTFUSE]			= "extfuse",
 };
 
 static int __base_pr(enum libbpf_print_level level, const char *format,
@@ -5506,10 +5507,134 @@ static int init_prog_array_slots(struct bpf_object *obj, struct bpf_map *map)
 	return 0;
 }
 
+static bool is_extfuse_handler(const struct bpf_program *prog)
+{
+	return prog->autoload && prog->type == BPF_PROG_TYPE_EXTFUSE &&
+	       str_has_pfx(prog->sec_name, "extfuse/");
+}
+
+static int parse_extfuse_handler_index(const char *sec_name, __u32 *index)
+{
+	const char *p = sec_name + sizeof("extfuse/") - 1;
+	__u32 value = 0;
+
+	if (!*p)
+		return -EINVAL;
+
+	for (; *p; p++) {
+		__u32 digit;
+
+		if (*p < '0' || *p > '9')
+			return -EINVAL;
+		digit = *p - '0';
+		if (value > (UINT32_MAX - digit) / 10)
+			return -ERANGE;
+		value = value * 10 + digit;
+	}
+
+	*index = value;
+	return 0;
+}
+
+static int find_extfuse_prog_array(struct bpf_object *obj, struct bpf_map **prog_array)
+{
+	struct bpf_program *prog;
+	struct bpf_map *map;
+	size_t i;
+	int err;
+
+	*prog_array = NULL;
+
+	for (i = 0; i < obj->nr_programs; i++) {
+		prog = &obj->programs[i];
+		if (is_extfuse_handler(prog))
+			break;
+	}
+	if (i == obj->nr_programs)
+		return 0;
+
+	if (obj->gen_loader) {
+		pr_warn("object '%s': loader generation for SEC(\"extfuse/N\") programs is unsupported\n",
+			obj->name);
+		return -EOPNOTSUPP;
+	}
+
+	for (i = 0; i < obj->nr_programs; i++) {
+		__u32 index;
+
+		prog = &obj->programs[i];
+		if (!is_extfuse_handler(prog))
+			continue;
+
+		err = parse_extfuse_handler_index(prog->sec_name, &index);
+		if (err) {
+			pr_warn("prog '%s': invalid ExtFUSE handler section '%s': suffix must be a decimal u32\n",
+				prog->name, prog->sec_name);
+			return err;
+		}
+	}
+
+	for (i = 0; i < obj->nr_maps; i++) {
+		map = &obj->maps[i];
+		if (map->def.type == BPF_MAP_TYPE_PROG_ARRAY)
+			*prog_array = map;
+	}
+
+	if (!*prog_array || (*prog_array)->fd < 0) {
+		pr_warn("object '%s': SEC(\"extfuse/N\") programs require a created BPF_MAP_TYPE_PROG_ARRAY map\n",
+			obj->name);
+		return -ENOENT;
+	}
+
+	return 0;
+}
+
+static int init_extfuse_prog_array(struct bpf_object *obj, struct bpf_map *map)
+{
+	struct bpf_program *prog;
+	size_t i;
+	int err;
+
+	for (i = 0; i < obj->nr_programs; i++) {
+		__u32 index;
+		int fd;
+
+		prog = &obj->programs[i];
+		if (!is_extfuse_handler(prog))
+			continue;
+
+		/* find_extfuse_prog_array() validated every handler suffix. */
+		err = parse_extfuse_handler_index(prog->sec_name, &index);
+		if (err)
+			return err;
+		fd = bpf_program__fd(prog);
+		if (fd < 0) {
+			pr_warn("prog '%s': ExtFUSE handler wasn't loaded\n", prog->name);
+			return -EINVAL;
+		}
+
+		err = bpf_map_update_elem(map->fd, &index, &fd, BPF_ANY);
+		if (err) {
+			err = -errno;
+			pr_warn("map '%s': failed to initialize slot [%u] to ExtFUSE prog '%s' fd=%d: %s\n",
+				map->name, index, prog->name, fd, errstr(err));
+			return err;
+		}
+		pr_debug("map '%s': slot [%u] set to ExtFUSE prog '%s' fd=%d\n",
+			 map->name, index, prog->name, fd);
+	}
+
+	return 0;
+}
+
 static int bpf_object_init_prog_arrays(struct bpf_object *obj)
 {
-	struct bpf_map *map;
+	struct bpf_map *map, *extfuse_prog_array;
 	int i, err;
+
+	err = find_extfuse_prog_array(obj, &extfuse_prog_array);
+	if (err)
+		return err;
 
 	for (i = 0; i < obj->nr_maps; i++) {
 		map = &obj->maps[i];
@@ -5521,6 +5646,9 @@ static int bpf_object_init_prog_arrays(struct bpf_object *obj)
 		if (err < 0)
 			return err;
 	}
+
+	if (extfuse_prog_array)
+		return init_extfuse_prog_array(obj, extfuse_prog_array);
 	return 0;
 }
 
@@ -7052,6 +7180,7 @@ static struct {
 	{ BPF_PROG_TYPE_CGROUP_SOCK_ADDR,        "bpf_sock_addr" },
 	{ BPF_PROG_TYPE_CGROUP_SOCKOPT,          "bpf_sockopt" },
 	{ BPF_PROG_TYPE_CGROUP_SYSCTL,           "bpf_sysctl" },
+	{ BPF_PROG_TYPE_EXTFUSE,                 "extfuse_req" },
 	{ BPF_PROG_TYPE_FLOW_DISSECTOR,          "__sk_buff" },
 	{ BPF_PROG_TYPE_KPROBE,                  "bpf_user_pt_regs_t" },
 	{ BPF_PROG_TYPE_LWT_IN,                  "__sk_buff" },
@@ -9810,6 +9939,7 @@ static int attach_iter(const struct bpf_program *prog, long cookie, struct bpf_l
 
 static const struct bpf_sec_def section_defs[] = {
 	SEC_DEF("socket",		SOCKET_FILTER, 0, SEC_NONE),
+	SEC_DEF("extfuse+",		EXTFUSE, 0, SEC_NONE),
 	SEC_DEF("sk_reuseport/migrate",	SK_REUSEPORT, BPF_SK_REUSEPORT_SELECT_OR_MIGRATE, SEC_ATTACHABLE),
 	SEC_DEF("sk_reuseport",		SK_REUSEPORT, BPF_SK_REUSEPORT_SELECT, SEC_ATTACHABLE),
 	SEC_DEF("kprobe+",		KPROBE,	0, SEC_NONE, attach_kprobe),

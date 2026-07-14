@@ -495,6 +495,7 @@ struct fuse_file_lock {
 #define FUSE_ALLOW_IDMAP	(1ULL << 40)
 #define FUSE_OVER_IO_URING	(1ULL << 41)
 #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
+#define FUSE_FS_EXTFUSE		(1ULL << 43)
 
 /**
  * CUSE INIT request/reply flags
@@ -925,7 +926,9 @@ struct fuse_init_out {
 	uint32_t	flags2;
 	uint32_t	max_stack_depth;
 	uint16_t	request_timeout;
-	uint16_t	unused[11];
+	uint16_t	extfuse_padding;
+	uint32_t	extfuse_prog_fd;
+	uint16_t	unused[8];
 };
 
 #define CUSE_INIT_INFO_MAX 4096

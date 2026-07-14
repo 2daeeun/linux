@@ -963,6 +963,12 @@ struct fuse_conn {
 	/** List of device instances belonging to this connection */
 	struct list_head devices;
 
+	/** Serializes publication and removal of the ExtFUSE state. */
+	spinlock_t extfuse_lock;
+
+	/** Private ExtFUSE state, protected by RCU. */
+	struct extfuse_data __rcu *fc_priv;
+
 #ifdef CONFIG_FUSE_DAX
 	/* Dax mode */
 	enum fuse_dax_mode dax_mode;

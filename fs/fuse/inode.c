@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dev_i.h"
+#include "extfuse_i.h"
 #include "dev_uring_i.h"
 
 #include <linux/dax.h>
@@ -993,6 +994,8 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->connected = 1;
 	atomic64_set(&fc->attr_version, 1);
 	atomic64_set(&fc->evict_ctr, 1);
+	spin_lock_init(&fc->extfuse_lock);
+	RCU_INIT_POINTER(fc->fc_priv, NULL);
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
 	fc->pid_ns = get_pid_ns(task_active_pid_ns(current));
 	fc->user_ns = get_user_ns(user_ns);
@@ -1043,6 +1046,8 @@ void fuse_conn_put(struct fuse_conn *fc)
 	}
 	if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 		fuse_backing_files_free(fc);
+	if (IS_ENABLED(CONFIG_EXTFUSE))
+		extfuse_unload_prog(fc);
 	call_rcu(&fc->rcu, delayed_release);
 }
 EXPORT_SYMBOL_GPL(fuse_conn_put);
@@ -1322,6 +1327,7 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 	struct fuse_conn *fc = fm->fc;
 	struct fuse_init_args *ia = container_of(args, typeof(*ia), args);
 	struct fuse_init_out *arg = &ia->out;
+	bool use_extfuse = false;
 	bool ok = true;
 
 	if (error || arg->major != FUSE_KERNEL_VERSION)
@@ -1456,6 +1462,9 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 
 			if (flags & FUSE_REQUEST_TIMEOUT)
 				timeout = arg->request_timeout;
+
+			if (flags & FUSE_FS_EXTFUSE)
+				use_extfuse = true;
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1469,11 +1478,14 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 		fc->minor = arg->minor;
 		fc->max_write = arg->minor < 5 ? 4096 : arg->max_write;
 		fc->max_write = max_t(unsigned, 4096, fc->max_write);
+		if (ok && use_extfuse && !rcu_access_pointer(fc->fc_priv))
+			ok = false;
 		fc->conn_init = 1;
 	}
 	kfree(ia);
 
 	if (!ok) {
+		fc->io_uring = 0;
 		fc->conn_init = 0;
 		fc->conn_error = 1;
 	}
@@ -1507,6 +1519,8 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
 		FUSE_REQUEST_TIMEOUT;
+	if (fm->fc->iq.ops == &fuse_dev_fiq_ops)
+		flags |= EXTFUSE_FLAGS;
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)
 		flags |= FUSE_MAP_ALIGNMENT;
