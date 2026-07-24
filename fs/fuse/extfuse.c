@@ -107,7 +107,7 @@ static void fuse_args_to_extfuse_req(struct fuse_args *args,
 /*
  * Try to service @args from BPF. Returns:
  *   -ENOSYS : no program / handler miss -> caller must do the normal upcall
- *   < 0     : request failed in-kernel with this errno
+ *   -511..-1: request failed in-kernel with this FUSE errno
  *   0       : fixed-size request fully handled in-kernel
  *   > 0     : PASSTHRU -> caller must do the normal upcall
  *
@@ -175,6 +175,14 @@ ssize_t extfuse_request_send(struct fuse_conn *fc, struct fuse_args *args)
 		 * daemon".  Returning -ENOSYS here continues the request through
 		 * the normal FUSE path without submitting it twice.
 		 */
+		ret = -ENOSYS;
+		goto out_unlock;
+	}
+
+	/* Match fuse_dev_do_write(): valid FUSE errors are -511..0. */
+	if (unlikely(prog_ret <= -512)) {
+		pr_warn_ratelimited("invalid BPF return %d; falling back to userspace\n",
+				    prog_ret);
 		ret = -ENOSYS;
 		goto out_unlock;
 	}
@@ -312,7 +320,7 @@ int extfuse_init_reply(struct fuse_conn *fc, struct fuse_args *args)
 }
 EXPORT_SYMBOL_GPL(extfuse_init_reply);
 
-/**
+/*
  * bpf_extfuse_read_args - copy a field of the mirrored request into @dst
  * @src:  pointer to the struct extfuse_req context
  * @type: which field to read (see enum extfuse_arg_t in uapi/linux/extfuse.h)
@@ -446,7 +454,7 @@ static const struct bpf_func_proto bpf_extfuse_read_args_proto = {
 	.arg4_type	= ARG_CONST_SIZE,
 };
 
-/**
+/*
  * bpf_extfuse_write_args - copy from @src into an out-arg of the request
  * @dst:  pointer to the struct extfuse_req context
  * @type: which out-arg to write (OUT_PARAM_0 / OUT_PARAM_1)
