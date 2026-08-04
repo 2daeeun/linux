@@ -34,10 +34,16 @@ struct extfuse_data {
 
 #define EXTFUSE_FLAGS		FUSE_FS_EXTFUSE
 
+/* Private BPF tail-call slots used only by native passthrough coherence. */
+#define EXTFUSE_PASSTHROUGH_READ	65
+#define EXTFUSE_PASSTHROUGH_WRITE	66
+#define EXTFUSE_PASSTHROUGH_MMAP	67
+
 int extfuse_load_prog(struct fuse_conn *fc, int fd);
 void extfuse_unload_prog(struct fuse_conn *fc);
 int extfuse_init_reply(struct fuse_conn *fc, struct fuse_args *args);
 ssize_t extfuse_request_send(struct fuse_conn *fc, struct fuse_args *args);
+int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode);
 
 #else /* !CONFIG_EXTFUSE */
 
@@ -65,6 +71,12 @@ static inline ssize_t extfuse_request_send(struct fuse_conn *fc,
 					   struct fuse_args *args)
 {
 	return -ENOSYS;
+}
+
+static inline int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid,
+					     u32 opcode)
+{
+	return 0;
 }
 
 #endif /* CONFIG_EXTFUSE */

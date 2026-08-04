@@ -448,6 +448,9 @@ struct fuse_file_lock {
  * FUSE_OVER_IO_URING: Indicate that client supports io-uring
  * FUSE_REQUEST_TIMEOUT: kernel supports timing out requests.
  *			 init_out.request_timeout contains the timeout (in secs)
+ * FUSE_FS_EXTFUSE: enable ExtFUSE BPF extensions
+ * FUSE_EXTFUSE_PASSTHROUGH_COHERENCE: native passthrough I/O notifies the
+ *			 ExtFUSE BPF program before and after metadata changes
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -496,6 +499,7 @@ struct fuse_file_lock {
 #define FUSE_OVER_IO_URING	(1ULL << 41)
 #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
 #define FUSE_FS_EXTFUSE		(1ULL << 43)
+#define FUSE_EXTFUSE_PASSTHROUGH_COHERENCE (1ULL << 44)
 
 /**
  * CUSE INIT request/reply flags

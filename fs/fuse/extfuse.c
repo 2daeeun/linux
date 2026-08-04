@@ -214,10 +214,38 @@ out_unlock:
 }
 EXPORT_SYMBOL_GPL(extfuse_request_send);
 
+/*
+ * Native passthrough does not create an ordinary FUSE READ/WRITE request, so
+ * run a private BPF notification for metadata-cache invalidation. A negotiated
+ * connection treats a missing or failing handler as an I/O error rather than
+ * risking a stale fast-path reply.
+ */
+int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode)
+{
+	struct fuse_args args = {
+		.nodeid = nodeid,
+		.opcode = opcode,
+	};
+	ssize_t ret;
+
+	if (!READ_ONCE(fc->extfuse_passthrough_coherence))
+		return 0;
+
+	ret = extfuse_request_send(fc, &args);
+	if (ret == 0)
+		return 0;
+
+	pr_warn_ratelimited("native passthrough notification %u failed: %zd\n",
+			    opcode, ret);
+	return ret < 0 && ret != -ENOSYS ? (int)ret : -EIO;
+}
+EXPORT_SYMBOL_GPL(extfuse_passthrough_notify);
+
 void extfuse_unload_prog(struct fuse_conn *fc)
 {
 	struct extfuse_data *data;
 
+	WRITE_ONCE(fc->extfuse_passthrough_coherence, 0);
 	spin_lock(&fc->extfuse_lock);
 	data = rcu_replace_pointer(fc->fc_priv, NULL,
 				   lockdep_is_held(&fc->extfuse_lock));

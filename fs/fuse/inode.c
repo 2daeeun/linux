@@ -1465,6 +1465,14 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 
 			if (flags & FUSE_FS_EXTFUSE)
 				use_extfuse = true;
+			if (flags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE) {
+				if (!(flags & FUSE_FS_EXTFUSE) ||
+				    !(flags & FUSE_PASSTHROUGH) ||
+				    !fc->passthrough)
+					ok = false;
+				else
+					fc->extfuse_passthrough_coherence = 1;
+			}
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1519,8 +1527,12 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
 		FUSE_REQUEST_TIMEOUT;
-	if (fm->fc->iq.ops == &fuse_dev_fiq_ops)
+	if (fm->fc->iq.ops == &fuse_dev_fiq_ops) {
 		flags |= EXTFUSE_FLAGS;
+		if (IS_ENABLED(CONFIG_EXTFUSE) &&
+		    IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
+			flags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE;
+	}
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)
 		flags |= FUSE_MAP_ALIGNMENT;

@@ -912,6 +912,9 @@ struct fuse_conn {
 	/** Passthrough support for read/write IO */
 	unsigned int passthrough:1;
 
+	/** Native passthrough invalidates ExtFUSE metadata-cache entries */
+	unsigned int extfuse_passthrough_coherence;
+
 	/* Use pages instead of pointer for kernel I/O */
 	unsigned int use_pages_for_kvec_io:1;
 
