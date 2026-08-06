@@ -874,6 +874,7 @@ static void process_init_limits(struct fuse_conn *fc, struct fuse_init_out *arg)
 static void process_init_reply(struct fuse_conn *fc, struct fuse_req *req)
 {
 	struct fuse_init_out *arg = &req->misc.init_out;
+	int err;
 
 	if (req->out.h.error || arg->major != FUSE_KERNEL_VERSION)
 		fc->conn_error = 1;
@@ -945,8 +946,15 @@ static void process_init_reply(struct fuse_conn *fc, struct fuse_req *req)
 			fc->no_flock = 1;
 		}
 
-		if (arg->flags & FUSE_FS_EXTFUSE)
-			extfuse_load_prog(fc, arg->extfuse_prog_fd);
+		if (arg->flags & FUSE_FS_EXTFUSE) {
+			err = extfuse_load_prog(fc, arg->extfuse_prog_fd);
+			if (err) {
+				pr_err("ExtFUSE bpf prog attach failed: %d\n",
+				       err);
+				fc->conn_error = 1;
+				goto out;
+			}
+		}
 
 		fc->sb->s_bdi->ra_pages =
 				min(fc->sb->s_bdi->ra_pages, ra_pages);
@@ -955,6 +963,7 @@ static void process_init_reply(struct fuse_conn *fc, struct fuse_req *req)
 		fc->max_write = max_t(unsigned, 4096, fc->max_write);
 		fc->conn_init = 1;
 	}
+out:
 	fuse_set_initialized(fc);
 	wake_up_all(&fc->blocked_waitq);
 }

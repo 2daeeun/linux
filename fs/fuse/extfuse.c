@@ -79,29 +79,29 @@ void extfuse_unload_prog(struct fuse_conn *fc)
 
 int extfuse_load_prog(struct fuse_conn *fc, int fd)
 {
-	struct bpf_prog *prog = NULL;
-	struct bpf_prog *old_prog;
+	struct bpf_prog *prog;
 	struct extfuse_data *data;
 
-	BUG_ON(fc->fc_priv);
-
-	data = kmalloc(sizeof(*data), GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
+	if (WARN_ON_ONCE(fc->fc_priv))
+		return -EEXIST;
 
 	prog = bpf_prog_get_type(fd, BPF_PROG_TYPE_EXTFUSE);
 	if (IS_ERR(prog)) {
 		pr_err("ExtFUSE bpf prog fd=%d failed: %ld\n", fd,
 		       PTR_ERR(prog));
-		kfree(data);
-		return -1;
+		return PTR_ERR(prog);
 	}
 
-	old_prog = xchg(&data->prog, prog);
-	if (old_prog)
-		bpf_prog_put(old_prog);
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data) {
+		bpf_prog_put(prog);
+		return -ENOMEM;
+	}
 
-	fc->fc_priv = (void *)data;
+	/* Initialize the new object before publishing it through fc_priv. */
+	data->prog = prog;
+
+	fc->fc_priv = data;
 
 	pr_info("ExtFUSE bpf prog loaded fd=%d\n", fd);
 	return 0;

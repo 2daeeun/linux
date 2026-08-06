@@ -766,6 +766,7 @@ static unsigned long __wb_calc_thresh(struct dirty_throttle_control *dtc)
 	struct wb_domain *dom = dtc_dom(dtc);
 	unsigned long thresh = dtc->thresh;
 	u64 wb_thresh;
+	u64 wb_max_thresh;
 	long numerator, denominator;
 	unsigned long wb_min_ratio, wb_max_ratio;
 
@@ -782,8 +783,21 @@ static unsigned long __wb_calc_thresh(struct dirty_throttle_control *dtc)
 	wb_min_max_ratio(dtc->wb, &wb_min_ratio, &wb_max_ratio);
 
 	wb_thresh += (thresh * wb_min_ratio) / 100;
-	if (wb_thresh > (thresh * wb_max_ratio) / 100)
-		wb_thresh = thresh * wb_max_ratio / 100;
+
+	/*
+	 * A strict-limit device can have no completion history after being
+	 * inactive.  Its proportional share then becomes zero and every writer
+	 * is throttled in balance_dirty_pages().  Give it the same 1% inactive
+	 * floor used by newer kernels; max_ratio still provides the hard cap.
+	 */
+	if (thresh > dtc->dirty &&
+	    unlikely(dtc->wb->bdi->capabilities & BDI_CAP_STRICTLIMIT))
+		wb_thresh = max_t(u64, wb_thresh,
+				  (thresh - dtc->dirty) / 100);
+
+	wb_max_thresh = (thresh * wb_max_ratio) / 100;
+	if (wb_thresh > wb_max_thresh)
+		wb_thresh = wb_max_thresh;
 
 	return wb_thresh;
 }
