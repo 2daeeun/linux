@@ -5878,8 +5878,10 @@ union bpf_attr {
  *		The full *size* byte destination is initialized on every return
  *		path. Input values may be copied into a larger destination, with
  *		the unused suffix zero-filled. Output values are readable only
- *		after a successful **bpf_extfuse_write_args**\ () call for the
- *		same output argument during this invocation.
+ *		after a successful **bpf_extfuse_write_args**\ () or
+ *		**bpf_extfuse_write_args_var**\ () call for the same output
+ *		argument during this invocation. The *size* must match the most
+ *		recent successful write; a zero-byte output has no readable payload.
  *	Return
  *		0 on success, or a negative error code on failure.
  *
@@ -5887,6 +5889,14 @@ union bpf_attr {
  *	Description
  *		Copy *size* bytes from *src* into the ExtFUSE output argument
  *		selected by *type*. The size must exactly match that argument.
+ *	Return
+ *		0 on success, or a negative error code on failure.
+ *
+ * long bpf_extfuse_write_args_var(void *ctx, u32 type, const void *src, u32 size)
+ *	Description
+ *		Copy the single direct variable output of **FUSE_GETXATTR**.
+ *		*size* may be zero or any value up to the target capacity and
+ *		becomes the actual reply length. Other request shapes fail.
  *	Return
  *		0 on success, or a negative error code on failure.
  */
@@ -6105,13 +6115,14 @@ union bpf_attr {
 	FN(cgrp_storage_delete, 211, ##ctx)		\
 	FN(extfuse_read_args, 212, ##ctx)		\
 	FN(extfuse_write_args, 213, ##ctx)		\
+	FN(extfuse_write_args_var, 214, ##ctx)		\
 	/* This helper list is effectively frozen. If you are trying to	\
 	 * add a new helper, you should add a kfunc instead which has	\
 	 * less stability guarantees. See Documentation/bpf/kfuncs.rst	\
 	 *								\
-	 * NOTE: extfuse_read_args/extfuse_write_args are appended here	\
+	 * NOTE: the three extfuse helpers are appended here		\
 	 * as an out-of-tree extension for CONFIG_EXTFUSE. If you rebase	\
-	 * onto a kernel that has assigned 212/213 to other helpers, you	\
+	 * onto a kernel that has assigned 212..214 to other helpers, you	\
 	 * must renumber these to avoid a UAPI clash.			\
 	 */
 

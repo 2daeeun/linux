@@ -37,7 +37,9 @@ struct extfuse_req_ctx {
 	struct extfuse_req req;
 	const void *in_values[EXTFUSE_MAX_IN_ARGS];
 	void *out_values[EXTFUSE_MAX_OUT_ARGS];
+	unsigned int out_actual[EXTFUSE_MAX_OUT_ARGS];
 	unsigned long out_written;
+	unsigned long out_variable;
 	bool split_lookup_name;
 };
 
@@ -47,15 +49,27 @@ struct extfuse_req_ctx {
  * payload pointers remain in the kernel-private wrapper and are accessed
  * lazily by the helpers under copy_{from,to}_kernel_nofault(). The helpers
  * return an error for page-backed payloads that have no direct value pointer.
+ * Return false if the request shape cannot be represented without truncation.
  */
-static void fuse_args_to_extfuse_req(struct fuse_args *args,
+static bool fuse_args_to_extfuse_req(struct fuse_args *args,
 				     struct extfuse_req_ctx *ctx)
 {
 	struct extfuse_req *ereq = &ctx->req;
 	unsigned int i;
 	unsigned int nin = 0;
-	unsigned int nout = min_t(unsigned int, args->out_numargs,
-				  EXTFUSE_MAX_OUT_ARGS);
+	unsigned int nout;
+
+	if (args->in_numargs > ARRAY_SIZE(args->in_args) ||
+	    args->out_numargs > ARRAY_SIZE(args->out_args) ||
+	    args->out_numargs > EXTFUSE_MAX_OUT_ARGS ||
+	    (args->is_ext && args->ext_idx >= args->in_numargs))
+		return false;
+
+	/* A hidden extension inside LOOKUP's three-part name is malformed. */
+	if (args->opcode == FUSE_LOOKUP && args->is_ext && args->ext_idx < 3)
+		return false;
+
+	nout = args->out_numargs;
 
 	memset(ctx, 0, sizeof(*ctx));
 
@@ -81,7 +95,7 @@ static void fuse_args_to_extfuse_req(struct fuse_args *args,
 		i = 0;
 	}
 
-	for (; i < args->in_numargs && nin < EXTFUSE_MAX_IN_ARGS; i++) {
+	for (; i < args->in_numargs; i++) {
 		/* Hide the internal extension slot from the ExtFUSE ABI. */
 		if (args->is_ext && i == args->ext_idx)
 			continue;
@@ -89,6 +103,8 @@ static void fuse_args_to_extfuse_req(struct fuse_args *args,
 		/* Skip the zero header used by name-only FUSE requests. */
 		if (!args->in_args[i].size && !args->in_args[i].value)
 			continue;
+		if (nin == EXTFUSE_MAX_IN_ARGS)
+			return false;
 
 		ereq->in.args[nin].size = args->in_args[i].size;
 		ctx->in_values[nin] = args->in_args[i].value;
@@ -102,17 +118,19 @@ static void fuse_args_to_extfuse_req(struct fuse_args *args,
 		ereq->out.args[i].size = args->out_args[i].size;
 		ctx->out_values[i] = args->out_args[i].value;
 	}
+
+	return true;
 }
 
 /*
  * Try to service @args from BPF. Returns:
- *   -ENOSYS : no program / handler miss -> caller must do the normal upcall
+ *   -ENOSYS : no program / handler miss / PASSTHRU -> normal upcall
  *   -511..-1: request failed in-kernel with this FUSE errno
- *   0       : fixed-size request fully handled in-kernel
- *   > 0     : PASSTHRU -> caller must do the normal upcall
+ *   0       : request fully handled in-kernel with no variable payload
+ *   > 0     : GETXATTR variable payload length
  *
  * The handler writes its reply directly into the caller's out_args[].value
- * buffers via bpf_extfuse_write_args(), so there is no copy-back step.
+ * buffers via an ExtFUSE write helper, so there is no copy-back step.
  */
 ssize_t extfuse_request_send(struct fuse_conn *fc, struct fuse_args *args)
 {
@@ -147,10 +165,17 @@ ssize_t extfuse_request_send(struct fuse_conn *fc, struct fuse_args *args)
 		goto out_unlock;
 	}
 
-	/* Forced control requests may be observed but must reach the daemon. */
-	force_upcall = args->force && args->opcode != FUSE_FLUSH;
+	/*
+	 * Forced control requests may be observed but must reach the daemon.
+	 * The current BPF ABI also hides request extensions, so a program may
+	 * perform conservative cache side effects but cannot complete them.
+	 */
+	force_upcall = (args->force && args->opcode != FUSE_FLUSH) || args->is_ext;
 
-	fuse_args_to_extfuse_req(args, &ctx);
+	if (!fuse_args_to_extfuse_req(args, &ctx)) {
+		ret = -ENOSYS;
+		goto out_unlock;
+	}
 	prog_ret = bpf_prog_run_pin_on_cpu(prog, &ctx.req);
 
 	/* Match the normal queue path if abort raced with BPF execution. */
@@ -188,21 +213,37 @@ ssize_t extfuse_request_send(struct fuse_conn *fc, struct fuse_args *args)
 	}
 
 	/*
-	 * The BPF ABI has no channel for the actual length of an out_argvar
-	 * reply. A successful fast-path reply would otherwise return the buffer
-	 * capacity, so use the normal daemon path instead.
+	 * Keep variable-output completion narrowly scoped until each opcode's
+	 * payload validation has been audited. GETXATTR has one direct output
+	 * buffer, and the write helper records its actual payload length.
 	 */
-	if (prog_ret == 0 && args->out_argvar) {
+	if (prog_ret == 0 && args->out_argvar &&
+	    (args->opcode != FUSE_GETXATTR || args->out_numargs != 1 ||
+	     args->out_pages || !args->out_args[0].value ||
+	     !(ctx.out_variable & BIT(0)))) {
 		ret = -ENOSYS;
 		goto out_unlock;
 	}
-	/* Never expose an untouched or partially copied fixed-size reply. */
+
+	/* Never expose an untouched or partially copied successful reply. */
 	if (prog_ret == 0) {
 		for (i = 0; i < ctx.req.out.numargs; i++)
 			if (ctx.req.out.args[i].size)
 				required_out |= BIT(i);
+		/* A zero-length variable reply still requires an explicit write. */
+		if (args->out_argvar)
+			required_out |= BIT(0);
 		if ((ctx.out_written & required_out) != required_out) {
 			ret = -ENOSYS;
+			goto out_unlock;
+		}
+		if (args->out_argvar) {
+			if (ctx.out_actual[0] > ctx.req.out.args[0].size) {
+				ret = -ENOSYS;
+				goto out_unlock;
+			}
+			args->out_args[0].size = ctx.out_actual[0];
+			ret = ctx.out_actual[0];
 			goto out_unlock;
 		}
 	}
@@ -439,7 +480,7 @@ BPF_CALL_4(bpf_extfuse_read_args, void *, src, u32, type, void *, dst,
 			return -EINVAL;
 		if (!(ctx->out_written & BIT(0)))
 			return -EACCES;
-		if (size != req->out.args[0].size)
+		if (size != ctx->out_actual[0])
 			return -E2BIG;
 		inptr = ctx->out_values[0];
 		break;
@@ -448,7 +489,7 @@ BPF_CALL_4(bpf_extfuse_read_args, void *, src, u32, type, void *, dst,
 			return -EINVAL;
 		if (!(ctx->out_written & BIT(1)))
 			return -EACCES;
-		if (size != req->out.args[1].size)
+		if (size != ctx->out_actual[1])
 			return -E2BIG;
 		inptr = ctx->out_values[1];
 		break;
@@ -482,8 +523,61 @@ static const struct bpf_func_proto bpf_extfuse_read_args_proto = {
 	.arg4_type	= ARG_CONST_SIZE,
 };
 
+static long extfuse_write_arg(void *dst, u32 type, const void *src, u32 size,
+			      bool variable)
+{
+	struct extfuse_req *req = (struct extfuse_req *)dst;
+	struct extfuse_req_ctx *ctx;
+	unsigned int numargs = req->out.numargs;
+	void *outptr = NULL;
+	unsigned int out_idx;
+	unsigned int capacity;
+	long ret = -EINVAL;
+
+	ctx = container_of(req, struct extfuse_req_ctx, req);
+
+	if (type == OUT_PARAM_0 && numargs >= 1) {
+		outptr = ctx->out_values[0];
+		out_idx = 0;
+	} else if (type == OUT_PARAM_1 && numargs >= 2) {
+		outptr = ctx->out_values[1];
+		out_idx = 1;
+	} else {
+		pr_debug("invalid write type %u numargs %u size %u\n",
+			 type, numargs, size);
+		return ret;
+	}
+
+	capacity = req->out.args[out_idx].size;
+	if (variable &&
+	    (req->in.h.opcode != FUSE_GETXATTR || !req->out.argvar ||
+	     numargs != 1 || out_idx != 0)) {
+		pr_debug("invalid variable write type %u numargs %u size %u\n",
+			 type, numargs, size);
+		return ret;
+	}
+	if (!outptr || (variable ? size > capacity : size != capacity)) {
+		pr_debug("invalid write type %u numargs %u size %u\n",
+			 type, numargs, size);
+		return ret;
+	}
+
+	ret = size ? copy_to_kernel_nofault(outptr, src, size) : 0;
+	if (unlikely(ret < 0))
+		return ret;
+
+	ctx->out_actual[out_idx] = size;
+	ctx->out_written |= BIT(out_idx);
+	if (variable)
+		ctx->out_variable |= BIT(out_idx);
+	else
+		ctx->out_variable &= ~BIT(out_idx);
+
+	return ret;
+}
+
 /*
- * bpf_extfuse_write_args - copy from @src into an out-arg of the request
+ * bpf_extfuse_write_args - copy a complete fixed-size output argument
  * @dst:  pointer to the struct extfuse_req context
  * @type: which out-arg to write (OUT_PARAM_0 / OUT_PARAM_1)
  * @src:  source buffer in BPF memory
@@ -492,38 +586,7 @@ static const struct bpf_func_proto bpf_extfuse_read_args_proto = {
 BPF_CALL_4(bpf_extfuse_write_args, void *, dst, u32, type, const void *, src,
 	   u32, size)
 {
-	struct extfuse_req *req = (struct extfuse_req *)dst;
-	struct extfuse_req_ctx *ctx;
-	unsigned int numargs = req->out.numargs;
-	void *outptr = NULL;
-	unsigned int out_idx;
-	long ret = -EINVAL;
-
-	ctx = container_of(req, struct extfuse_req_ctx, req);
-
-	if (type == OUT_PARAM_0 && numargs >= 1 &&
-	    size == req->out.args[0].size) {
-		outptr = ctx->out_values[0];
-		out_idx = 0;
-	} else if (type == OUT_PARAM_1 && numargs >= 2 &&
-		 size == req->out.args[1].size) {
-		outptr = ctx->out_values[1];
-		out_idx = 1;
-	}
-
-	if (!outptr) {
-		pr_debug("invalid write type %u numargs %u size %u\n",
-			 type, numargs, size);
-		return ret;
-	}
-
-	ret = copy_to_kernel_nofault(outptr, src, size);
-	if (unlikely(ret < 0))
-		return ret;
-
-	ctx->out_written |= BIT(out_idx);
-
-	return ret;
+	return extfuse_write_arg(dst, type, src, size, false);
 }
 
 static const struct bpf_func_proto bpf_extfuse_write_args_proto = {
@@ -536,6 +599,29 @@ static const struct bpf_func_proto bpf_extfuse_write_args_proto = {
 	.arg4_type	= ARG_CONST_SIZE,
 };
 
+/*
+ * bpf_extfuse_write_args_var - copy a variable GETXATTR output argument
+ * @dst:  pointer to the struct extfuse_req context
+ * @type: must select the single direct output argument
+ * @src:  source buffer in BPF memory
+ * @size: actual reply length, from zero through the output buffer capacity
+ */
+BPF_CALL_4(bpf_extfuse_write_args_var, void *, dst, u32, type,
+	   const void *, src, u32, size)
+{
+	return extfuse_write_arg(dst, type, src, size, true);
+}
+
+static const struct bpf_func_proto bpf_extfuse_write_args_var_proto = {
+	.func		= bpf_extfuse_write_args_var,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_ANYTHING,
+	.arg3_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+	.arg4_type	= ARG_CONST_SIZE_OR_ZERO,
+};
+
 static const struct bpf_func_proto *
 bpf_extfuse_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
@@ -546,6 +632,8 @@ bpf_extfuse_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	case BPF_FUNC_extfuse_write_args:
 	case BPF_FUNC_skb_output: /* Original ExtFUSE helper ID. */
 		return &bpf_extfuse_write_args_proto;
+	case BPF_FUNC_extfuse_write_args_var:
+		return &bpf_extfuse_write_args_var_proto;
 	case BPF_FUNC_map_lookup_elem:
 		return &bpf_map_lookup_elem_proto;
 	case BPF_FUNC_map_update_elem:
