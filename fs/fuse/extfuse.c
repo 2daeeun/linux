@@ -261,16 +261,30 @@ EXPORT_SYMBOL_GPL(extfuse_request_send);
  * connection treats a missing or failing handler as an I/O error rather than
  * risking a stale fast-path reply.
  */
-int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode)
+int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode,
+			       u32 phase)
 {
+	struct extfuse_passthrough_in in = {
+		.phase = phase,
+	};
 	struct fuse_args args = {
 		.nodeid = nodeid,
 		.opcode = opcode,
 	};
 	ssize_t ret;
+	unsigned int coherence;
 
-	if (!READ_ONCE(fc->extfuse_passthrough_coherence))
+	coherence = READ_ONCE(fc->extfuse_passthrough_coherence);
+	if (!coherence)
 		return 0;
+	if (phase != EXTFUSE_PASSTHROUGH_PHASE_BEGIN &&
+	    phase != EXTFUSE_PASSTHROUGH_PHASE_END)
+		return -EINVAL;
+	if (coherence >= 2) {
+		args.in_numargs = 1;
+		args.in_args[0].size = sizeof(in);
+		args.in_args[0].value = &in;
+	}
 
 	ret = extfuse_request_send(fc, &args);
 	if (ret == 0)

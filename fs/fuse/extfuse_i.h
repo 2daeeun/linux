@@ -43,7 +43,8 @@ int extfuse_load_prog(struct fuse_conn *fc, int fd);
 void extfuse_unload_prog(struct fuse_conn *fc);
 int extfuse_init_reply(struct fuse_conn *fc, struct fuse_args *args);
 ssize_t extfuse_request_send(struct fuse_conn *fc, struct fuse_args *args);
-int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode);
+int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode,
+			       u32 phase);
 
 #else /* !CONFIG_EXTFUSE */
 
@@ -74,7 +75,7 @@ static inline ssize_t extfuse_request_send(struct fuse_conn *fc,
 }
 
 static inline int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid,
-					     u32 opcode)
+					     u32 opcode, u32 phase)
 {
 	return 0;
 }

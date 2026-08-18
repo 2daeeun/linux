@@ -12,21 +12,40 @@
 #include <linux/backing-file.h>
 #include <linux/splice.h>
 
-static int fuse_passthrough_extfuse_notify(struct file *file, u32 opcode)
+static int fuse_passthrough_extfuse_notify(struct file *file, u32 opcode,
+					   u32 phase)
 {
 	struct fuse_file *ff = file->private_data;
 
 	return extfuse_passthrough_notify(ff->fm->fc,
-					 get_node_id(file_inode(file)), opcode);
+					 get_node_id(file_inode(file)), opcode,
+					 phase);
+}
+
+static int fuse_passthrough_begin_io(struct kiocb *iocb, bool write)
+{
+	return fuse_passthrough_extfuse_notify(iocb->ki_filp,
+			write ? EXTFUSE_PASSTHROUGH_WRITE :
+				EXTFUSE_PASSTHROUGH_READ,
+			EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
+}
+
+static int fuse_passthrough_end_io(struct kiocb *iocb, ssize_t ret,
+				   bool write)
+{
+	(void)ret;
+	if (!write)
+		fuse_invalidate_atime(file_inode(iocb->ki_filp));
+	return fuse_passthrough_extfuse_notify(iocb->ki_filp,
+			write ? EXTFUSE_PASSTHROUGH_WRITE :
+				EXTFUSE_PASSTHROUGH_READ,
+			EXTFUSE_PASSTHROUGH_PHASE_END);
 }
 
 static void fuse_file_accessed(struct file *file)
 {
 	struct inode *inode = file_inode(file);
 
-	/* The matching pre-I/O notification closes the daemon-refresh race. */
-	(void)fuse_passthrough_extfuse_notify(
-		file, EXTFUSE_PASSTHROUGH_READ);
 	fuse_invalidate_atime(inode);
 }
 
@@ -34,9 +53,6 @@ static void fuse_passthrough_end_write(struct kiocb *iocb, ssize_t ret)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 
-	/* Completion-time invalidation also covers asynchronous lower writes. */
-	(void)fuse_passthrough_extfuse_notify(
-		iocb->ki_filp, EXTFUSE_PASSTHROUGH_WRITE);
 	fuse_write_update_attr(inode, iocb->ki_pos, ret);
 }
 
@@ -49,6 +65,8 @@ ssize_t fuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 	ssize_t ret;
 	struct backing_file_ctx ctx = {
 		.cred = ff->cred,
+		.begin_io = fuse_passthrough_begin_io,
+		.end_io = fuse_passthrough_end_io,
 		.accessed = fuse_file_accessed,
 	};
 
@@ -58,11 +76,6 @@ ssize_t fuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 
 	if (!count)
 		return 0;
-	ret = fuse_passthrough_extfuse_notify(
-		file, EXTFUSE_PASSTHROUGH_READ);
-	if (ret)
-		return ret;
-
 	ret = backing_file_read_iter(backing_file, iter, iocb, iocb->ki_flags,
 				     &ctx);
 
@@ -80,6 +93,8 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
 	ssize_t ret;
 	struct backing_file_ctx ctx = {
 		.cred = ff->cred,
+		.begin_io = fuse_passthrough_begin_io,
+		.end_io = fuse_passthrough_end_io,
 		.end_write = fuse_passthrough_end_write,
 	};
 
@@ -88,11 +103,6 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
 
 	if (!count)
 		return 0;
-	ret = fuse_passthrough_extfuse_notify(
-		file, EXTFUSE_PASSTHROUGH_WRITE);
-	if (ret)
-		return ret;
-
 	inode_lock(inode);
 	ret = backing_file_write_iter(backing_file, iter, iocb, iocb->ki_flags,
 				      &ctx);
@@ -109,6 +119,8 @@ ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
 	struct file *backing_file = fuse_file_passthrough(ff);
 	struct backing_file_ctx ctx = {
 		.cred = ff->cred,
+		.begin_io = fuse_passthrough_begin_io,
+		.end_io = fuse_passthrough_end_io,
 		.accessed = fuse_file_accessed,
 	};
 	struct kiocb iocb;
@@ -119,10 +131,6 @@ ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
 
 	init_sync_kiocb(&iocb, in);
 	iocb.ki_pos = *ppos;
-	ret = fuse_passthrough_extfuse_notify(
-		in, EXTFUSE_PASSTHROUGH_READ);
-	if (ret)
-		return ret;
 	ret = backing_file_splice_read(backing_file, &iocb, pipe, len, flags, &ctx);
 	*ppos = iocb.ki_pos;
 
@@ -139,6 +147,8 @@ ssize_t fuse_passthrough_splice_write(struct pipe_inode_info *pipe,
 	ssize_t ret;
 	struct backing_file_ctx ctx = {
 		.cred = ff->cred,
+		.begin_io = fuse_passthrough_begin_io,
+		.end_io = fuse_passthrough_end_io,
 		.end_write = fuse_passthrough_end_write,
 	};
 	struct kiocb iocb;
@@ -149,12 +159,6 @@ ssize_t fuse_passthrough_splice_write(struct pipe_inode_info *pipe,
 	inode_lock(inode);
 	init_sync_kiocb(&iocb, out);
 	iocb.ki_pos = *ppos;
-	ret = fuse_passthrough_extfuse_notify(
-		out, EXTFUSE_PASSTHROUGH_WRITE);
-	if (ret) {
-		inode_unlock(inode);
-		return ret;
-	}
 	ret = backing_file_splice_write(pipe, backing_file, &iocb, len, flags, &ctx);
 	*ppos = iocb.ki_pos;
 	inode_unlock(inode);
@@ -175,22 +179,28 @@ ssize_t fuse_passthrough_mmap(struct file *file, struct vm_area_struct *vma)
 	pr_debug("%s: backing_file=0x%p, start=%lu, end=%lu\n", __func__,
 		 backing_file, vma->vm_start, vma->vm_end);
 	ret = fuse_passthrough_extfuse_notify(
-		file, EXTFUSE_PASSTHROUGH_READ);
+		file, EXTFUSE_PASSTHROUGH_READ,
+		EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
 	if (ret)
 		return ret;
 
 	/*
-	 * A writable shared mapping can modify lower mtime/ctime after FUSE
-	 * RELEASE. Install a session-lifetime BPF marker before publishing it.
+	 * Page faults can update lower atime, and a writable shared mapping can
+	 * update size/times long after FUSE RELEASE. Install a session-lifetime
+	 * BPF marker before publishing every native mapping.
 	 */
-	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE)) {
-		ret = fuse_passthrough_extfuse_notify(
-			file, EXTFUSE_PASSTHROUGH_MMAP);
-		if (ret)
-			return ret;
-	}
+	ret = fuse_passthrough_extfuse_notify(file, EXTFUSE_PASSTHROUGH_MMAP,
+					      EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
+	if (ret)
+		goto out_end;
+	/* Future page faults are not bracketed, so expire the VFS attr cache too. */
+	fuse_invalidate_attr(file_inode(file));
 
-	return backing_file_mmap(backing_file, vma, &ctx);
+	ret = backing_file_mmap(backing_file, vma, &ctx);
+out_end:
+	(void)fuse_passthrough_extfuse_notify(file, EXTFUSE_PASSTHROUGH_READ,
+					     EXTFUSE_PASSTHROUGH_PHASE_END);
+	return ret;
 }
 
 /*

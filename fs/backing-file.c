@@ -81,6 +81,7 @@ struct backing_aio {
 	struct kiocb *orig_iocb;
 	/* used for aio completion */
 	void (*end_write)(struct kiocb *iocb, ssize_t);
+	int (*end_io)(struct kiocb *iocb, ssize_t ret, bool write);
 	struct work_struct work;
 	long res;
 };
@@ -103,16 +104,46 @@ static void backing_aio_put(struct backing_aio *aio)
 	}
 }
 
-static void backing_aio_cleanup(struct backing_aio *aio, long res)
+static int backing_file_begin_io(struct backing_file_ctx *ctx,
+				 struct kiocb *iocb, bool write)
+{
+	int ret;
+
+	if (!ctx->begin_io)
+		return 0;
+	ret = ctx->begin_io(iocb, write);
+	return ret > 0 ? -EIO : ret;
+}
+
+static long backing_file_end_io(struct kiocb *iocb, long res, bool write,
+				void (*end_write)(struct kiocb *, ssize_t),
+				int (*end_io)(struct kiocb *, ssize_t, bool))
+{
+	if (end_write)
+		end_write(iocb, res);
+	/*
+	 * BEGIN failure prevents the lower operation. Once I/O has completed,
+	 * however, replacing its result after an END failure can make callers retry
+	 * an already committed write. The FUSE callback leaves its active token set
+	 * on failure, which safely forces future metadata requests to userspace.
+	 */
+	if (end_io)
+		end_io(iocb, res, write);
+	return res;
+}
+
+static long backing_aio_cleanup(struct backing_aio *aio, long res)
 {
 	struct kiocb *iocb = &aio->iocb;
 	struct kiocb *orig_iocb = aio->orig_iocb;
 
 	orig_iocb->ki_pos = iocb->ki_pos;
-	if (aio->end_write)
-		aio->end_write(orig_iocb, res);
+	res = backing_file_end_io(orig_iocb, res,
+				  iocb->ki_flags & IOCB_WRITE,
+				  aio->end_write, aio->end_io);
 
 	backing_aio_put(aio);
+	return res;
 }
 
 static void backing_aio_rw_complete(struct kiocb *iocb, long res)
@@ -123,7 +154,7 @@ static void backing_aio_rw_complete(struct kiocb *iocb, long res)
 	if (iocb->ki_flags & IOCB_WRITE)
 		kiocb_end_write(iocb);
 
-	backing_aio_cleanup(aio, res);
+	res = backing_aio_cleanup(aio, res);
 	orig_iocb->ki_complete(orig_iocb, res);
 }
 
@@ -158,7 +189,8 @@ static int backing_aio_init_wq(struct kiocb *iocb)
 }
 
 static int do_backing_file_read_iter(struct file *file, struct iov_iter *iter,
-				     struct kiocb *iocb, int flags)
+				     struct kiocb *iocb, int flags,
+				     struct backing_file_ctx *ctx)
 {
 	struct backing_aio *aio = NULL;
 	int ret;
@@ -166,7 +198,12 @@ static int do_backing_file_read_iter(struct file *file, struct iov_iter *iter,
 	if (is_sync_kiocb(iocb)) {
 		rwf_t rwf = iocb_to_rw_flags(flags);
 
-		return vfs_iter_read(file, iter, &iocb->ki_pos, rwf);
+		ret = backing_file_begin_io(ctx, iocb, false);
+		if (ret)
+			return ret;
+		ret = vfs_iter_read(file, iter, &iocb->ki_pos, rwf);
+		return backing_file_end_io(iocb, ret, false, NULL,
+					   ctx->end_io);
 	}
 
 	aio = kmem_cache_zalloc(backing_aio_cachep, GFP_KERNEL);
@@ -176,11 +213,18 @@ static int do_backing_file_read_iter(struct file *file, struct iov_iter *iter,
 	aio->orig_iocb = iocb;
 	kiocb_clone(&aio->iocb, iocb, get_file(file));
 	aio->iocb.ki_complete = backing_aio_rw_complete;
+	aio->end_io = ctx->end_io;
 	refcount_set(&aio->ref, 2);
+	ret = backing_file_begin_io(ctx, iocb, false);
+	if (ret) {
+		backing_aio_put(aio);
+		backing_aio_put(aio);
+		return ret;
+	}
 	ret = vfs_iocb_iter_read(file, &aio->iocb, iter);
 	backing_aio_put(aio);
 	if (ret != -EIOCBQUEUED)
-		backing_aio_cleanup(aio, ret);
+		ret = backing_aio_cleanup(aio, ret);
 	return ret;
 }
 
@@ -201,7 +245,7 @@ ssize_t backing_file_read_iter(struct file *file, struct iov_iter *iter,
 		return -EINVAL;
 
 	scoped_with_creds(ctx->cred)
-		ret = do_backing_file_read_iter(file, iter, iocb, flags);
+		ret = do_backing_file_read_iter(file, iter, iocb, flags, ctx);
 
 	if (ctx->accessed)
 		ctx->accessed(iocb->ki_filp);
@@ -212,7 +256,7 @@ EXPORT_SYMBOL_GPL(backing_file_read_iter);
 
 static int do_backing_file_write_iter(struct file *file, struct iov_iter *iter,
 				      struct kiocb *iocb, int flags,
-				      void (*end_write)(struct kiocb *, ssize_t))
+				      struct backing_file_ctx *ctx)
 {
 	struct backing_aio *aio;
 	int ret;
@@ -221,21 +265,23 @@ static int do_backing_file_write_iter(struct file *file, struct iov_iter *iter,
 		rwf_t rwf = iocb_to_rw_flags(flags);
 
 		ret = vfs_iter_write(file, iter, &iocb->ki_pos, rwf);
-		if (end_write)
-			end_write(iocb, ret);
-		return ret;
+		return backing_file_end_io(iocb, ret, true, ctx->end_write,
+					   ctx->end_io);
 	}
 
 	ret = backing_aio_init_wq(iocb);
 	if (ret)
-		return ret;
+		return backing_file_end_io(iocb, ret, true, NULL,
+					   ctx->end_io);
 
 	aio = kmem_cache_zalloc(backing_aio_cachep, GFP_KERNEL);
 	if (!aio)
-		return -ENOMEM;
+		return backing_file_end_io(iocb, -ENOMEM, true, NULL,
+					   ctx->end_io);
 
 	aio->orig_iocb = iocb;
-	aio->end_write = end_write;
+	aio->end_write = ctx->end_write;
+	aio->end_io = ctx->end_io;
 	kiocb_clone(&aio->iocb, iocb, get_file(file));
 	aio->iocb.ki_flags = flags;
 	aio->iocb.ki_complete = backing_aio_queue_completion;
@@ -243,7 +289,7 @@ static int do_backing_file_write_iter(struct file *file, struct iov_iter *iter,
 	ret = vfs_iocb_iter_write(file, &aio->iocb, iter);
 	backing_aio_put(aio);
 	if (ret != -EIOCBQUEUED)
-		backing_aio_cleanup(aio, ret);
+		ret = backing_aio_cleanup(aio, ret);
 	return ret;
 }
 
@@ -259,16 +305,22 @@ ssize_t backing_file_write_iter(struct file *file, struct iov_iter *iter,
 	if (!iov_iter_count(iter))
 		return 0;
 
-	ret = file_remove_privs(iocb->ki_filp);
+	ret = backing_file_begin_io(ctx, iocb, true);
 	if (ret)
 		return ret;
 
+	ret = file_remove_privs(iocb->ki_filp);
+	if (ret)
+		return backing_file_end_io(iocb, ret, true, NULL,
+					   ctx->end_io);
+
 	if (iocb->ki_flags & IOCB_DIRECT &&
 	    !(file->f_mode & FMODE_CAN_ODIRECT))
-		return -EINVAL;
+		return backing_file_end_io(iocb, -EINVAL, true, NULL,
+					   ctx->end_io);
 
 	scoped_with_creds(ctx->cred)
-		return do_backing_file_write_iter(file, iter, iocb, flags, ctx->end_write);
+		return do_backing_file_write_iter(file, iter, iocb, flags, ctx);
 }
 EXPORT_SYMBOL_GPL(backing_file_write_iter);
 
@@ -282,8 +334,12 @@ ssize_t backing_file_splice_read(struct file *in, struct kiocb *iocb,
 	if (WARN_ON_ONCE(!(in->f_mode & FMODE_BACKING)))
 		return -EIO;
 
+	ret = backing_file_begin_io(ctx, iocb, false);
+	if (ret)
+		return ret;
 	scoped_with_creds(ctx->cred)
 		ret = vfs_splice_read(in, &iocb->ki_pos, pipe, len, flags);
+	ret = backing_file_end_io(iocb, ret, false, NULL, ctx->end_io);
 
 	if (ctx->accessed)
 		ctx->accessed(iocb->ki_filp);
@@ -305,9 +361,13 @@ ssize_t backing_file_splice_write(struct pipe_inode_info *pipe,
 	if (!out->f_op->splice_write)
 		return -EINVAL;
 
-	ret = file_remove_privs(iocb->ki_filp);
+	ret = backing_file_begin_io(ctx, iocb, true);
 	if (ret)
 		return ret;
+	ret = file_remove_privs(iocb->ki_filp);
+	if (ret)
+		return backing_file_end_io(iocb, ret, true, NULL,
+					   ctx->end_io);
 
 	scoped_with_creds(ctx->cred) {
 		file_start_write(out);
@@ -315,10 +375,8 @@ ssize_t backing_file_splice_write(struct pipe_inode_info *pipe,
 		file_end_write(out);
 	}
 
-	if (ctx->end_write)
-		ctx->end_write(iocb, ret);
-
-	return ret;
+	return backing_file_end_io(iocb, ret, true, ctx->end_write,
+				   ctx->end_io);
 }
 EXPORT_SYMBOL_GPL(backing_file_splice_write);
 

@@ -38,4 +38,17 @@ struct extfuse_req {
 	struct extfuse_out out;
 };
 
+/*
+ * Private native-passthrough notifications use one input argument to bracket
+ * lower I/O.  BEGIN is emitted before the lower operation can mutate metadata;
+ * END is emitted after completion, including asynchronous completion.
+ */
+#define EXTFUSE_PASSTHROUGH_PHASE_BEGIN	1
+#define EXTFUSE_PASSTHROUGH_PHASE_END	2
+
+struct extfuse_passthrough_in {
+	__u32 phase;
+	__u32 reserved;
+};
+
 #endif /* _UAPI_LINUX_EXTFUSE_TYPES_H */

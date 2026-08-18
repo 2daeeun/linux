@@ -14,6 +14,8 @@
 
 struct backing_file_ctx {
 	const struct cred *cred;
+	int (*begin_io)(struct kiocb *iocb, bool write);
+	int (*end_io)(struct kiocb *iocb, ssize_t ret, bool write);
 	void (*accessed)(struct file *file);
 	void (*end_write)(struct kiocb *iocb, ssize_t);
 };

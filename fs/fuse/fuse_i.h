@@ -912,7 +912,7 @@ struct fuse_conn {
 	/** Passthrough support for read/write IO */
 	unsigned int passthrough:1;
 
-	/** Native passthrough invalidates ExtFUSE metadata-cache entries */
+	/** Native passthrough ExtFUSE coherence protocol version (0, 1, or 2) */
 	unsigned int extfuse_passthrough_coherence;
 
 	/* Use pages instead of pointer for kernel I/O */
