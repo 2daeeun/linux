@@ -915,6 +915,9 @@ struct fuse_conn {
 	/** Native passthrough ExtFUSE coherence protocol version (0, 1, or 2) */
 	unsigned int extfuse_passthrough_coherence;
 
+	/** Refresh daemon attributes from the native passthrough inode */
+	unsigned int extfuse_passthrough_attr_refresh;
+
 	/* Use pages instead of pointer for kernel I/O */
 	unsigned int use_pages_for_kvec_io:1;
 
@@ -1620,6 +1623,13 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb, struct iov_iter *iter);
 ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
 				     struct pipe_inode_info *pipe,
 				     size_t len, unsigned int flags);
+#ifdef CONFIG_FUSE_PASSTHROUGH
+void fuse_passthrough_attr_refresh(struct inode *inode);
+#else
+static inline void fuse_passthrough_attr_refresh(struct inode *inode)
+{
+}
+#endif
 ssize_t fuse_passthrough_splice_write(struct pipe_inode_info *pipe,
 				      struct file *out, loff_t *ppos,
 				      size_t len, unsigned int flags);

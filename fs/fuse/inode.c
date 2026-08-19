@@ -1482,6 +1482,17 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				else
 					fc->extfuse_passthrough_coherence = 2;
 			}
+			if (flags & FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH) {
+				if (!(flags & FUSE_FS_EXTFUSE) ||
+				    !(flags & FUSE_PASSTHROUGH) ||
+				    !(flags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE) ||
+				    !(flags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2) ||
+				    !fc->passthrough ||
+				    fc->extfuse_passthrough_coherence < 2)
+					ok = false;
+				else
+					fc->extfuse_passthrough_attr_refresh = 1;
+			}
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1541,7 +1552,8 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		if (IS_ENABLED(CONFIG_EXTFUSE) &&
 		    IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 			flags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE |
-				 FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2;
+				 FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2 |
+				 FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
 	}
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)

@@ -453,6 +453,9 @@ struct fuse_file_lock {
  *			 ExtFUSE BPF program before and after metadata changes
  * FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2: notifications carry explicit
  *			 BEGIN/END phases for a shared per-inode sequence protocol
+ * FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH: refresh regular-file daemon GETATTR
+ *			 state from the same native inode used for passthrough;
+ *			 requires FS_EXTFUSE, PASSTHROUGH and coherence V1/V2
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -503,6 +506,7 @@ struct fuse_file_lock {
 #define FUSE_FS_EXTFUSE		(1ULL << 43)
 #define FUSE_EXTFUSE_PASSTHROUGH_COHERENCE (1ULL << 44)
 #define FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2 (1ULL << 45)
+#define FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH (1ULL << 46)
 
 /**
  * CUSE INIT request/reply flags

@@ -20,6 +20,8 @@
 
 #ifdef __KERNEL__
 
+struct fuse_attr;
+
 #if IS_ENABLED(CONFIG_EXTFUSE)
 
 #include <linux/bpf.h>
@@ -45,6 +47,11 @@ int extfuse_init_reply(struct fuse_conn *fc, struct fuse_args *args);
 ssize_t extfuse_request_send(struct fuse_conn *fc, struct fuse_args *args);
 int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode,
 			       u32 phase);
+int extfuse_passthrough_attr_prepare(struct fuse_conn *fc, u64 nodeid,
+				     struct extfuse_passthrough_attr_cookie *cookie);
+int extfuse_passthrough_attr_commit(struct fuse_conn *fc, u64 nodeid,
+				    const struct extfuse_passthrough_attr_cookie *cookie,
+				    const struct fuse_attr *attr);
 
 #else /* !CONFIG_EXTFUSE */
 
@@ -78,6 +85,21 @@ static inline int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid,
 					     u32 opcode, u32 phase)
 {
 	return 0;
+}
+
+static inline int
+extfuse_passthrough_attr_prepare(struct fuse_conn *fc, u64 nodeid,
+				 struct extfuse_passthrough_attr_cookie *cookie)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int
+extfuse_passthrough_attr_commit(struct fuse_conn *fc, u64 nodeid,
+				const struct extfuse_passthrough_attr_cookie *cookie,
+				const struct fuse_attr *attr)
+{
+	return -EOPNOTSUPP;
 }
 
 #endif /* CONFIG_EXTFUSE */

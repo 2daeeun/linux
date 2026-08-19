@@ -43,6 +43,9 @@ struct extfuse_req_ctx {
 	bool split_lookup_name;
 };
 
+static_assert(sizeof(struct extfuse_passthrough_in) == 8);
+static_assert(sizeof(struct extfuse_passthrough_attr_cookie) == 16);
+
 /*
  * Build the BPF context by mirroring the in-flight request described by
  * @args. Only the small header + pointer-free arg descriptors are exposed;
@@ -132,7 +135,8 @@ static bool fuse_args_to_extfuse_req(struct fuse_args *args,
  * The handler writes its reply directly into the caller's out_args[].value
  * buffers via an ExtFUSE write helper, so there is no copy-back step.
  */
-ssize_t extfuse_request_send(struct fuse_conn *fc, struct fuse_args *args)
+static ssize_t __extfuse_request_send(struct fuse_conn *fc,
+				      struct fuse_args *args)
 {
 	struct extfuse_data *data;
 	struct bpf_prog *prog;
@@ -253,7 +257,71 @@ out_unlock:
 	rcu_read_unlock();
 	return ret;
 }
+
+/* Keep this symbol as the stable tracing and request-accounting boundary. */
+noinline ssize_t extfuse_request_send(struct fuse_conn *fc,
+				      struct fuse_args *args)
+{
+	return __extfuse_request_send(fc, args);
+}
 EXPORT_SYMBOL_GPL(extfuse_request_send);
+
+/*
+ * These two operations are implementation details of the passthrough GETATTR
+ * refresh handshake.  They intentionally bypass extfuse_request_send(), so
+ * request tracing continues to count only ordinary FUSE requests and the
+ * pre-existing native-I/O coherence notifications.
+ */
+int extfuse_passthrough_attr_prepare(struct fuse_conn *fc, u64 nodeid,
+				     struct extfuse_passthrough_attr_cookie *cookie)
+{
+	struct fuse_args args = {
+		.nodeid = nodeid,
+		.opcode = EXTFUSE_PASSTHROUGH_ATTR_PREPARE,
+		.out_numargs = 1,
+		.out_args[0] = {
+			.size = sizeof(*cookie),
+			.value = cookie,
+		},
+	};
+
+	if (!cookie)
+		return -EINVAL;
+
+	memset(cookie, 0, sizeof(*cookie));
+	if (!READ_ONCE(fc->extfuse_passthrough_attr_refresh))
+		return -EOPNOTSUPP;
+
+	return __extfuse_request_send(fc, &args);
+}
+EXPORT_SYMBOL_GPL(extfuse_passthrough_attr_prepare);
+
+int extfuse_passthrough_attr_commit(struct fuse_conn *fc, u64 nodeid,
+				    const struct extfuse_passthrough_attr_cookie *cookie,
+				    const struct fuse_attr *attr)
+{
+	struct fuse_args args = {
+		.nodeid = nodeid,
+		.opcode = EXTFUSE_PASSTHROUGH_ATTR_COMMIT,
+		.in_numargs = 2,
+		.in_args[0] = {
+			.size = sizeof(*cookie),
+			.value = cookie,
+		},
+		.in_args[1] = {
+			.size = sizeof(*attr),
+			.value = attr,
+		},
+	};
+
+	if (!cookie || !attr)
+		return -EINVAL;
+	if (!READ_ONCE(fc->extfuse_passthrough_attr_refresh))
+		return -EOPNOTSUPP;
+
+	return __extfuse_request_send(fc, &args);
+}
+EXPORT_SYMBOL_GPL(extfuse_passthrough_attr_commit);
 
 /*
  * Native passthrough does not create an ordinary FUSE READ/WRITE request, so
@@ -300,6 +368,7 @@ void extfuse_unload_prog(struct fuse_conn *fc)
 {
 	struct extfuse_data *data;
 
+	WRITE_ONCE(fc->extfuse_passthrough_attr_refresh, 0);
 	WRITE_ONCE(fc->extfuse_passthrough_coherence, 0);
 	spin_lock(&fc->extfuse_lock);
 	data = rcu_replace_pointer(fc->fc_priv, NULL,

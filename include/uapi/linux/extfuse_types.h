@@ -48,9 +48,19 @@ struct extfuse_req {
 #define EXTFUSE_PASSTHROUGH_PHASE_BEGIN	1
 #define EXTFUSE_PASSTHROUGH_PHASE_END	2
 
+/* Private BPF tail-call slots for the passthrough attribute handshake. */
+#define EXTFUSE_PASSTHROUGH_ATTR_PREPARE	68
+#define EXTFUSE_PASSTHROUGH_ATTR_COMMIT	69
+
 struct extfuse_passthrough_in {
 	__u32 phase;
 	__u32 reserved;
+};
+
+/* Opaque state guarding a passthrough-backed attribute refresh. */
+struct extfuse_passthrough_attr_cookie {
+	__u64 daemon_state;
+	__u64 native_state;
 };
 
 #endif /* _UAPI_LINUX_EXTFUSE_TYPES_H */
