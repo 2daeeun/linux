@@ -305,19 +305,24 @@ ssize_t backing_file_write_iter(struct file *file, struct iov_iter *iter,
 	if (!iov_iter_count(iter))
 		return 0;
 
-	ret = backing_file_begin_io(ctx, iocb, true);
+	/*
+	 * Complete user-file preparation before starting the backing-file
+	 * transaction.  In particular, file_remove_privs() can issue ordinary
+	 * filesystem xattr operations on iocb->ki_filp; treating those requests as
+	 * concurrent backing I/O needlessly defeats an upper filesystem's coherent
+	 * metadata cache.  begin_io still precedes every operation on @file.
+	 */
+	ret = file_remove_privs(iocb->ki_filp);
 	if (ret)
 		return ret;
 
-	ret = file_remove_privs(iocb->ki_filp);
-	if (ret)
-		return backing_file_end_io(iocb, ret, true, NULL,
-					   ctx->end_io);
-
 	if (iocb->ki_flags & IOCB_DIRECT &&
 	    !(file->f_mode & FMODE_CAN_ODIRECT))
-		return backing_file_end_io(iocb, -EINVAL, true, NULL,
-					   ctx->end_io);
+		return -EINVAL;
+
+	ret = backing_file_begin_io(ctx, iocb, true);
+	if (ret)
+		return ret;
 
 	scoped_with_creds(ctx->cred)
 		return do_backing_file_write_iter(file, iter, iocb, flags, ctx);
@@ -361,13 +366,12 @@ ssize_t backing_file_splice_write(struct pipe_inode_info *pipe,
 	if (!out->f_op->splice_write)
 		return -EINVAL;
 
+	ret = file_remove_privs(iocb->ki_filp);
+	if (ret)
+		return ret;
 	ret = backing_file_begin_io(ctx, iocb, true);
 	if (ret)
 		return ret;
-	ret = file_remove_privs(iocb->ki_filp);
-	if (ret)
-		return backing_file_end_io(iocb, ret, true, NULL,
-					   ctx->end_io);
 
 	scoped_with_creds(ctx->cred) {
 		file_start_write(out);
