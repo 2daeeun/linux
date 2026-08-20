@@ -1500,6 +1500,10 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
 	args.out_numargs = 1;
 	args.out_args[0].size = sizeof(outarg);
 	args.out_args[0].value = &outarg;
+	if (S_ISREG(inode->i_mode)) {
+		args.extfuse_getattr_inode = inode;
+		args.extfuse_getattr_refresh = fuse_passthrough_attr_refresh;
+	}
 	fuse_passthrough_attr_refresh(inode);
 	err = fuse_simple_request(fm, &args);
 	if (!err) {

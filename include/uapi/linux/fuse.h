@@ -456,6 +456,12 @@ struct fuse_file_lock {
  * FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH: refresh regular-file daemon GETATTR
  *			 state from the same native inode used for passthrough;
  *			 requires FS_EXTFUSE, PASSTHROUGH and coherence V1/V2
+ * FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER: serialize regular-file
+ *			 RELEASE metadata publication with ExtFUSE GETATTR refresh;
+ *			 requires FS_EXTFUSE, PASSTHROUGH, coherence V1/V2 and
+ *			 ATTR_REFRESH; the daemon must finish cache publication
+ *			 before the RELEASE reply and must not recurse through the
+ *			 same mount for GETATTR while handling RELEASE
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -507,6 +513,7 @@ struct fuse_file_lock {
 #define FUSE_EXTFUSE_PASSTHROUGH_COHERENCE (1ULL << 44)
 #define FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2 (1ULL << 45)
 #define FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH (1ULL << 46)
+#define FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER (1ULL << 47)
 
 /**
  * CUSE INIT request/reply flags

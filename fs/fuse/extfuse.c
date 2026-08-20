@@ -258,11 +258,81 @@ out_unlock:
 	return ret;
 }
 
+static ssize_t extfuse_release_race_fallback(struct fuse_conn *fc)
+{
+	return READ_ONCE(fc->connected) ? -ENOSYS : -ENOTCONN;
+}
+
+static ssize_t extfuse_getattr_after_release(struct fuse_conn *fc,
+					     struct fuse_args *args,
+					     struct inode *inode)
+{
+	struct fuse_attr_release_barrier_snapshot snapshot;
+	ssize_t ret;
+
+	if (!READ_ONCE(fc->connected) ||
+	    !fuse_attr_release_barrier_enabled(fc))
+		return extfuse_release_race_fallback(fc);
+
+	args->extfuse_getattr_refresh(inode);
+	if (!READ_ONCE(fc->connected) ||
+	    !fuse_attr_release_barrier_enabled(fc))
+		return extfuse_release_race_fallback(fc);
+
+	/* A new RELEASE gets normal userspace fallback instead of another wait. */
+	snapshot = fuse_attr_release_barrier_snapshot(inode);
+	if (snapshot.pending)
+		return extfuse_release_race_fallback(fc);
+
+	ret = __extfuse_request_send(fc, args);
+	if (!READ_ONCE(fc->connected) ||
+	    !fuse_attr_release_barrier_enabled(fc) ||
+	    fuse_attr_release_barrier_changed(inode, &snapshot))
+		return extfuse_release_race_fallback(fc);
+
+	return ret;
+}
+
 /* Keep this symbol as the stable tracing and request-accounting boundary. */
 noinline ssize_t extfuse_request_send(struct fuse_conn *fc,
 				      struct fuse_args *args)
 {
-	return __extfuse_request_send(fc, args);
+	struct fuse_attr_release_barrier_snapshot snapshot;
+	struct inode *inode = args->extfuse_getattr_inode;
+	bool release_barrier;
+	ssize_t ret;
+
+	/*
+	 * GETATTR supplies its inode directly: resolving nodeid here would race
+	 * eviction and would add a global lookup to every ExtFUSE request.
+	 */
+	release_barrier = args->opcode == FUSE_GETATTR && inode &&
+		args->extfuse_getattr_refresh && S_ISREG(inode->i_mode) &&
+		get_node_id(inode) == args->nodeid &&
+		fuse_attr_release_barrier_enabled(fc);
+	if (!release_barrier)
+		return __extfuse_request_send(fc, args);
+
+	snapshot = fuse_attr_release_barrier_snapshot(inode);
+	if (!snapshot.pending) {
+		ret = __extfuse_request_send(fc, args);
+		if (!fuse_attr_release_barrier_changed(inode, &snapshot))
+			return ret;
+	}
+
+	/*
+	 * RELEASE completion publishes daemon metadata before its end callback
+	 * drops pending.  Discard even a successful first dispatch if RELEASE
+	 * overlapped it; a signal, bounded-wait timeout, or capability loss takes
+	 * the safe ordinary fallback instead.
+	 */
+	if (fuse_attr_release_barrier_wait(fc, inode))
+		return extfuse_release_race_fallback(fc);
+	if (!READ_ONCE(fc->connected) ||
+	    !fuse_attr_release_barrier_enabled(fc))
+		return extfuse_release_race_fallback(fc);
+
+	return extfuse_getattr_after_release(fc, args, inode);
 }
 EXPORT_SYMBOL_GPL(extfuse_request_send);
 
@@ -368,6 +438,7 @@ void extfuse_unload_prog(struct fuse_conn *fc)
 {
 	struct extfuse_data *data;
 
+	WRITE_ONCE(fc->extfuse_passthrough_attr_release_barrier, 0);
 	WRITE_ONCE(fc->extfuse_passthrough_attr_refresh, 0);
 	WRITE_ONCE(fc->extfuse_passthrough_coherence, 0);
 	spin_lock(&fc->extfuse_lock);

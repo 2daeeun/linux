@@ -120,6 +120,9 @@ static struct inode *fuse_alloc_inode(struct super_block *sb)
 
 	if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 		fuse_inode_backing_set(fi, NULL);
+#ifdef CONFIG_FUSE_PASSTHROUGH
+	init_waitqueue_head(&fi->extfuse_release_waitq);
+#endif
 
 	return &fi->inode;
 
@@ -1493,6 +1496,23 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				else
 					fc->extfuse_passthrough_attr_refresh = 1;
 			}
+			if (flags &
+			    FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER) {
+				if (!(flags & FUSE_FS_EXTFUSE) ||
+				    !(flags & FUSE_PASSTHROUGH) ||
+				    !(flags &
+				      FUSE_EXTFUSE_PASSTHROUGH_COHERENCE) ||
+				    !(flags &
+				      FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2) ||
+				    !(flags &
+				      FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH) ||
+				    !fc->passthrough ||
+				    fc->extfuse_passthrough_coherence < 2 ||
+				    !fc->extfuse_passthrough_attr_refresh)
+					ok = false;
+				else
+					fc->extfuse_passthrough_attr_release_barrier = 1;
+			}
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1553,7 +1573,8 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		    IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 			flags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE |
 				 FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2 |
-				 FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
+				 FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH |
+				 FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
 	}
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)

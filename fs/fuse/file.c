@@ -96,6 +96,10 @@ static void fuse_release_end(struct fuse_mount *fm, struct fuse_args *args,
 {
 	struct fuse_release_args *ra = container_of(args, typeof(*ra), args);
 
+	if (ra->extfuse_attr_release_barrier_armed) {
+		ra->extfuse_attr_release_barrier_armed = false;
+		fuse_attr_release_barrier_complete(fm->fc, ra->inode);
+	}
 	iput(ra->inode);
 	kfree(ra);
 }
@@ -306,8 +310,22 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 {
 	struct fuse_conn *fc = ff->fm->fc;
 	struct fuse_release_args *ra = &ff->args->release_args;
+	struct inode *release_inode = NULL;
+	bool passthrough = !!fuse_file_passthrough(ff);
+	bool release_barrier_armed = false;
 
-	if (fuse_file_passthrough(ff))
+	if (!sync && fi)
+		release_inode = igrab(&fi->inode);
+	if (release_inode && passthrough && opcode == FUSE_RELEASE &&
+	    S_ISREG(fi->inode.i_mode) &&
+	    fuse_attr_release_barrier_enabled(fc)) {
+		release_barrier_armed =
+			fuse_attr_release_barrier_begin(release_inode);
+		if (release_barrier_armed)
+			fuse_invalidate_attr(release_inode);
+	}
+
+	if (passthrough)
 		fuse_passthrough_release(ff, fuse_inode_backing(fi));
 
 	/* Inode is NULL on error path of fuse_create_open() */
@@ -337,13 +355,14 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 	ra->args.nodeid = ff->nodeid;
 	ra->args.force = true;
 	ra->args.nocreds = true;
+	ra->extfuse_attr_release_barrier_armed = release_barrier_armed;
 
 	/*
 	 * Hold inode until release is finished.
 	 * From fuse_sync_release() the refcount is 1 and everything's
 	 * synchronous, so we are fine with not doing igrab() here.
 	 */
-	ra->inode = sync ? NULL : igrab(&fi->inode);
+	ra->inode = release_inode;
 }
 
 void fuse_file_release(struct inode *inode, struct fuse_file *ff,

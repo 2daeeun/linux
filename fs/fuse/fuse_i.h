@@ -216,6 +216,15 @@ struct fuse_inode {
 #ifdef CONFIG_FUSE_PASSTHROUGH
 	/** Reference to backing file in passthrough mode */
 	struct fuse_backing *fb;
+
+	/** Passthrough RELEASE requests awaiting daemon completion */
+	unsigned int extfuse_release_pending;
+
+	/** Changes whenever a passthrough RELEASE begins or completes */
+	u64 extfuse_release_sequence;
+
+	/** Waiters for passthrough RELEASE completion */
+	wait_queue_head_t extfuse_release_waitq;
 #endif
 
 	/*
@@ -345,6 +354,9 @@ struct fuse_args {
 	bool is_ext:1;
 	bool is_pinned:1;
 	bool invalidate_vmap:1;
+	/* Internal context for a release-barrier GETATTR retry. */
+	struct inode *extfuse_getattr_inode;
+	void (*extfuse_getattr_refresh)(struct inode *inode);
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
@@ -363,6 +375,7 @@ struct fuse_release_args {
 	struct fuse_args args;
 	struct fuse_release_in inarg;
 	struct inode *inode;
+	bool extfuse_attr_release_barrier_armed;
 };
 
 union fuse_file_args {
@@ -918,6 +931,9 @@ struct fuse_conn {
 	/** Refresh daemon attributes from the native passthrough inode */
 	unsigned int extfuse_passthrough_attr_refresh;
 
+	/** Serialize passthrough RELEASE with ExtFUSE GETATTR refresh */
+	unsigned int extfuse_passthrough_attr_release_barrier;
+
 	/* Use pages instead of pointer for kernel I/O */
 	unsigned int use_pages_for_kvec_io:1;
 
@@ -1072,6 +1088,119 @@ static inline struct fuse_inode *get_fuse_inode(const struct inode *inode)
 static inline u64 get_node_id(struct inode *inode)
 {
 	return get_fuse_inode(inode)->nodeid;
+}
+
+struct fuse_attr_release_barrier_snapshot {
+	u64 sequence;
+	unsigned int pending;
+};
+
+static inline bool fuse_attr_release_barrier_enabled(struct fuse_conn *fc)
+{
+	return READ_ONCE(fc->extfuse_passthrough_attr_release_barrier);
+}
+
+#ifdef CONFIG_FUSE_PASSTHROUGH
+static inline bool fuse_attr_release_barrier_begin(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool armed = false;
+
+	spin_lock(&fi->lock);
+	if (!WARN_ON_ONCE(fi->extfuse_release_pending == UINT_MAX)) {
+		fi->extfuse_release_pending++;
+		fi->extfuse_release_sequence++;
+		armed = true;
+	}
+	spin_unlock(&fi->lock);
+
+	return armed;
+}
+
+static inline void
+fuse_attr_release_barrier_complete(struct fuse_conn *fc, struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool wake = false;
+
+	spin_lock(&fi->lock);
+	if (!WARN_ON_ONCE(!fi->extfuse_release_pending)) {
+		/* Reject attr replies that started before this RELEASE completed. */
+		fi->attr_version = atomic64_inc_return(&fc->attr_version);
+		set_mask_bits(&fi->inval_mask, 0, STATX_BASIC_STATS);
+		fi->extfuse_release_pending--;
+		fi->extfuse_release_sequence++;
+		wake = !fi->extfuse_release_pending;
+	}
+	spin_unlock(&fi->lock);
+
+	if (wake)
+		wake_up_all(&fi->extfuse_release_waitq);
+}
+
+static inline struct fuse_attr_release_barrier_snapshot
+fuse_attr_release_barrier_snapshot(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_attr_release_barrier_snapshot snapshot;
+
+	spin_lock(&fi->lock);
+	snapshot.sequence = fi->extfuse_release_sequence;
+	snapshot.pending = fi->extfuse_release_pending;
+	spin_unlock(&fi->lock);
+
+	return snapshot;
+}
+
+static inline int fuse_attr_release_barrier_wait(struct fuse_conn *fc,
+						 struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	long ret;
+
+	ret = wait_event_killable_timeout(fi->extfuse_release_waitq,
+					  !READ_ONCE(fi->extfuse_release_pending) ||
+					  !READ_ONCE(fc->connected) ||
+					  !fuse_attr_release_barrier_enabled(fc),
+					  HZ);
+	if (ret > 0)
+		return 0;
+
+	return ret ? (int)ret : -ETIMEDOUT;
+}
+#else
+static inline bool fuse_attr_release_barrier_begin(struct inode *inode)
+{
+	return false;
+}
+
+static inline void
+fuse_attr_release_barrier_complete(struct fuse_conn *fc, struct inode *inode)
+{
+}
+
+static inline struct fuse_attr_release_barrier_snapshot
+fuse_attr_release_barrier_snapshot(struct inode *inode)
+{
+	return (struct fuse_attr_release_barrier_snapshot) {};
+}
+
+static inline int fuse_attr_release_barrier_wait(struct fuse_conn *fc,
+						 struct inode *inode)
+{
+	return 0;
+}
+#endif
+
+static inline bool
+fuse_attr_release_barrier_changed(struct inode *inode,
+				  const struct fuse_attr_release_barrier_snapshot *before)
+{
+	struct fuse_attr_release_barrier_snapshot after;
+
+	after = fuse_attr_release_barrier_snapshot(inode);
+	return before->pending || after.pending ||
+	       before->sequence != after.sequence;
 }
 
 static inline int invalid_nodeid(u64 nodeid)
