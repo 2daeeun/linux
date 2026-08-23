@@ -8,6 +8,7 @@
 
 
 #include "fuse_i.h"
+#include "fuse_cpu_scope.h"
 #include <linux/iversion.h>
 #include <linux/posix_acl.h>
 #include <linux/pagemap.h>
@@ -589,6 +590,7 @@ int fuse_readdir(struct file *file, struct dir_context *ctx)
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
 	int err;
+	FUSE_CPU_SCOPE(ff->fm->fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;

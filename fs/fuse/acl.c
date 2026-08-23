@@ -7,6 +7,7 @@
  */
 
 #include "fuse_i.h"
+#include "fuse_cpu_scope.h"
 
 #include <linux/posix_acl.h>
 #include <linux/posix_acl_xattr.h>
@@ -69,6 +70,7 @@ struct posix_acl *fuse_get_acl(struct mnt_idmap *idmap,
 {
 	struct inode *inode = d_inode(dentry);
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_no_acl(fc, inode))
 		return ERR_PTR(-EOPNOTSUPP);
@@ -79,6 +81,7 @@ struct posix_acl *fuse_get_acl(struct mnt_idmap *idmap,
 struct posix_acl *fuse_get_inode_acl(struct inode *inode, int type, bool rcu)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	FUSE_CPU_SCOPE(fc);
 
 	/*
 	 * FUSE daemons before FUSE_POSIX_ACL was introduced could get and set
@@ -99,6 +102,7 @@ int fuse_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	const char *name;
 	int ret;
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;

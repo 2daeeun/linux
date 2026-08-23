@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "fuse_cpu_scope.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -257,6 +258,7 @@ static int fuse_open(struct inode *inode, struct file *file)
 	bool is_truncate = (file->f_flags & O_TRUNC) && fc->atomic_o_trunc;
 	bool is_wb_truncate = is_truncate && fc->writeback_cache;
 	bool dax_truncate = is_truncate && FUSE_IS_DAX(inode);
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -406,6 +408,7 @@ void fuse_release_common(struct file *file, bool isdir)
 static int fuse_release(struct inode *inode, struct file *file)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	FUSE_CPU_SCOPE(fc);
 
 	/*
 	 * Dirty pages might remain despite write_inode_now() call from
@@ -481,6 +484,7 @@ static int fuse_flush(struct file *file, fl_owner_t id)
 	struct fuse_flush_in inarg;
 	FUSE_ARGS(args);
 	int err;
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -552,6 +556,7 @@ static int fuse_fsync(struct file *file, loff_t start, loff_t end,
 	struct inode *inode = file->f_mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	int err;
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -729,6 +734,7 @@ static void fuse_aio_complete_req(struct fuse_mount *fm, struct fuse_args *args,
 	struct fuse_io_priv *io = ia->io;
 	ssize_t pos = -1;
 	size_t nres;
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (err) {
 		/* Nothing */
@@ -992,6 +998,7 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 		.read_ctx = &data,
 
 	};
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	if (fuse_is_bad(inode)) {
 		folio_unlock(folio);
@@ -1023,6 +1030,7 @@ static void fuse_readpages_end(struct fuse_mount *fm, struct fuse_args *args,
 	size_t num_read = args->out_args[0].size;
 	struct address_space *mapping;
 	struct inode *inode;
+	FUSE_CPU_SCOPE(fm->fc);
 
 	WARN_ON_ONCE(!ap->num_folios);
 	mapping = ap->folios[0]->mapping;
@@ -1096,6 +1104,7 @@ static void fuse_readahead(struct readahead_control *rac)
 		.rac = rac,
 		.read_ctx = &data
 	};
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_is_bad(inode))
 		return;
@@ -1831,6 +1840,7 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct file *file = iocb->ki_filp;
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -1852,6 +1862,7 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct file *file = iocb->ki_filp;
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -1873,6 +1884,7 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 				unsigned int flags)
 {
 	struct fuse_file *ff = in->private_data;
+	FUSE_CPU_SCOPE(ff->fm->fc);
 
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
@@ -1885,6 +1897,7 @@ static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
 				 loff_t *ppos, size_t len, unsigned int flags)
 {
 	struct fuse_file *ff = out->private_data;
+	FUSE_CPU_SCOPE(ff->fm->fc);
 
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
@@ -2007,6 +2020,7 @@ static void fuse_writepage_end(struct fuse_mount *fm, struct fuse_args *args,
 	struct inode *inode = wpa->inode;
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	FUSE_CPU_SCOPE(fc);
 
 	mapping_set_error(inode->i_mapping, error);
 	/*
@@ -2050,6 +2064,7 @@ int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_file *ff;
 	int err;
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	ff = __fuse_write_file_get(fi);
 	err = fuse_flush_times(inode, ff);
@@ -2303,6 +2318,7 @@ static int fuse_writepages(struct address_space *mapping,
 		.ops = &fuse_writeback_ops,
 		.wb_ctx	= &data,
 	};
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -2324,6 +2340,7 @@ static int fuse_launder_folio(struct folio *folio)
 		.ops = &fuse_writeback_ops,
 		.wb_ctx	= &data,
 	};
+	FUSE_CPU_SCOPE(get_fuse_conn(wpc.inode));
 
 	if (folio_clear_dirty_for_io(folio)) {
 		err = iomap_writeback_folio(&wpc, folio);
@@ -2341,6 +2358,7 @@ static int fuse_launder_folio(struct folio *folio)
 static void fuse_vma_close(struct vm_area_struct *vma)
 {
 	int err;
+	FUSE_CPU_SCOPE(get_fuse_conn(file_inode(vma->vm_file)));
 
 	err = write_inode_now(vma->vm_file->f_mapping->host, 1);
 	mapping_set_error(vma->vm_file->f_mapping, err);
@@ -2365,6 +2383,7 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 {
 	struct folio *folio = page_folio(vmf->page);
 	struct inode *inode = file_inode(vmf->vma->vm_file);
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	file_update_time(vmf->vma->vm_file);
 	folio_lock(folio);
@@ -2390,6 +2409,7 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 	struct fuse_conn *fc = ff->fm->fc;
 	struct inode *inode = file_inode(file);
 	int rc;
+	FUSE_CPU_SCOPE(fc);
 
 	/* DAX mmap is superior to direct_io mmap */
 	if (FUSE_IS_DAX(inode))
@@ -2552,6 +2572,7 @@ static int fuse_file_lock(struct file *file, int cmd, struct file_lock *fl)
 	struct inode *inode = file_inode(file);
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	int err;
+	FUSE_CPU_SCOPE(fc);
 
 	if (cmd == F_CANCELLK) {
 		err = 0;
@@ -2575,6 +2596,7 @@ static int fuse_file_flock(struct file *file, int cmd, struct file_lock *fl)
 	struct inode *inode = file_inode(file);
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	int err;
+	FUSE_CPU_SCOPE(fc);
 
 	if (fc->no_flock) {
 		err = locks_lock_file_wait(file, fl);
@@ -2597,6 +2619,7 @@ static sector_t fuse_bmap(struct address_space *mapping, sector_t block)
 	struct fuse_bmap_in inarg;
 	struct fuse_bmap_out outarg;
 	int err;
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (!inode->i_sb->s_bdev || fm->fc->no_bmap)
 		return 0;
@@ -2667,6 +2690,7 @@ static loff_t fuse_file_llseek(struct file *file, loff_t offset, int whence)
 {
 	loff_t retval;
 	struct inode *inode = file_inode(file);
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	switch (whence) {
 	case SEEK_SET:
@@ -2753,6 +2777,7 @@ __poll_t fuse_file_poll(struct file *file, poll_table *wait)
 	struct fuse_poll_out outarg;
 	FUSE_ARGS(args);
 	int err;
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (fm->fc->no_poll)
 		return DEFAULT_POLLMASK;
@@ -2845,6 +2870,7 @@ fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 	size_t count = iov_iter_count(iter), shortened = 0;
 	loff_t offset = iocb->ki_pos;
 	struct fuse_io_priv *io;
+	FUSE_CPU_SCOPE(ff->fm->fc);
 
 	pos = offset;
 	inode = file->f_mapping->host;
@@ -2956,6 +2982,7 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
 	bool block_faults = FUSE_IS_DAX(inode) &&
 		(!(mode & FALLOC_FL_KEEP_SIZE) ||
 		 (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)));
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
 		     FALLOC_FL_ZERO_RANGE))
@@ -3167,6 +3194,7 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
 				    size_t len, unsigned int flags)
 {
 	ssize_t ret;
+	FUSE_CPU_SCOPE(get_fuse_conn(file_inode(src_file)));
 
 	ret = __fuse_copy_file_range(src_file, src_off, dst_file, dst_off,
 				     len, flags);

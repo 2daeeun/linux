@@ -4,6 +4,7 @@
  */
 
 #include "fuse_i.h"
+#include "fuse_cpu_scope.h"
 
 #include <linux/uio.h>
 #include <linux/compat.h>
@@ -426,12 +427,16 @@ long fuse_ioctl_common(struct file *file, unsigned int cmd,
 
 long fuse_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+	FUSE_CPU_SCOPE(get_fuse_conn(file_inode(file)));
+
 	return fuse_ioctl_common(file, cmd, arg, 0);
 }
 
 long fuse_file_compat_ioctl(struct file *file, unsigned int cmd,
 			    unsigned long arg)
 {
+	FUSE_CPU_SCOPE(get_fuse_conn(file_inode(file)));
+
 	return fuse_ioctl_common(file, cmd, arg, FUSE_IOCTL_COMPAT);
 }
 
@@ -509,6 +514,7 @@ int fuse_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
 	unsigned int flags;
 	struct fsxattr xfa;
 	int err;
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	ff = fuse_priv_ioctl_prepare(inode);
 	if (IS_ERR(ff))
@@ -547,6 +553,7 @@ int fuse_fileattr_set(struct mnt_idmap *idmap,
 	unsigned int flags = fa->flags;
 	struct fsxattr xfa;
 	int err;
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	ff = fuse_priv_ioctl_prepare(inode);
 	if (IS_ERR(ff))

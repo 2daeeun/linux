@@ -6,6 +6,7 @@
  */
 
 #include "fuse_i.h"
+#include "fuse_cpu_scope.h"
 #include "extfuse_i.h"
 
 #include <linux/file.h>
@@ -61,6 +62,7 @@ void fuse_passthrough_attr_refresh(struct inode *inode)
 	struct kstat stat;
 	const struct cred *old_cred;
 	int err;
+	FUSE_CPU_SCOPE(fc);
 
 	if (!S_ISREG(inode->i_mode) ||
 	    !READ_ONCE(fc->extfuse_passthrough_attr_refresh))
@@ -104,6 +106,8 @@ static int fuse_passthrough_extfuse_notify(struct file *file, u32 opcode,
 
 static int fuse_passthrough_begin_io(struct kiocb *iocb, bool write)
 {
+	FUSE_CPU_SCOPE(get_fuse_conn(file_inode(iocb->ki_filp)));
+
 	return fuse_passthrough_extfuse_notify(iocb->ki_filp,
 			write ? EXTFUSE_PASSTHROUGH_WRITE :
 				EXTFUSE_PASSTHROUGH_READ,
@@ -113,6 +117,8 @@ static int fuse_passthrough_begin_io(struct kiocb *iocb, bool write)
 static int fuse_passthrough_end_io(struct kiocb *iocb, ssize_t ret,
 				   bool write)
 {
+	FUSE_CPU_SCOPE(get_fuse_conn(file_inode(iocb->ki_filp)));
+
 	(void)ret;
 	if (!write)
 		fuse_invalidate_atime(file_inode(iocb->ki_filp));
@@ -125,6 +131,7 @@ static int fuse_passthrough_end_io(struct kiocb *iocb, ssize_t ret,
 static void fuse_file_accessed(struct file *file)
 {
 	struct inode *inode = file_inode(file);
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	fuse_invalidate_atime(inode);
 }
@@ -132,6 +139,7 @@ static void fuse_file_accessed(struct file *file)
 static void fuse_passthrough_end_write(struct kiocb *iocb, ssize_t ret)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	fuse_write_update_attr(inode, iocb->ki_pos, ret);
 }

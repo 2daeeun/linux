@@ -124,6 +124,30 @@ TRACE_EVENT(fuse_request_end,
 		  __entry->unique, __entry->len, __entry->error)
 );
 
+/*
+ * Marks inclusive kernel CPU work performed on behalf of one FUSE
+ * connection.  Consumers keep a per-TID stack because FUSE callbacks may be
+ * nested, including through another FUSE filesystem.
+ */
+TRACE_EVENT(fuse_cpu_scope,
+	TP_PROTO(dev_t connection, bool enter),
+
+	TP_ARGS(connection, enter),
+
+	TP_STRUCT__entry(
+		__field(dev_t,	connection)
+		__field(bool,	enter)
+	),
+
+	TP_fast_assign(
+		__entry->connection	=	connection;
+		__entry->enter		=	enter;
+	),
+
+	TP_printk("connection %u enter %u", __entry->connection,
+		  __entry->enter)
+);
+
 #endif /* _TRACE_FUSE_H */
 
 #undef TRACE_INCLUDE_PATH

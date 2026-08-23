@@ -5,6 +5,7 @@
  */
 
 #include "fuse_i.h"
+#include "fuse_cpu_scope.h"
 
 #include <linux/delay.h>
 #include <linux/dax.h>
@@ -69,6 +70,9 @@ struct fuse_inode_dax {
 };
 
 struct fuse_conn_dax {
+	/* Owning connection for connection-scoped worker attribution */
+	struct fuse_conn *fc;
+
 	/* DAX device */
 	struct dax_device *dev;
 
@@ -761,6 +765,7 @@ static vm_fault_t __fuse_dax_fault(struct vm_fault *vmf, unsigned int order,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_conn_dax *fcd = fc->dax;
 	bool retry = false;
+	FUSE_CPU_SCOPE(fc);
 
 	if (write)
 		sb_start_pagefault(sb);
@@ -1160,6 +1165,8 @@ static void fuse_dax_free_mem_worker(struct work_struct *work)
 	int ret;
 	struct fuse_conn_dax *fcd = container_of(work, struct fuse_conn_dax,
 						 free_work.work);
+	FUSE_CPU_SCOPE(fcd->fc);
+
 	ret = try_to_free_dmap_chunks(fcd, FUSE_DAX_RECLAIM_CHUNK);
 	if (ret) {
 		pr_debug("fuse: try_to_free_dmap_chunks() failed with err=%d\n",
@@ -1260,6 +1267,7 @@ int fuse_dax_conn_alloc(struct fuse_conn *fc, enum fuse_dax_mode dax_mode,
 		return -ENOMEM;
 
 	spin_lock_init(&fcd->lock);
+	fcd->fc = fc;
 	fcd->dev = dax_dev;
 	err = fuse_dax_mem_range_init(fcd);
 	if (err) {

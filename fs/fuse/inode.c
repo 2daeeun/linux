@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "fuse_cpu_scope.h"
 #include "fuse_dev_i.h"
 #include "extfuse_i.h"
 #include "dev_uring_i.h"
@@ -162,6 +163,7 @@ static void fuse_cleanup_submount_lookup(struct fuse_conn *fc,
 static void fuse_evict_inode(struct inode *inode)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	/* Will write inode on close/munmap and in all other dirtiers */
 	WARN_ON(inode_state_read_once(inode) & I_DIRTY_INODE);
@@ -621,6 +623,7 @@ void fuse_unlock_inode(struct inode *inode, bool locked)
 static void fuse_umount_begin(struct super_block *sb)
 {
 	struct fuse_conn *fc = get_fuse_conn_super(sb);
+	FUSE_CPU_SCOPE(fc);
 
 	if (fc->no_force_umount)
 		return;
@@ -665,6 +668,7 @@ static int fuse_statfs(struct dentry *dentry, struct kstatfs *buf)
 	FUSE_ARGS(args);
 	struct fuse_statfs_out outarg;
 	int err;
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (!fuse_allow_current_process(fm->fc)) {
 		buf->f_type = FUSE_SUPER_MAGIC;
@@ -742,6 +746,7 @@ static int fuse_sync_fs(struct super_block *sb, int wait)
 	struct fuse_syncfs_in inarg;
 	FUSE_ARGS(args);
 	int err;
+	FUSE_CPU_SCOPE(fc);
 
 	/*
 	 * Userspace cannot handle the wait == 0 case.  Avoid a
@@ -917,6 +922,7 @@ static int fuse_show_options(struct seq_file *m, struct dentry *root)
 {
 	struct super_block *sb = root->d_sb;
 	struct fuse_conn *fc = get_fuse_conn_super(sb);
+	FUSE_CPU_SCOPE(fc);
 
 	if (fc->legacy_opts_show) {
 		seq_printf(m, ",user_id=%u",
@@ -1019,6 +1025,7 @@ EXPORT_SYMBOL_GPL(fuse_conn_init);
 static void delayed_release(struct rcu_head *p)
 {
 	struct fuse_conn *fc = container_of(p, struct fuse_conn, rcu);
+	FUSE_CPU_SCOPE(fc);
 
 	fuse_uring_destruct(fc);
 
@@ -1131,6 +1138,7 @@ static int fuse_encode_fh(struct inode *inode, u32 *fh, int *max_len,
 	int len = parent ? 6 : 3;
 	u64 nodeid;
 	u32 generation;
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
 
 	if (*max_len < len) {
 		*max_len = len;
@@ -1161,6 +1169,7 @@ static struct dentry *fuse_fh_to_dentry(struct super_block *sb,
 		struct fid *fid, int fh_len, int fh_type)
 {
 	struct fuse_inode_handle handle;
+	FUSE_CPU_SCOPE(get_fuse_conn_super(sb));
 
 	if ((fh_type != FILEID_INO64_GEN &&
 	     fh_type != FILEID_INO64_GEN_PARENT) || fh_len < 3)
@@ -1176,6 +1185,7 @@ static struct dentry *fuse_fh_to_parent(struct super_block *sb,
 		struct fid *fid, int fh_len, int fh_type)
 {
 	struct fuse_inode_handle parent;
+	FUSE_CPU_SCOPE(get_fuse_conn_super(sb));
 
 	if (fh_type != FILEID_INO64_GEN_PARENT || fh_len < 6)
 		return NULL;
@@ -1194,6 +1204,7 @@ static struct dentry *fuse_get_parent(struct dentry *child)
 	struct dentry *parent;
 	struct fuse_entry_out outarg;
 	int err;
+	FUSE_CPU_SCOPE(fc);
 
 	if (!fc->export_support)
 		return ERR_PTR(-ESTALE);
@@ -1332,6 +1343,7 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 	struct fuse_init_out *arg = &ia->out;
 	bool use_extfuse = false;
 	bool ok = true;
+	FUSE_CPU_SCOPE(fc);
 
 	if (error || arg->major != FUSE_KERNEL_VERSION)
 		ok = false;

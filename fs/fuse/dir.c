@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "fuse_cpu_scope.h"
 
 #include <linux/pagemap.h>
 #include <linux/file.h>
@@ -201,6 +202,7 @@ void fuse_epoch_work(struct work_struct *work)
 					    epoch_work);
 	struct fuse_mount *fm;
 	struct inode *inode;
+	FUSE_CPU_SCOPE(fc);
 
 	down_read(&fc->killsb);
 
@@ -391,6 +393,7 @@ static int fuse_dentry_revalidate(struct inode *dir, const struct qstr *name,
 	int ret;
 
 	fc = get_fuse_conn_super(dir->i_sb);
+	FUSE_CPU_SCOPE(fc);
 	if (entry->d_time < atomic_read(&fc->epoch))
 		goto invalid;
 
@@ -472,6 +475,7 @@ invalid:
 static int fuse_dentry_init(struct dentry *dentry)
 {
 	struct fuse_dentry *fd;
+	FUSE_CPU_SCOPE(get_fuse_conn_super(dentry->d_sb));
 
 	fd = kzalloc(sizeof(struct fuse_dentry),
 			  GFP_KERNEL_ACCOUNT | __GFP_RECLAIMABLE);
@@ -488,6 +492,7 @@ static int fuse_dentry_init(struct dentry *dentry)
 static void fuse_dentry_release(struct dentry *dentry)
 {
 	struct fuse_dentry *fd = dentry->d_fsdata;
+	FUSE_CPU_SCOPE(get_fuse_conn_super(dentry->d_sb));
 
 	if (!RB_EMPTY_NODE(&fd->node))
 		fuse_dentry_tree_del_node(dentry);
@@ -496,6 +501,8 @@ static void fuse_dentry_release(struct dentry *dentry)
 
 static int fuse_dentry_delete(const struct dentry *dentry)
 {
+	FUSE_CPU_SCOPE(get_fuse_conn_super(dentry->d_sb));
+
 	return time_before64(fuse_dentry_time(dentry), get_jiffies_64());
 }
 
@@ -509,6 +516,7 @@ static struct vfsmount *fuse_dentry_automount(struct path *path)
 	struct fs_context *fsc;
 	struct vfsmount *mnt;
 	struct fuse_inode *mp_fi = get_fuse_inode(d_inode(path->dentry));
+	FUSE_CPU_SCOPE(get_fuse_conn(d_inode(path->dentry)));
 
 	fsc = fs_context_for_submount(path->mnt->mnt_sb->s_type, path->dentry);
 	if (IS_ERR(fsc))
@@ -610,6 +618,7 @@ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
 	int err, epoch;
 	bool outarg_valid = true;
 	bool locked;
+	FUSE_CPU_SCOPE(get_fuse_conn(dir));
 
 	if (fuse_is_bad(dir))
 		return ERR_PTR(-EIO);
@@ -932,6 +941,7 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 	int err;
 	struct mnt_idmap *idmap = file_mnt_idmap(file);
 	struct fuse_conn *fc = get_fuse_conn(dir);
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_is_bad(dir))
 		return -EIO;
@@ -1064,6 +1074,7 @@ static int fuse_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	struct fuse_mknod_in inarg;
 	struct fuse_mount *fm = get_fuse_mount(dir);
 	FUSE_ARGS(args);
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (!fm->fc->dont_mask)
 		mode &= ~current_umask();
@@ -1084,6 +1095,8 @@ static int fuse_mknod(struct mnt_idmap *idmap, struct inode *dir,
 static int fuse_create(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *entry, umode_t mode, bool excl)
 {
+	FUSE_CPU_SCOPE(get_fuse_conn(dir));
+
 	return fuse_mknod(idmap, dir, entry, mode, 0);
 }
 
@@ -1092,6 +1105,7 @@ static int fuse_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct fuse_conn *fc = get_fuse_conn(dir);
 	int err;
+	FUSE_CPU_SCOPE(fc);
 
 	if (fc->no_tmpfile)
 		return -EOPNOTSUPP;
@@ -1111,6 +1125,7 @@ static struct dentry *fuse_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	struct fuse_mkdir_in inarg;
 	struct fuse_mount *fm = get_fuse_mount(dir);
 	FUSE_ARGS(args);
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (!fm->fc->dont_mask)
 		mode &= ~current_umask();
@@ -1133,6 +1148,7 @@ static int fuse_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	struct fuse_mount *fm = get_fuse_mount(dir);
 	unsigned len = strlen(link) + 1;
 	FUSE_ARGS(args);
+	FUSE_CPU_SCOPE(fm->fc);
 
 	args.opcode = FUSE_SYMLINK;
 	args.in_numargs = 3;
@@ -1194,6 +1210,7 @@ static int fuse_unlink(struct inode *dir, struct dentry *entry)
 	int err;
 	struct fuse_mount *fm = get_fuse_mount(dir);
 	FUSE_ARGS(args);
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (fuse_is_bad(dir))
 		return -EIO;
@@ -1218,6 +1235,7 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
 	int err;
 	struct fuse_mount *fm = get_fuse_mount(dir);
 	FUSE_ARGS(args);
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (fuse_is_bad(dir))
 		return -EIO;
@@ -1293,6 +1311,7 @@ static int fuse_rename2(struct mnt_idmap *idmap, struct inode *olddir,
 {
 	struct fuse_conn *fc = get_fuse_conn(olddir);
 	int err;
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_is_bad(olddir))
 		return -EIO;
@@ -1329,6 +1348,7 @@ static int fuse_link(struct dentry *entry, struct inode *newdir,
 	struct inode *inode = d_inode(entry);
 	struct fuse_mount *fm = get_fuse_mount(inode);
 	FUSE_ARGS(args);
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (fm->fc->no_link)
 		goto out;
@@ -1760,6 +1780,7 @@ static int fuse_permission(struct mnt_idmap *idmap,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	bool refreshed = false;
 	int err = 0;
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -1858,6 +1879,7 @@ static const char *fuse_get_link(struct dentry *dentry, struct inode *inode,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct folio *folio;
 	int err;
+	FUSE_CPU_SCOPE(fc);
 
 	err = -EIO;
 	if (fuse_is_bad(inode))
@@ -1893,6 +1915,7 @@ static int fuse_dir_open(struct inode *inode, struct file *file)
 {
 	struct fuse_mount *fm = get_fuse_mount(inode);
 	int err;
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -1921,6 +1944,8 @@ static int fuse_dir_open(struct inode *inode, struct file *file)
 
 static int fuse_dir_release(struct inode *inode, struct file *file)
 {
+	FUSE_CPU_SCOPE(get_fuse_conn(inode));
+
 	fuse_release_common(file, true);
 
 	return 0;
@@ -1932,6 +1957,7 @@ static int fuse_dir_fsync(struct file *file, loff_t start, loff_t end,
 	struct inode *inode = file->f_mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	int err;
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -1954,6 +1980,7 @@ static long fuse_dir_ioctl(struct file *file, unsigned int cmd,
 			    unsigned long arg)
 {
 	struct fuse_conn *fc = get_fuse_conn(file->f_mapping->host);
+	FUSE_CPU_SCOPE(fc);
 
 	/* FUSE_IOCTL_DIR only supported for API version >= 7.18 */
 	if (fc->minor < 18)
@@ -1966,6 +1993,7 @@ static long fuse_dir_compat_ioctl(struct file *file, unsigned int cmd,
 				   unsigned long arg)
 {
 	struct fuse_conn *fc = get_fuse_conn(file->f_mapping->host);
+	FUSE_CPU_SCOPE(fc);
 
 	if (fc->minor < 18)
 		return -ENOTTY;
@@ -2320,6 +2348,7 @@ static int fuse_setattr(struct mnt_idmap *idmap, struct dentry *entry,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct file *file = (attr->ia_valid & ATTR_FILE) ? attr->ia_file : NULL;
 	int ret;
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -2382,6 +2411,7 @@ static int fuse_getattr(struct mnt_idmap *idmap,
 {
 	struct inode *inode = d_inode(path->dentry);
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	FUSE_CPU_SCOPE(fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -2477,6 +2507,7 @@ void fuse_init_dir(struct inode *inode)
 
 static int fuse_symlink_read_folio(struct file *null, struct folio *folio)
 {
+	FUSE_CPU_SCOPE(get_fuse_conn(folio->mapping->host));
 	int err = fuse_readlink_folio(folio->mapping->host, folio);
 
 	if (!err)

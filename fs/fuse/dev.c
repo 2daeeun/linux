@@ -8,6 +8,7 @@
 
 #include "dev_uring_i.h"
 #include "fuse_i.h"
+#include "fuse_cpu_scope.h"
 #include "fuse_dev_i.h"
 #include "extfuse_i.h"
 
@@ -80,6 +81,7 @@ void fuse_check_timeout(struct work_struct *work)
 	struct fuse_dev *fud;
 	struct fuse_pqueue *fpq;
 	bool expired = false;
+	FUSE_CPU_SCOPE(fc);
 
 	if (!atomic_read(&fc->num_waiting))
 	    goto out;
@@ -485,6 +487,7 @@ void fuse_request_end(struct fuse_req *req)
 	struct fuse_mount *fm = req->fm;
 	struct fuse_conn *fc = fm->fc;
 	struct fuse_iqueue *fiq = &fc->iq;
+	FUSE_CPU_SCOPE(fc);
 
 	if (test_and_set_bit(FR_FINISHED, &req->flags))
 		goto put_request;
@@ -1595,6 +1598,7 @@ static ssize_t fuse_dev_read(struct kiocb *iocb, struct iov_iter *to)
 
 	if (IS_ERR(fud))
 		return PTR_ERR(fud);
+	FUSE_CPU_SCOPE(fud->fc);
 
 	if (!user_backed_iter(to))
 		return -EINVAL;
@@ -1616,6 +1620,7 @@ static ssize_t fuse_dev_splice_read(struct file *in, loff_t *ppos,
 
 	if (IS_ERR(fud))
 		return PTR_ERR(fud);
+	FUSE_CPU_SCOPE(fud->fc);
 
 	bufs = kvmalloc_array(pipe->max_usage, sizeof(struct pipe_buffer),
 			      GFP_KERNEL);
@@ -2321,6 +2326,7 @@ static ssize_t fuse_dev_write(struct kiocb *iocb, struct iov_iter *from)
 
 	if (!fud)
 		return -EPERM;
+	FUSE_CPU_SCOPE(fud->fc);
 
 	if (!user_backed_iter(from))
 		return -EINVAL;
@@ -2345,6 +2351,7 @@ static ssize_t fuse_dev_splice_write(struct pipe_inode_info *pipe,
 
 	if (!fud)
 		return -EPERM;
+	FUSE_CPU_SCOPE(fud->fc);
 
 	pipe_lock(pipe);
 
@@ -2430,6 +2437,7 @@ static __poll_t fuse_dev_poll(struct file *file, poll_table *wait)
 
 	if (IS_ERR(fud))
 		return EPOLLERR;
+	FUSE_CPU_SCOPE(fud->fc);
 
 	fiq = &fud->fc->iq;
 	poll_wait(file, &fiq->waitq, wait);
@@ -2582,6 +2590,7 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 		struct fuse_pqueue *fpq = &fud->pq;
 		LIST_HEAD(to_end);
 		unsigned int i;
+		FUSE_CPU_SCOPE(fc);
 
 		spin_lock(&fpq->lock);
 		WARN_ON(!list_empty(&fpq->io));
@@ -2608,6 +2617,7 @@ static int fuse_dev_fasync(int fd, struct file *file, int on)
 
 	if (IS_ERR(fud))
 		return PTR_ERR(fud);
+	FUSE_CPU_SCOPE(fud->fc);
 
 	/* No locking - fasync_helper does its own locking */
 	return fasync_helper(fd, file, on, &fud->fc->iq.fasync);
@@ -2652,6 +2662,8 @@ static long fuse_dev_ioctl_clone(struct file *file, __u32 __user *argp)
 
 	res = -EINVAL;
 	if (fud) {
+		FUSE_CPU_SCOPE(fud->fc);
+
 		mutex_lock(&fuse_mutex);
 		res = fuse_device_clone(fud->fc, file);
 		mutex_unlock(&fuse_mutex);
@@ -2668,6 +2680,7 @@ static long fuse_dev_ioctl_backing_open(struct file *file,
 
 	if (IS_ERR(fud))
 		return PTR_ERR(fud);
+	FUSE_CPU_SCOPE(fud->fc);
 
 	if (!IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 		return -EOPNOTSUPP;
@@ -2685,6 +2698,7 @@ static long fuse_dev_ioctl_backing_close(struct file *file, __u32 __user *argp)
 
 	if (IS_ERR(fud))
 		return PTR_ERR(fud);
+	FUSE_CPU_SCOPE(fud->fc);
 
 	if (!IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 		return -EOPNOTSUPP;

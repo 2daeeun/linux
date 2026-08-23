@@ -7,6 +7,7 @@
  */
 
 #include "fuse_i.h"
+#include "fuse_cpu_scope.h"
 
 #include <linux/xattr.h>
 #include <linux/posix_acl_xattr.h>
@@ -18,6 +19,7 @@ int fuse_setxattr(struct inode *inode, const char *name, const void *value,
 	FUSE_ARGS(args);
 	struct fuse_setxattr_in inarg;
 	int err;
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (fm->fc->no_setxattr)
 		return -EOPNOTSUPP;
@@ -56,6 +58,7 @@ ssize_t fuse_getxattr(struct inode *inode, const char *name, void *value,
 	struct fuse_getxattr_in inarg;
 	struct fuse_getxattr_out outarg;
 	ssize_t ret;
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (fm->fc->no_getxattr)
 		return -EOPNOTSUPP;
@@ -114,6 +117,7 @@ ssize_t fuse_listxattr(struct dentry *entry, char *list, size_t size)
 	struct fuse_getxattr_in inarg;
 	struct fuse_getxattr_out outarg;
 	ssize_t ret;
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -158,6 +162,7 @@ int fuse_removexattr(struct inode *inode, const char *name)
 	struct fuse_mount *fm = get_fuse_mount(inode);
 	FUSE_ARGS(args);
 	int err;
+	FUSE_CPU_SCOPE(fm->fc);
 
 	if (fm->fc->no_removexattr)
 		return -EOPNOTSUPP;

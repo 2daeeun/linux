@@ -5,6 +5,7 @@
  */
 
 #include "fuse_i.h"
+#include "fuse_cpu_scope.h"
 #include "dev_uring_i.h"
 #include "fuse_dev_i.h"
 #include "fuse_trace.h"
@@ -438,6 +439,7 @@ static void fuse_uring_async_stop_queues(struct work_struct *work)
 	int qid;
 	struct fuse_ring *ring =
 		container_of(work, struct fuse_ring, async_teardown_work.work);
+	FUSE_CPU_SCOPE(ring->fc);
 
 	/* XXX code dup */
 	for (qid = 0; qid < ring->nr_queues; qid++) {
@@ -1181,6 +1183,7 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		return PTR_ERR(fud);
 	}
 	fc = fud->fc;
+	FUSE_CPU_SCOPE(fc);
 
 	/* Once a connection has io-uring enabled on it, it can't be disabled */
 	if (!enable_uring && !fc->io_uring) {
@@ -1253,6 +1256,7 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
 	struct fuse_ring_ent *ent = uring_cmd_to_ring_ent(cmd);
 	struct fuse_ring_queue *queue = ent->queue;
 	int err;
+	FUSE_CPU_SCOPE(queue->ring->fc);
 
 	if (!tw.cancel) {
 		err = fuse_uring_prepare_send(ent, ent->fuse_req);
