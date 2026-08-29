@@ -15,6 +15,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/poll.h>
+#include <linux/posix_acl.h>
 #include <linux/sched/signal.h>
 #include <linux/uio.h>
 #include <linux/miscdevice.h>
@@ -152,6 +153,7 @@ static struct fuse_req *fuse_request_alloc(struct fuse_mount *fm, gfp_t flags)
 static void fuse_request_free(struct fuse_req *req)
 {
 	WARN_ON(!list_empty(&req->intr_entry));
+	extfuse_request_free(req);
 	kmem_cache_free(fuse_req_cachep, req);
 }
 
@@ -377,7 +379,7 @@ void fuse_dev_queue_interrupt(struct fuse_iqueue *fiq, struct fuse_req *req)
 static inline void fuse_request_assign_unique_locked(struct fuse_iqueue *fiq,
 						     struct fuse_req *req)
 {
-	if (req->in.h.opcode != FUSE_NOTIFY_REPLY)
+	if (req->in.h.opcode != FUSE_NOTIFY_REPLY && !req->in.h.unique)
 		req->in.h.unique = fuse_get_unique_locked(fiq);
 
 	/* tracepoint captures in.h.unique and in.h.len */
@@ -387,7 +389,7 @@ static inline void fuse_request_assign_unique_locked(struct fuse_iqueue *fiq,
 inline void fuse_request_assign_unique(struct fuse_iqueue *fiq,
 				       struct fuse_req *req)
 {
-	if (req->in.h.opcode != FUSE_NOTIFY_REPLY)
+	if (req->in.h.opcode != FUSE_NOTIFY_REPLY && !req->in.h.unique)
 		req->in.h.unique = fuse_get_unique(fiq);
 
 	/* tracepoint captures in.h.unique and in.h.len */
@@ -492,6 +494,7 @@ void fuse_request_end(struct fuse_req *req)
 	if (test_and_set_bit(FR_FINISHED, &req->flags))
 		goto put_request;
 
+	extfuse_request_complete(req);
 	trace_fuse_request_end(req);
 	/*
 	 * test_and_set_bit() implies smp_mb() between bit
@@ -545,8 +548,9 @@ bool fuse_remove_pending_req(struct fuse_req *req, spinlock_t *lock)
 		 */
 		list_del(&req->list);
 		spin_unlock(lock);
-		__fuse_put_request(req);
 		req->out.h.error = -EINTR;
+		extfuse_request_cancel(req, -EINTR);
+		__fuse_put_request(req);
 		return true;
 	}
 	spin_unlock(lock);
@@ -703,12 +707,18 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
 	 * Run ExtFUSE after request admission and compatibility adjustment.
 	 * This preserves connection errors and legacy argument layouts.
 	 */
-	ret = extfuse_request_send(fc, args);
+	fuse_args_to_req(req, args);
+	ret = extfuse_request_pre(req, GFP_KERNEL);
 	if (ret != -ENOSYS) {
 		fuse_put_request(req);
 		return ret;
 	}
-	fuse_args_to_req(req, args);
+	ret = extfuse_request_prepare_daemon(req, GFP_KERNEL);
+	if (ret) {
+		extfuse_request_cancel(req, ret);
+		fuse_put_request(req);
+		return ret;
+	}
 
 	if (!args->noreply)
 		__set_bit(FR_ISREPLY, &req->flags);
@@ -777,6 +787,7 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 			    gfp_t gfp_flags)
 {
 	struct fuse_req *req;
+	int err;
 
 	if (args->force) {
 		WARN_ON(!args->nocreds);
@@ -792,8 +803,15 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 	}
 
 	fuse_args_to_req(req, args);
+	err = extfuse_request_prepare_daemon(req, gfp_flags);
+	if (err) {
+		extfuse_request_cancel(req, err);
+		fuse_put_request(req);
+		return err;
+	}
 
 	if (!fuse_request_queue_background(req)) {
+		extfuse_request_cancel(req, -ENOTCONN);
 		fuse_put_request(req);
 		return -ENOTCONN;
 	}
@@ -1695,6 +1713,49 @@ static int fuse_notify_inval_inode(struct fuse_conn *fc, unsigned int size,
 	err = fuse_reverse_inval_inode(fc, outarg.ino,
 				       outarg.off, outarg.len);
 	up_read(&fc->killsb);
+	if (!err)
+		extfuse_coherence_invalidate(fc, outarg.ino,
+					     EXTFUSE_COHERENCE_DOMAIN_ATTR |
+					     EXTFUSE_COHERENCE_DOMAIN_XATTR |
+					     EXTFUSE_COHERENCE_DOMAIN_DATA);
+	return err;
+}
+
+static int fuse_notify_inval_xattr(struct fuse_conn *fc, unsigned int size,
+				   struct fuse_copy_state *cs)
+{
+	struct fuse_notify_inval_xattr_out outarg;
+	struct inode *inode;
+	int err;
+
+	if (!READ_ONCE(fc->extfuse_notify_inval_xattr))
+		return -EOPNOTSUPP;
+	if (size != sizeof(outarg))
+		return -EINVAL;
+	err = fuse_copy_one(cs, &outarg, sizeof(outarg));
+	if (err)
+		return err;
+	fuse_copy_finish(cs);
+	if (!outarg.ino || outarg.flags || outarg.padding)
+		return -EINVAL;
+
+	down_read(&fc->killsb);
+	inode = fuse_ilookup(fc, outarg.ino, NULL);
+	if (!inode) {
+		err = -ENOENT;
+		goto out;
+	}
+
+	forget_all_cached_acls(inode);
+	inode_set_flags(inode, 0, S_NOSEC);
+	fuse_invalidate_attr(inode);
+	extfuse_coherence_invalidate_inode(fc, inode,
+					   EXTFUSE_COHERENCE_DOMAIN_ATTR |
+					   EXTFUSE_COHERENCE_DOMAIN_XATTR);
+	iput(inode);
+	err = 0;
+out:
+	up_read(&fc->killsb);
 	return err;
 }
 
@@ -1735,6 +1796,9 @@ static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
 	down_read(&fc->killsb);
 	err = fuse_reverse_inval_entry(fc, outarg.parent, 0, &name, outarg.flags);
 	up_read(&fc->killsb);
+	extfuse_coherence_invalidate(fc, outarg.parent,
+				     EXTFUSE_COHERENCE_DOMAIN_ATTR |
+				     EXTFUSE_COHERENCE_DOMAIN_NAMESPACE);
 err:
 	kfree(buf);
 	return err;
@@ -1776,6 +1840,11 @@ static int fuse_notify_delete(struct fuse_conn *fc, unsigned int size,
 	down_read(&fc->killsb);
 	err = fuse_reverse_inval_entry(fc, outarg.parent, outarg.child, &name, 0);
 	up_read(&fc->killsb);
+	extfuse_coherence_invalidate(fc, outarg.parent,
+				     EXTFUSE_COHERENCE_DOMAIN_ATTR |
+				     EXTFUSE_COHERENCE_DOMAIN_NAMESPACE);
+	extfuse_coherence_invalidate(fc, outarg.child,
+				     EXTFUSE_COHERENCE_DOMAIN_ATTR);
 err:
 	kfree(buf);
 	return err;
@@ -1794,6 +1863,7 @@ static int fuse_notify_store(struct fuse_conn *fc, unsigned int size,
 	unsigned int num;
 	loff_t file_size;
 	loff_t end;
+	bool extfuse_begun = false;
 
 	if (size < sizeof(outarg))
 		return -EINVAL;
@@ -1813,6 +1883,14 @@ static int fuse_notify_store(struct fuse_conn *fc, unsigned int size,
 	inode = fuse_ilookup(fc, nodeid,  NULL);
 	if (!inode)
 		goto out_up_killsb;
+	if (READ_ONCE(fc->extfuse_coherence_v3)) {
+		err = extfuse_coherence_begin_inode(fc, inode,
+					EXTFUSE_COHERENCE_DOMAIN_ATTR |
+					EXTFUSE_COHERENCE_DOMAIN_DATA);
+		if (err)
+			goto out_iput;
+		extfuse_begun = true;
+	}
 
 	mapping = inode->i_mapping;
 	index = outarg.offset >> PAGE_SHIFT;
@@ -1860,6 +1938,10 @@ static int fuse_notify_store(struct fuse_conn *fc, unsigned int size,
 	err = 0;
 
 out_iput:
+	if (extfuse_begun)
+		extfuse_coherence_end_inode(inode,
+					EXTFUSE_COHERENCE_DOMAIN_ATTR |
+					EXTFUSE_COHERENCE_DOMAIN_DATA);
 	iput(inode);
 out_up_killsb:
 	up_read(&fc->killsb);
@@ -2079,6 +2161,7 @@ static int fuse_notify_resend(struct fuse_conn *fc)
 static int fuse_notify_inc_epoch(struct fuse_conn *fc)
 {
 	atomic_inc(&fc->epoch);
+	extfuse_coherence_invalidate_namespace(fc);
 	if (inval_wq)
 		schedule_work(&fc->epoch_work);
 
@@ -2155,6 +2238,9 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
 	case FUSE_NOTIFY_PRUNE:
 		return fuse_notify_prune(fc, size, cs);
 
+	case FUSE_NOTIFY_INVAL_XATTR:
+		return fuse_notify_inval_xattr(fc, size, cs);
+
 	default:
 		return -EINVAL;
 	}
@@ -2173,11 +2259,29 @@ struct fuse_req *fuse_request_find(struct fuse_pqueue *fpq, u64 unique)
 	return NULL;
 }
 
+static int fuse_copy_discard(struct fuse_copy_state *cs, unsigned int nbytes)
+{
+	char discard[256];
+	int err;
+
+	while (nbytes) {
+		unsigned int count = min_t(unsigned int, nbytes,
+					   sizeof(discard));
+
+		err = fuse_copy_one(cs, discard, count);
+		if (err)
+			return err;
+		nbytes -= count;
+	}
+	return 0;
+}
+
 int fuse_copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 		       unsigned nbytes)
 {
-
 	unsigned int reqsize = 0;
+	unsigned int excess;
+	int err;
 
 	/*
 	 * Uring has all headers separated from args - args is payload only
@@ -2187,7 +2291,20 @@ int fuse_copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 
 	reqsize += fuse_len_args(args->out_numargs, args->out_args);
 
-	if (reqsize < nbytes || (reqsize > nbytes && !args->out_argvar))
+	if (WARN_ON_ONCE(args->out_argvar && args->out_arg_optional))
+		return -EINVAL;
+	if (reqsize < nbytes && args->out_arg_optional) {
+		excess = nbytes - reqsize;
+		args->out_arg_optional_invalid = true;
+		err = fuse_copy_args(cs, args->out_numargs, args->out_pages,
+				     args->out_args, args->page_zeroing);
+		if (err)
+			return err;
+		return fuse_copy_discard(cs, excess);
+	}
+	if (reqsize < nbytes ||
+	    (reqsize > nbytes && !args->out_argvar &&
+	     !args->out_arg_optional))
 		return -EINVAL;
 	else if (reqsize > nbytes) {
 		struct fuse_arg *lastarg = &args->out_args[args->out_numargs-1];
@@ -2280,10 +2397,18 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 	if (!req->args->page_replace)
 		cs->move_folios = false;
 
-	if (oh.error)
-		err = nbytes != sizeof(oh) ? -EINVAL : 0;
-	else
+	if (oh.error) {
+		if (nbytes == sizeof(oh)) {
+			err = 0;
+		} else if (req->args->out_arg_optional) {
+			req->args->out_arg_optional_invalid = true;
+			err = fuse_copy_discard(cs, nbytes - sizeof(oh));
+		} else {
+			err = -EINVAL;
+		}
+	} else {
 		err = fuse_copy_out_args(cs, req->args, nbytes);
+	}
 	fuse_copy_finish(cs);
 
 	spin_lock(&fpq->lock);
@@ -2295,6 +2420,8 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 	if (!test_bit(FR_PRIVATE, &req->flags))
 		list_del_init(&req->list);
 	spin_unlock(&fpq->lock);
+	if (!err)
+		req->extfuse_reply_received = true;
 
 	/*
 	 * Resolve the ExtFUSE program while current is still the daemon that

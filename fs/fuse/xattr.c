@@ -31,6 +31,7 @@ int fuse_setxattr(struct inode *inode, const char *name, const void *value,
 
 	args.opcode = FUSE_SETXATTR;
 	args.nodeid = get_node_id(inode);
+	args.extfuse_inode = inode;
 	args.in_numargs = 3;
 	args.in_args[0].size = fm->fc->setxattr_ext ?
 		sizeof(inarg) : FUSE_COMPAT_SETXATTR_IN_SIZE;
@@ -67,6 +68,7 @@ ssize_t fuse_getxattr(struct inode *inode, const char *name, void *value,
 	inarg.size = size;
 	args.opcode = FUSE_GETXATTR;
 	args.nodeid = get_node_id(inode);
+	args.extfuse_inode = inode;
 	args.in_numargs = 2;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
@@ -132,6 +134,7 @@ ssize_t fuse_listxattr(struct dentry *entry, char *list, size_t size)
 	inarg.size = size;
 	args.opcode = FUSE_LISTXATTR;
 	args.nodeid = get_node_id(inode);
+	args.extfuse_inode = inode;
 	args.in_numargs = 1;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
@@ -169,6 +172,7 @@ int fuse_removexattr(struct inode *inode, const char *name)
 
 	args.opcode = FUSE_REMOVEXATTR;
 	args.nodeid = get_node_id(inode);
+	args.extfuse_inode = inode;
 	args.in_numargs = 2;
 	fuse_set_zero_arg0(&args);
 	args.in_args[1].size = strlen(name) + 1;

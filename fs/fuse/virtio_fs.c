@@ -723,37 +723,88 @@ static int copy_args_to_argbuf(struct fuse_req *req, gfp_t gfp)
 /* Copy args out of and free req->argbuf */
 static void copy_args_from_argbuf(struct fuse_args *args, struct fuse_req *req)
 {
+	unsigned int max_payload;
 	unsigned int remaining;
 	unsigned int offset;
 	unsigned int num_in;
 	unsigned int num_out;
 	unsigned int i;
 
-	remaining = req->out.h.len - sizeof(req->out.h);
 	num_in = args->in_numargs - args->in_pages;
 	num_out = args->out_numargs - args->out_pages;
 	offset = fuse_len_args(num_in, (struct fuse_arg *)args->in_args);
+	if (req->virtio_fs_out_len < sizeof(req->out.h) ||
+	    req->out.h.len != req->virtio_fs_out_len ||
+	    req->out.h.error <= -512 || req->out.h.error > 0 ||
+	    (req->out.h.unique & ~FUSE_INT_REQ_BIT) != req->in.h.unique ||
+	    (req->out.h.unique & FUSE_INT_REQ_BIT)) {
+		req->out.h.error = -EIO;
+		goto out;
+	}
+
+	remaining = req->virtio_fs_out_len - sizeof(req->out.h);
+	if (req->out.h.error) {
+		if (remaining && !args->out_arg_optional) {
+			req->out.h.error = -EIO;
+			goto out;
+		}
+		if (remaining)
+			args->out_arg_optional_invalid = true;
+		req->extfuse_reply_received = true;
+		goto out;
+	}
+
+	max_payload = fuse_len_args(args->out_numargs, args->out_args);
+	if (remaining > max_payload) {
+		if (!args->out_arg_optional) {
+			req->out.h.error = -EIO;
+			goto out;
+		}
+		args->out_arg_optional_invalid = true;
+		remaining = max_payload;
+	}
 
 	for (i = 0; i < num_out; i++) {
 		unsigned int argsize = args->out_args[i].size;
+		bool last = i == args->out_numargs - 1;
 
-		if (args->out_argvar &&
-		    i == args->out_numargs - 1 &&
-		    argsize > remaining) {
-			argsize = remaining;
+		if (last && (args->out_argvar || args->out_arg_optional)) {
+			if (remaining > argsize && args->out_arg_optional)
+				args->out_arg_optional_invalid = true;
+			argsize = min(argsize, remaining);
+		} else if (argsize > remaining) {
+			req->out.h.error = -EIO;
+			goto out;
 		}
 
 		memcpy(args->out_args[i].value, req->argbuf + offset, argsize);
 		offset += argsize;
-
-		if (i != args->out_numargs - 1)
-			remaining -= argsize;
+		remaining -= argsize;
+		if (last && (args->out_argvar || args->out_arg_optional))
+			args->out_args[i].size = argsize;
 	}
+	if (args->out_pages) {
+		struct fuse_arg *lastarg;
 
-	/* Store the actual size of the variable-length arg */
-	if (args->out_argvar)
-		args->out_args[args->out_numargs - 1].size = remaining;
+		if (WARN_ON_ONCE(!args->out_numargs)) {
+			req->out.h.error = -EIO;
+			goto out;
+		}
+		lastarg = &args->out_args[args->out_numargs - 1];
+		if (remaining > lastarg->size) {
+			req->out.h.error = -EIO;
+			goto out;
+		}
+		if (args->out_argvar)
+			lastarg->size = remaining;
+		else if (remaining != lastarg->size) {
+			req->out.h.error = -EIO;
+			goto out;
+		}
+	}
+	req->extfuse_reply_received = true;
 
+out:
 	kfree(req->argbuf);
 	req->argbuf = NULL;
 }
@@ -824,6 +875,7 @@ static void virtio_fs_requests_done_work(struct work_struct *work)
 		virtqueue_disable_cb(vq);
 
 		while ((req = virtqueue_get_buf(vq, &len)) != NULL) {
+			req->virtio_fs_out_len = len;
 			spin_lock(&fpq->lock);
 			list_move_tail(&req->list, &reqs);
 			spin_unlock(&fpq->lock);

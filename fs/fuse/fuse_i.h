@@ -147,6 +147,18 @@ struct fuse_inode {
 	/** Version of last attribute change */
 	u64 attr_version;
 
+	/** Serializes the ExtFUSE V3 epoch and active-mutation state. */
+	spinlock_t extfuse_coherence_lock;
+
+	/** Distinguishes reuse of the same daemon-provided node ID. */
+	u64 extfuse_incarnation;
+
+	/** ATTR, XATTR, DATA and NAMESPACE epochs, in that order. */
+	u64 extfuse_epoch[4];
+
+	/** In-flight mutation counts for the corresponding epoch domains. */
+	u32 extfuse_active[4];
+
 	union {
 		/* read/write io cache (regular file only) */
 		struct {
@@ -348,6 +360,8 @@ struct fuse_args {
 	bool out_pages:1;
 	bool user_pages:1;
 	bool out_argvar:1;
+	bool out_arg_optional:1;
+	bool out_arg_optional_invalid:1;
 	bool page_zeroing:1;
 	bool page_replace:1;
 	bool may_block:1;
@@ -357,6 +371,11 @@ struct fuse_args {
 	/* Internal context for a release-barrier GETATTR retry. */
 	struct inode *extfuse_getattr_inode;
 	void (*extfuse_getattr_refresh)(struct inode *inode);
+	/* Direct inode identities for ExtFUSE V3 mutation tracking. */
+	struct inode *extfuse_inode;
+	struct inode *extfuse_inode2;
+	struct inode *extfuse_inode3;
+	struct inode *extfuse_inode4;
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
@@ -462,6 +481,13 @@ struct fuse_req {
 	/* Input/output arguments */
 	struct fuse_args *args;
 
+	/** Optional ExtFUSE V3 PRE/POST and mutation state. */
+	struct extfuse_req_state *extfuse_state;
+	/** A transport validated and accepted the daemon reply. */
+	bool extfuse_reply_received:1;
+	/** The stable ExtFUSE PRE terminal event was emitted. */
+	bool extfuse_pre_traced:1;
+
 	/** refcount */
 	refcount_t count;
 
@@ -484,6 +510,8 @@ struct fuse_req {
 #if IS_ENABLED(CONFIG_VIRTIO_FS)
 	/** virtio-fs's physically contiguous buffer for in and out args */
 	void *argbuf;
+	/** Actual number of reply bytes reported by the virtqueue. */
+	unsigned int virtio_fs_out_len;
 #endif
 
 	/** fuse_mount this request belongs to */
@@ -934,6 +962,15 @@ struct fuse_conn {
 	/** Serialize passthrough RELEASE with ExtFUSE GETATTR refresh */
 	unsigned int extfuse_passthrough_attr_release_barrier;
 
+	/** Kernel-owned ExtFUSE inode epochs and two-phase BPF dispatch */
+	unsigned int extfuse_coherence_v3;
+
+	/** Daemon replies may append struct fuse_mutation_out */
+	unsigned int extfuse_mutation_metadata;
+
+	/** Daemon may send FUSE_NOTIFY_INVAL_XATTR */
+	unsigned int extfuse_notify_inval_xattr;
+
 	/* Use pages instead of pointer for kernel I/O */
 	unsigned int use_pages_for_kvec_io:1;
 
@@ -969,6 +1006,19 @@ struct fuse_conn {
 
 	/** Version counter for evict inode */
 	atomic64_t evict_ctr;
+
+	/** Allocates connection-local ExtFUSE inode incarnations. */
+	atomic64_t extfuse_incarnation_ctr;
+
+	/** Invalidates every ExtFUSE parent namespace snapshot at once. */
+	atomic64_t extfuse_namespace_epoch;
+
+	/** Serializes filesystem-wide ExtFUSE metadata mutation state. */
+	spinlock_t extfuse_global_coherence_lock;
+
+	/** Epoch and active count folded into every ExtFUSE target snapshot. */
+	u64 extfuse_global_epoch;
+	u32 extfuse_global_active;
 
 	/* maximum file name length */
 	u32 name_max;
@@ -1684,7 +1734,8 @@ void fuse_file_io_release(struct fuse_file *ff, struct inode *inode);
 
 /* file.c */
 struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
-				 unsigned int open_flags, bool isdir);
+				 unsigned int open_flags, bool isdir,
+				 struct inode *inode);
 void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 		       unsigned int open_flags, fl_owner_t id, bool isdir);
 

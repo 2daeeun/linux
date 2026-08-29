@@ -240,6 +240,10 @@
  *  - add FUSE_COPY_FILE_RANGE_64
  *  - add struct fuse_copy_file_range_out
  *  - add FUSE_NOTIFY_PRUNE
+ *
+ *  7.46
+ *  - add ExtFUSE coherence V3 and mutation metadata
+ *  - add FUSE_NOTIFY_INVAL_XATTR
  */
 
 #ifndef _LINUX_FUSE_H
@@ -275,7 +279,7 @@
 #define FUSE_KERNEL_VERSION 7
 
 /** Minor version number of this interface */
-#define FUSE_KERNEL_MINOR_VERSION 45
+#define FUSE_KERNEL_MINOR_VERSION 46
 
 /** The node ID of the root inode */
 #define FUSE_ROOT_ID 1
@@ -462,6 +466,12 @@ struct fuse_file_lock {
  *			 ATTR_REFRESH; the daemon must finish cache publication
  *			 before the RELEASE reply and must not recurse through the
  *			 same mount for GETATTR while handling RELEASE
+ * FUSE_EXTFUSE_COHERENCE_V3: expose kernel-owned inode coherence epochs to
+ *			 ExtFUSE before and after daemon requests
+ * FUSE_MUTATION_METADATA: mutation replies may append a validated metadata
+ *			 trailer; requires FUSE_EXTFUSE_COHERENCE_V3
+ * FUSE_HAS_NOTIFY_INVAL_XATTR: daemon may invalidate all cached xattr state
+ *			 for one node; requires FUSE_EXTFUSE_COHERENCE_V3
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -514,6 +524,9 @@ struct fuse_file_lock {
 #define FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2 (1ULL << 45)
 #define FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH (1ULL << 46)
 #define FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER (1ULL << 47)
+#define FUSE_EXTFUSE_COHERENCE_V3 (1ULL << 48)
+#define FUSE_MUTATION_METADATA	(1ULL << 49)
+#define FUSE_HAS_NOTIFY_INVAL_XATTR (1ULL << 50)
 
 /**
  * CUSE INIT request/reply flags
@@ -701,6 +714,7 @@ enum fuse_notify_code {
 	FUSE_NOTIFY_RESEND = 7,
 	FUSE_NOTIFY_INC_EPOCH = 8,
 	FUSE_NOTIFY_PRUNE = 9,
+	FUSE_NOTIFY_INVAL_XATTR = 10,
 };
 
 /* The read buffer is required to be at least 8k, but may be much larger */
@@ -746,6 +760,26 @@ struct fuse_attr_out {
 	uint32_t	attr_valid_nsec;
 	uint32_t	dummy;
 	struct fuse_attr attr;
+};
+
+#define FUSE_MUTATION_MAX_NODES	4
+#define FUSE_MUTATION_OUT_VERSION	1
+
+#define FUSE_MUTATION_NODE_ATTR_VALID		(1 << 0)
+#define FUSE_MUTATION_NODE_XATTR_UNCHANGED	(1 << 1)
+#define FUSE_MUTATION_NODE_XATTR_CHANGED	(1 << 2)
+
+struct fuse_mutation_out {
+	uint16_t	version;
+	uint16_t	count;
+	uint32_t	flags;
+};
+
+struct fuse_mutation_node_out {
+	uint64_t	nodeid;
+	uint32_t	flags;
+	uint32_t	reserved;
+	struct fuse_attr_out attr;
 };
 
 struct fuse_statx_in {
@@ -1145,6 +1179,12 @@ struct fuse_notify_prune_out {
 	uint32_t	count;
 	uint32_t	padding;
 	uint64_t	spare;
+};
+
+struct fuse_notify_inval_xattr_out {
+	uint64_t	ino;
+	uint32_t	flags;
+	uint32_t	padding;
 };
 
 struct fuse_backing_map {

@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_cpu_scope.h"
+#include "extfuse_i.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -26,7 +27,7 @@
 
 static int fuse_send_open(struct fuse_mount *fm, u64 nodeid,
 			  unsigned int open_flags, int opcode,
-			  struct fuse_open_out *outargp)
+			  struct fuse_open_out *outargp, struct inode *inode)
 {
 	struct fuse_open_in inarg;
 	FUSE_ARGS(args);
@@ -43,6 +44,7 @@ static int fuse_send_open(struct fuse_mount *fm, u64 nodeid,
 
 	args.opcode = opcode;
 	args.nodeid = nodeid;
+	args.extfuse_inode = inode;
 	args.in_numargs = 1;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
@@ -132,7 +134,8 @@ static void fuse_file_put(struct fuse_file *ff, bool sync)
 }
 
 struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
-				 unsigned int open_flags, bool isdir)
+				 unsigned int open_flags, bool isdir,
+				 struct inode *inode)
 {
 	struct fuse_conn *fc = fm->fc;
 	struct fuse_file *ff;
@@ -160,7 +163,8 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 		struct fuse_open_out *outargp = &ff->args->open_outarg;
 		int err;
 
-		err = fuse_send_open(fm, nodeid, open_flags, opcode, outargp);
+		err = fuse_send_open(fm, nodeid, open_flags, opcode, outargp,
+				     inode);
 		if (!err) {
 			ff->fh = outargp->fh;
 			ff->open_flags = outargp->open_flags;
@@ -190,7 +194,9 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
 		 bool isdir)
 {
-	struct fuse_file *ff = fuse_file_open(fm, nodeid, file->f_flags, isdir);
+	struct inode *inode = nodeid ? file_inode(file) : NULL;
+	struct fuse_file *ff = fuse_file_open(fm, nodeid, file->f_flags, isdir,
+					     inode);
 
 	if (!IS_ERR(ff))
 		file->private_data = ff;
@@ -313,11 +319,19 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 	struct fuse_conn *fc = ff->fm->fc;
 	struct fuse_release_args *ra = &ff->args->release_args;
 	struct inode *release_inode = NULL;
+	struct inode *extfuse_inode = NULL;
 	bool passthrough = !!fuse_file_passthrough(ff);
 	bool release_barrier_armed = false;
+	bool extfuse_release_begun = false;
+	bool extfuse_release_mutation;
+	int extfuse_err;
 
 	if (!sync && fi)
 		release_inode = igrab(&fi->inode);
+	if (release_inode)
+		extfuse_inode = release_inode;
+	else if (sync && fi)
+		extfuse_inode = &fi->inode;
 	if (release_inode && passthrough && opcode == FUSE_RELEASE &&
 	    S_ISREG(fi->inode.i_mode) &&
 	    fuse_attr_release_barrier_enabled(fc)) {
@@ -326,9 +340,27 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 		if (release_barrier_armed)
 			fuse_invalidate_attr(release_inode);
 	}
+	extfuse_release_mutation = passthrough && fi &&
+		opcode == FUSE_RELEASE && S_ISREG(fi->inode.i_mode) &&
+		(flags & O_ACCMODE) != O_RDONLY &&
+		READ_ONCE(fc->extfuse_coherence_v3);
+	if (extfuse_release_mutation) {
+		extfuse_err = extfuse_coherence_begin_inode(fc, &fi->inode,
+				EXTFUSE_COHERENCE_DOMAIN_ATTR |
+				EXTFUSE_COHERENCE_DOMAIN_DATA);
+		extfuse_release_begun = !extfuse_err;
+	}
 
 	if (passthrough)
 		fuse_passthrough_release(ff, fuse_inode_backing(fi));
+	if (extfuse_release_begun)
+		extfuse_coherence_end_inode(&fi->inode,
+			EXTFUSE_COHERENCE_DOMAIN_ATTR |
+			EXTFUSE_COHERENCE_DOMAIN_DATA);
+	else if (extfuse_release_mutation)
+		extfuse_coherence_invalidate_inode(fc, &fi->inode,
+			EXTFUSE_COHERENCE_DOMAIN_ATTR |
+			EXTFUSE_COHERENCE_DOMAIN_DATA);
 
 	/* Inode is NULL on error path of fuse_create_open() */
 	if (likely(fi)) {
@@ -355,6 +387,7 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 	ra->args.in_args[0].value = &ra->inarg;
 	ra->args.opcode = opcode;
 	ra->args.nodeid = ff->nodeid;
+	ra->args.extfuse_inode = extfuse_inode;
 	ra->args.force = true;
 	ra->args.nocreds = true;
 	ra->extfuse_attr_release_barrier_armed = release_barrier_armed;
@@ -509,6 +542,7 @@ static int fuse_flush(struct file *file, fl_owner_t id)
 	inarg.lock_owner = fuse_lock_owner_id(fm->fc, id);
 	args.opcode = FUSE_FLUSH;
 	args.nodeid = get_node_id(inode);
+	args.extfuse_inode = inode;
 	args.in_numargs = 1;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
@@ -544,6 +578,7 @@ int fuse_fsync_common(struct file *file, loff_t start, loff_t end,
 	inarg.fsync_flags = datasync ? FUSE_FSYNC_FDATASYNC : 0;
 	args.opcode = opcode;
 	args.nodeid = get_node_id(inode);
+	args.extfuse_inode = inode;
 	args.in_numargs = 1;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
@@ -613,6 +648,7 @@ void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
 	ia->read.in.flags = file->f_flags;
 	args->opcode = opcode;
 	args->nodeid = ff->nodeid;
+	args->extfuse_inode = file_inode(file);
 	args->in_numargs = 1;
 	args->in_args[0].size = sizeof(ia->read.in);
 	args->in_args[0].value = &ia->read.in;
@@ -1178,6 +1214,7 @@ static ssize_t fuse_send_write(struct fuse_io_args *ia, loff_t pos,
 	ssize_t err;
 
 	fuse_write_args_fill(ia, ff, pos, count);
+	ia->ap.args.extfuse_inode = file_inode(file);
 	inarg->flags = fuse_write_flags(iocb);
 	if (owner != NULL) {
 		inarg->write_flags |= FUSE_WRITE_LOCKOWNER;
@@ -1229,6 +1266,7 @@ static ssize_t fuse_send_write_pages(struct fuse_io_args *ia,
 		folio_wait_writeback(ap->folios[i]);
 
 	fuse_write_args_fill(ia, ff, pos, count);
+	ap->args.extfuse_inode = inode;
 	ia->write.in.flags = fuse_write_flags(iocb);
 	if (fm->fc->handle_killpriv_v2 && !capable(CAP_FSETID))
 		ia->write.in.write_flags |= FUSE_WRITE_KILL_SUIDGID;
@@ -1506,6 +1544,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	bool writeback = false;
+	bool extfuse_outer_begun = false;
 
 	if (fc->writeback_cache) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
@@ -1527,9 +1566,25 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	task_io_account_write(count);
 
+	if (fc->writeback_cache && READ_ONCE(fc->extfuse_coherence_v3)) {
+		err = extfuse_coherence_begin_inode(fc, inode,
+					EXTFUSE_COHERENCE_DOMAIN_ATTR |
+					EXTFUSE_COHERENCE_DOMAIN_DATA);
+		if (err)
+			goto out;
+		extfuse_outer_begun = true;
+	}
+
 	err = kiocb_modified(iocb);
 	if (err)
 		goto out;
+	if (extfuse_outer_begun &&
+	    (!writeback || (iocb->ki_flags & IOCB_DIRECT))) {
+		extfuse_coherence_end_inode(inode,
+					EXTFUSE_COHERENCE_DOMAIN_ATTR |
+					EXTFUSE_COHERENCE_DOMAIN_DATA);
+		extfuse_outer_begun = false;
+	}
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
 		written = generic_file_direct_write(iocb, from);
@@ -1550,6 +1605,10 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		written = fuse_perform_write(iocb, from);
 	}
 out:
+	if (extfuse_outer_begun)
+		extfuse_coherence_end_inode(inode,
+					EXTFUSE_COHERENCE_DOMAIN_ATTR |
+					EXTFUSE_COHERENCE_DOMAIN_DATA);
 	inode_unlock(inode);
 	if (written > 0)
 		written = generic_write_sync(iocb, written);
@@ -2137,6 +2196,7 @@ static struct fuse_writepage_args *fuse_writepage_args_setup(struct folio *folio
 	wpa->ia.ff = ff;
 
 	ap = &wpa->ia.ap;
+	ap->args.extfuse_inode = inode;
 	ap->args.in_pages = true;
 	ap->args.end = fuse_writepage_end;
 
@@ -2393,6 +2453,9 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	}
 
 	folio_wait_writeback(folio);
+	extfuse_coherence_invalidate_inode(get_fuse_conn(inode), inode,
+					   EXTFUSE_COHERENCE_DOMAIN_ATTR |
+					   EXTFUSE_COHERENCE_DOMAIN_DATA);
 	return VM_FAULT_LOCKED;
 }
 
@@ -2425,18 +2488,23 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 	else if (fuse_inode_backing(get_fuse_inode(inode)))
 		return -ENODEV;
 
+	if ((ff->open_flags & FOPEN_DIRECT_IO) &&
+	    (vma->vm_flags & VM_MAYSHARE) && !fc->direct_io_allow_mmap)
+		return -ENODEV;
+	if (READ_ONCE(fc->extfuse_coherence_v3)) {
+		rc = extfuse_passthrough_notify(fc, get_node_id(inode),
+					 EXTFUSE_PASSTHROUGH_MMAP,
+					 EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
+		if (rc)
+			return rc;
+		fuse_invalidate_attr(inode);
+	}
+
 	/*
 	 * FOPEN_DIRECT_IO handling is special compared to O_DIRECT,
 	 * as does not allow MAP_SHARED mmap without FUSE_DIRECT_IO_ALLOW_MMAP.
 	 */
 	if (ff->open_flags & FOPEN_DIRECT_IO) {
-		/*
-		 * Can't provide the coherency needed for MAP_SHARED
-		 * if FUSE_DIRECT_IO_ALLOW_MMAP isn't set.
-		 */
-		if ((vma->vm_flags & VM_MAYSHARE) && !fc->direct_io_allow_mmap)
-			return -ENODEV;
-
 		invalidate_inode_pages2(file->f_mapping);
 
 		if (!(vma->vm_flags & VM_MAYSHARE)) {
@@ -3023,6 +3091,7 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
 
 	args.opcode = FUSE_FALLOCATE;
 	args.nodeid = ff->nodeid;
+	args.extfuse_inode = inode;
 	args.in_numargs = 1;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
@@ -3134,6 +3203,8 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
 
 	args.opcode = FUSE_COPY_FILE_RANGE_64;
 	args.nodeid = ff_in->nodeid;
+	args.extfuse_inode = inode_in;
+	args.extfuse_inode2 = inode_out;
 	args.in_numargs = 1;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;

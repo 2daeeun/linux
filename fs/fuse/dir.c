@@ -864,6 +864,7 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
 
 	args.opcode = opcode;
 	args.nodeid = get_node_id(dir);
+	args.extfuse_inode = dir;
 	args.in_numargs = 2;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
@@ -1000,6 +1001,7 @@ static struct dentry *create_new_entry(struct mnt_idmap *idmap, struct fuse_moun
 
 	memset(&outarg, 0, sizeof(outarg));
 	args->nodeid = get_node_id(dir);
+	args->extfuse_inode = dir;
 	args->out_numargs = 1;
 	args->out_args[0].size = sizeof(outarg);
 	args->out_args[0].value = &outarg;
@@ -1217,6 +1219,8 @@ static int fuse_unlink(struct inode *dir, struct dentry *entry)
 
 	args.opcode = FUSE_UNLINK;
 	args.nodeid = get_node_id(dir);
+	args.extfuse_inode = dir;
+	args.extfuse_inode2 = d_inode(entry);
 	args.in_numargs = 2;
 	fuse_set_zero_arg0(&args);
 	args.in_args[1].size = entry->d_name.len + 1;
@@ -1242,6 +1246,8 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
 
 	args.opcode = FUSE_RMDIR;
 	args.nodeid = get_node_id(dir);
+	args.extfuse_inode = dir;
+	args.extfuse_inode2 = d_inode(entry);
 	args.in_numargs = 2;
 	fuse_set_zero_arg0(&args);
 	args.in_args[1].size = entry->d_name.len + 1;
@@ -1269,6 +1275,10 @@ static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, str
 	inarg.flags = flags;
 	args.opcode = opcode;
 	args.nodeid = get_node_id(olddir);
+	args.extfuse_inode = olddir;
+	args.extfuse_inode2 = newdir;
+	args.extfuse_inode3 = d_inode(oldent);
+	args.extfuse_inode4 = d_inode(newent);
 	args.in_numargs = 3;
 	args.in_args[0].size = argsize;
 	args.in_args[0].value = &inarg;
@@ -1356,6 +1366,7 @@ static int fuse_link(struct dentry *entry, struct inode *newdir,
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.oldnodeid = get_node_id(inode);
 	args.opcode = FUSE_LINK;
+	args.extfuse_inode2 = inode;
 	args.in_numargs = 2;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
@@ -1514,6 +1525,7 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
 	}
 	args.opcode = FUSE_GETATTR;
 	args.nodeid = get_node_id(inode);
+	args.extfuse_inode = inode;
 	args.in_numargs = 1;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
@@ -1852,6 +1864,7 @@ static int fuse_readlink_folio(struct inode *inode, struct folio *folio)
 
 	ap.args.opcode = FUSE_READLINK;
 	ap.args.nodeid = get_node_id(inode);
+	ap.args.extfuse_inode = inode;
 	ap.args.out_pages = true;
 	ap.args.out_argvar = true;
 	ap.args.page_zeroing = true;
@@ -2116,6 +2129,7 @@ static void fuse_setattr_fill(struct fuse_conn *fc, struct fuse_args *args,
 {
 	args->opcode = FUSE_SETATTR;
 	args->nodeid = get_node_id(inode);
+	args->extfuse_inode = inode;
 	args->in_numargs = 1;
 	args->in_args[0].size = sizeof(*inarg_p);
 	args->in_args[0].value = inarg_p;

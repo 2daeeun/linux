@@ -6,6 +6,7 @@
 
 #include "fuse_i.h"
 #include "fuse_cpu_scope.h"
+#include "extfuse_i.h"
 
 #include <linux/delay.h>
 #include <linux/dax.h>
@@ -720,6 +721,9 @@ static ssize_t fuse_dax_direct_write(struct kiocb *iocb, struct iov_iter *from)
 ssize_t fuse_dax_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	bool local_write = false;
+	bool extfuse_local_begun = false;
 	ssize_t ret;
 
 	if (iocb->ki_flags & IOCB_NOWAIT) {
@@ -732,6 +736,15 @@ ssize_t fuse_dax_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	ret = generic_write_checks(iocb, from);
 	if (ret <= 0)
 		goto out;
+	local_write = !file_extending_write(iocb, from);
+	if (local_write && READ_ONCE(fc->extfuse_coherence_v3)) {
+		ret = extfuse_coherence_begin_inode(fc, inode,
+					EXTFUSE_COHERENCE_DOMAIN_ATTR |
+					EXTFUSE_COHERENCE_DOMAIN_DATA);
+		if (ret)
+			goto out;
+		extfuse_local_begun = true;
+	}
 
 	ret = file_remove_privs(iocb->ki_filp);
 	if (ret)
@@ -741,12 +754,16 @@ ssize_t fuse_dax_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	/* Do not use dax for file extending writes as write and on
 	 * disk i_size increase are not atomic otherwise.
 	 */
-	if (file_extending_write(iocb, from))
+	if (!local_write)
 		ret = fuse_dax_direct_write(iocb, from);
 	else
 		ret = dax_iomap_rw(iocb, from, &fuse_iomap_ops);
 
 out:
+	if (extfuse_local_begun)
+		extfuse_coherence_end_inode(inode,
+					EXTFUSE_COHERENCE_DOMAIN_ATTR |
+					EXTFUSE_COHERENCE_DOMAIN_DATA);
 	inode_unlock(inode);
 
 	if (ret > 0)
@@ -791,6 +808,10 @@ retry:
 	if (ret & VM_FAULT_NEEDDSYNC)
 		ret = dax_finish_sync_fault(vmf, order, pfn);
 	filemap_invalidate_unlock_shared(inode->i_mapping);
+	if (write && !(ret & VM_FAULT_ERROR))
+		extfuse_coherence_invalidate_inode(fc, inode,
+					     EXTFUSE_COHERENCE_DOMAIN_ATTR |
+					     EXTFUSE_COHERENCE_DOMAIN_DATA);
 
 	if (write)
 		sb_end_pagefault(sb);
@@ -827,6 +848,18 @@ static const struct vm_operations_struct fuse_dax_vm_ops = {
 
 int fuse_dax_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	int ret;
+
+	if (READ_ONCE(fc->extfuse_coherence_v3)) {
+		ret = extfuse_passthrough_notify(fc, get_node_id(inode),
+						 EXTFUSE_PASSTHROUGH_MMAP,
+						 EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
+		if (ret)
+			return ret;
+		fuse_invalidate_attr(inode);
+	}
 	file_accessed(file);
 	vma->vm_ops = &fuse_dax_vm_ops;
 	vm_flags_set(vma, VM_MIXEDMAP | VM_HUGEPAGE);

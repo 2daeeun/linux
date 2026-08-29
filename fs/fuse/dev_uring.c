@@ -546,10 +546,11 @@ static void fuse_uring_prepare_cancel(struct io_uring_cmd *cmd, int issue_flags,
  */
 static int fuse_uring_out_header_has_err(struct fuse_out_header *oh,
 					 struct fuse_req *req,
-					 struct fuse_conn *fc)
+					 bool *valid_reply)
 {
 	int err;
 
+	*valid_reply = false;
 	err = -EINVAL;
 	if (oh->unique == 0) {
 		/* Not supported through io-uring yet */
@@ -559,11 +560,6 @@ static int fuse_uring_out_header_has_err(struct fuse_out_header *oh,
 
 	if (oh->error <= -ERESTARTSYS || oh->error > 0)
 		goto err;
-
-	if (oh->error) {
-		err = oh->error;
-		goto err;
-	}
 
 	err = -ENOENT;
 	if ((oh->unique & ~FUSE_INT_REQ_BIT) != req->in.h.unique) {
@@ -578,27 +574,24 @@ static int fuse_uring_out_header_has_err(struct fuse_out_header *oh,
 	 * XXX: Not supported through fuse-io-uring yet, it should not even
 	 *      find the request - should not happen.
 	 */
-	WARN_ON_ONCE(oh->unique & FUSE_INT_REQ_BIT);
+	if (WARN_ON_ONCE(oh->unique & FUSE_INT_REQ_BIT))
+		goto err;
 
-	err = 0;
+	*valid_reply = true;
+	err = oh->error;
 err:
 	return err;
 }
 
 static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
 				     struct fuse_req *req,
-				     struct fuse_ring_ent *ent)
+				     struct fuse_ring_ent *ent,
+				     unsigned int payload_sz)
 {
 	struct fuse_copy_state cs;
 	struct fuse_args *args = req->args;
 	struct iov_iter iter;
 	int err;
-	struct fuse_uring_ent_in_out ring_in_out;
-
-	err = copy_from_user(&ring_in_out, &ent->headers->ring_ent_in_out,
-			     sizeof(ring_in_out));
-	if (err)
-		return -EFAULT;
 
 	err = import_ubuf(ITER_SOURCE, ent->payload, ring->max_payload_sz,
 			  &iter);
@@ -609,7 +602,7 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
 	cs.is_uring = true;
 	cs.req = req;
 
-	err = fuse_copy_out_args(&cs, args, ring_in_out.payload_sz);
+	err = fuse_copy_out_args(&cs, args, payload_sz);
 	fuse_copy_finish(&cs);
 	return err;
 }
@@ -840,20 +833,41 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
 			      unsigned int issue_flags)
 {
 	struct fuse_ring *ring = ent->queue->ring;
-	struct fuse_conn *fc = ring->fc;
+	struct fuse_uring_ent_in_out ring_in_out;
+	bool valid_reply;
 	ssize_t err = -EFAULT;
 
 	if (copy_from_user(&req->out.h, &ent->headers->in_out,
 			   sizeof(req->out.h)))
 		goto out;
-
-	err = fuse_uring_out_header_has_err(&req->out.h, req, fc);
-	if (err) {
-		/* req->out.h.error already set */
+	if (copy_from_user(&ring_in_out, &ent->headers->ring_ent_in_out,
+			   sizeof(ring_in_out)))
+		goto out;
+	if (ring_in_out.payload_sz > ring->max_payload_sz ||
+	    req->out.h.len < sizeof(req->out.h) ||
+	    req->out.h.len - sizeof(req->out.h) != ring_in_out.payload_sz) {
+		err = -EINVAL;
 		goto out;
 	}
 
-	err = fuse_uring_copy_from_ring(ring, req, ent);
+	err = fuse_uring_out_header_has_err(&req->out.h, req, &valid_reply);
+	if (err) {
+		/* req->out.h.error already set */
+		if (valid_reply && !ring_in_out.payload_sz)
+			req->extfuse_reply_received = true;
+		else if (valid_reply && req->args->out_arg_optional) {
+			req->args->out_arg_optional_invalid = true;
+			req->extfuse_reply_received = true;
+		} else if (valid_reply) {
+			err = -EINVAL;
+		}
+		goto out;
+	}
+
+	err = fuse_uring_copy_from_ring(ring, req, ent,
+					 ring_in_out.payload_sz);
+	if (!err)
+		req->extfuse_reply_received = true;
 out:
 	fuse_uring_req_end(ent, req, err);
 }

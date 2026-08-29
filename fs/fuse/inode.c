@@ -112,6 +112,13 @@ static struct inode *fuse_alloc_inode(struct super_block *sb)
 	fi->inval_mask = ~0;
 	mutex_init(&fi->mutex);
 	spin_lock_init(&fi->lock);
+	spin_lock_init(&fi->extfuse_coherence_lock);
+	fi->extfuse_incarnation = atomic64_inc_return(
+		&get_fuse_conn_super(sb)->extfuse_incarnation_ctr);
+	fi->extfuse_epoch[0] = 1;
+	fi->extfuse_epoch[1] = 1;
+	fi->extfuse_epoch[2] = 1;
+	fi->extfuse_epoch[3] = 1;
 	fi->forget = fuse_alloc_forget();
 	if (!fi->forget)
 		goto out_free;
@@ -1003,6 +1010,11 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->connected = 1;
 	atomic64_set(&fc->attr_version, 1);
 	atomic64_set(&fc->evict_ctr, 1);
+	atomic64_set(&fc->extfuse_incarnation_ctr, 0);
+	atomic64_set(&fc->extfuse_namespace_epoch, 1);
+	spin_lock_init(&fc->extfuse_global_coherence_lock);
+	fc->extfuse_global_epoch = 1;
+	fc->extfuse_global_active = 0;
 	spin_lock_init(&fc->extfuse_lock);
 	RCU_INIT_POINTER(fc->fc_priv, NULL);
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
@@ -1525,6 +1537,31 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				else
 					fc->extfuse_passthrough_attr_release_barrier = 1;
 			}
+			if (flags & FUSE_EXTFUSE_COHERENCE_V3) {
+				if (arg->minor < 46 ||
+				    !(flags & FUSE_FS_EXTFUSE))
+					ok = false;
+				else
+					fc->extfuse_coherence_v3 = 1;
+			}
+			if (flags & FUSE_MUTATION_METADATA) {
+				if (arg->minor < 46 ||
+				    !(flags & FUSE_FS_EXTFUSE) ||
+				    !(flags & FUSE_EXTFUSE_COHERENCE_V3) ||
+				    !fc->extfuse_coherence_v3)
+					ok = false;
+				else
+					fc->extfuse_mutation_metadata = 1;
+			}
+			if (flags & FUSE_HAS_NOTIFY_INVAL_XATTR) {
+				if (arg->minor < 46 ||
+				    !(flags & FUSE_FS_EXTFUSE) ||
+				    !(flags & FUSE_EXTFUSE_COHERENCE_V3) ||
+				    !fc->extfuse_coherence_v3)
+					ok = false;
+				else
+					fc->extfuse_notify_inval_xattr = 1;
+			}
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1581,6 +1618,10 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		FUSE_REQUEST_TIMEOUT;
 	if (fm->fc->iq.ops == &fuse_dev_fiq_ops) {
 		flags |= EXTFUSE_FLAGS;
+		if (IS_ENABLED(CONFIG_EXTFUSE))
+			flags |= FUSE_EXTFUSE_COHERENCE_V3 |
+				 FUSE_MUTATION_METADATA |
+				 FUSE_HAS_NOTIFY_INVAL_XATTR;
 		if (IS_ENABLED(CONFIG_EXTFUSE) &&
 		    IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 			flags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE |

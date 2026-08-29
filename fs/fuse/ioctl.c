@@ -317,6 +317,7 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 	/* okay, let's send it to the client */
 	ap.args.opcode = FUSE_IOCTL;
 	ap.args.nodeid = ff->nodeid;
+	ap.args.extfuse_inode = file_inode(file);
 	ap.args.in_numargs = 1;
 	ap.args.in_args[0].size = sizeof(inarg);
 	ap.args.in_args[0].value = &inarg;
@@ -466,6 +467,7 @@ static int fuse_priv_ioctl(struct inode *inode, struct fuse_file *ff,
 
 	args.opcode = FUSE_IOCTL;
 	args.nodeid = ff->nodeid;
+	args.extfuse_inode = inode;
 	args.in_numargs = 2;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
@@ -499,7 +501,7 @@ static struct fuse_file *fuse_priv_ioctl_prepare(struct inode *inode)
 	if (!S_ISREG(inode->i_mode) && !isdir)
 		return ERR_PTR(-ENOTTY);
 
-	return fuse_file_open(fm, get_node_id(inode), O_RDONLY, isdir);
+	return fuse_file_open(fm, get_node_id(inode), O_RDONLY, isdir, inode);
 }
 
 static void fuse_priv_ioctl_cleanup(struct inode *inode, struct fuse_file *ff)

@@ -18,17 +18,50 @@
 #define EXTFUSE_PASSTHRU(x)	((x) > 0)
 #define EXTFUSE_RETURN(x)	((x) == 0)
 
+enum extfuse_trace_phase {
+	EXTFUSE_TRACE_PHASE_PRE = 1,
+	EXTFUSE_TRACE_PHASE_POST_DAEMON = 2,
+	EXTFUSE_TRACE_PHASE_BEGIN = 3,
+	EXTFUSE_TRACE_PHASE_END = 4,
+};
+
+enum extfuse_trace_action {
+	EXTFUSE_TRACE_ACTION_HIT = 1,
+	EXTFUSE_TRACE_ACTION_FALLBACK = 2,
+	EXTFUSE_TRACE_ACTION_ERROR = 3,
+	EXTFUSE_TRACE_ACTION_POSTED = 4,
+	EXTFUSE_TRACE_ACTION_SKIPPED = 5,
+	EXTFUSE_TRACE_ACTION_MUTATION = 6,
+};
+
+enum extfuse_trace_reason {
+	EXTFUSE_TRACE_REASON_NONE = 0,
+	EXTFUSE_TRACE_REASON_NO_PROGRAM = 1,
+	EXTFUSE_TRACE_REASON_PROGRAM_FALLBACK = 2,
+	EXTFUSE_TRACE_REASON_PROGRAM_ERROR = 3,
+	EXTFUSE_TRACE_REASON_INVALID_OUTPUT = 4,
+	EXTFUSE_TRACE_REASON_ACTIVE = 5,
+	EXTFUSE_TRACE_REASON_RACE = 6,
+	EXTFUSE_TRACE_REASON_POST_ERROR = 7,
+	EXTFUSE_TRACE_REASON_TRAILER_ABSENT = 8,
+	EXTFUSE_TRACE_REASON_TRAILER_INVALID = 9,
+	EXTFUSE_TRACE_REASON_TRAILER_RACE = 10,
+};
+
 #ifdef __KERNEL__
 
+#include <linux/gfp_types.h>
+
 struct fuse_attr;
+struct fuse_args;
+struct fuse_conn;
+struct fuse_req;
+struct inode;
 
 #if IS_ENABLED(CONFIG_EXTFUSE)
 
 #include <linux/bpf.h>
 #include <linux/filter.h>
-
-struct fuse_conn;
-struct fuse_args;
 
 struct extfuse_data {
 	struct bpf_prog *prog;
@@ -45,6 +78,19 @@ int extfuse_load_prog(struct fuse_conn *fc, int fd);
 void extfuse_unload_prog(struct fuse_conn *fc);
 int extfuse_init_reply(struct fuse_conn *fc, struct fuse_args *args);
 ssize_t extfuse_request_send(struct fuse_conn *fc, struct fuse_args *args);
+ssize_t extfuse_request_pre(struct fuse_req *req, gfp_t gfp);
+int extfuse_request_prepare_daemon(struct fuse_req *req, gfp_t gfp);
+void extfuse_request_complete(struct fuse_req *req);
+void extfuse_request_cancel(struct fuse_req *req, int error);
+void extfuse_request_free(struct fuse_req *req);
+void extfuse_coherence_invalidate_inode(struct fuse_conn *fc,
+					struct inode *inode, u32 dependencies);
+void extfuse_coherence_invalidate(struct fuse_conn *fc, u64 nodeid,
+				  u32 dependencies);
+void extfuse_coherence_invalidate_namespace(struct fuse_conn *fc);
+int extfuse_coherence_begin_inode(struct fuse_conn *fc, struct inode *inode,
+				    u32 dependencies);
+void extfuse_coherence_end_inode(struct inode *inode, u32 dependencies);
 int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode,
 			       u32 phase);
 int extfuse_passthrough_attr_prepare(struct fuse_conn *fc, u64 nodeid,
@@ -54,9 +100,6 @@ int extfuse_passthrough_attr_commit(struct fuse_conn *fc, u64 nodeid,
 				    const struct fuse_attr *attr);
 
 #else /* !CONFIG_EXTFUSE */
-
-struct fuse_conn;
-struct fuse_args;
 
 #define EXTFUSE_FLAGS		0
 
@@ -79,6 +122,58 @@ static inline ssize_t extfuse_request_send(struct fuse_conn *fc,
 					   struct fuse_args *args)
 {
 	return -ENOSYS;
+}
+
+static inline ssize_t extfuse_request_pre(struct fuse_req *req, gfp_t gfp)
+{
+	return -ENOSYS;
+}
+
+static inline int extfuse_request_prepare_daemon(struct fuse_req *req,
+						  gfp_t gfp)
+{
+	return 0;
+}
+
+static inline void extfuse_request_complete(struct fuse_req *req)
+{
+}
+
+static inline void extfuse_request_cancel(struct fuse_req *req, int error)
+{
+}
+
+static inline void extfuse_request_free(struct fuse_req *req)
+{
+}
+
+static inline void
+extfuse_coherence_invalidate_inode(struct fuse_conn *fc, struct inode *inode,
+				   u32 dependencies)
+{
+}
+
+static inline void extfuse_coherence_invalidate(struct fuse_conn *fc,
+						 u64 nodeid,
+						 u32 dependencies)
+{
+}
+
+static inline void
+extfuse_coherence_invalidate_namespace(struct fuse_conn *fc)
+{
+}
+
+static inline int
+extfuse_coherence_begin_inode(struct fuse_conn *fc, struct inode *inode,
+				    u32 dependencies)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void extfuse_coherence_end_inode(struct inode *inode,
+					      u32 dependencies)
+{
 }
 
 static inline int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid,

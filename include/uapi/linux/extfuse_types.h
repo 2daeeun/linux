@@ -8,6 +8,18 @@
 #define EXTFUSE_MAX_IN_ARGS	3
 #define EXTFUSE_MAX_OUT_ARGS	2
 
+#define EXTFUSE_COHERENCE_VERSION	3
+#define EXTFUSE_COHERENCE_MAX_TARGETS	4
+
+#define EXTFUSE_COHERENCE_PHASE_PRE		1
+#define EXTFUSE_COHERENCE_PHASE_POST_DAEMON	2
+
+#define EXTFUSE_COHERENCE_DOMAIN_ATTR		(1U << 0)
+#define EXTFUSE_COHERENCE_DOMAIN_XATTR		(1U << 1)
+#define EXTFUSE_COHERENCE_DOMAIN_DATA		(1U << 2)
+#define EXTFUSE_COHERENCE_DOMAIN_NAMESPACE	(1U << 3)
+#define EXTFUSE_COHERENCE_DOMAIN_ALL		((1U << 4) - 1)
+
 /* One BPF-visible input argument descriptor. */
 struct extfuse_in_arg {
 	__u32 size;
@@ -33,9 +45,33 @@ struct extfuse_out {
 	struct extfuse_arg args[EXTFUSE_MAX_OUT_ARGS];
 };
 
+struct extfuse_coherence_target {
+	__u64 nodeid;
+	__u64 incarnation;
+	__u64 attr_epoch;
+	__u64 xattr_epoch;
+	__u64 data_epoch;
+	__u64 namespace_epoch;
+	__u32 dependencies;
+	__u32 active;
+};
+
+struct extfuse_coherence {
+	__u32 version;
+	__u16 phase;
+	__u16 target_count;
+	__s32 daemon_error;
+	__u32 request_dependencies;
+	__u32 validated_dependencies;
+	__u32 reason;
+	__u64 unique;
+	struct extfuse_coherence_target targets[EXTFUSE_COHERENCE_MAX_TARGETS];
+};
+
 struct extfuse_req {
 	struct extfuse_in in;
 	struct extfuse_out out;
+	struct extfuse_coherence coherence;
 };
 
 /*

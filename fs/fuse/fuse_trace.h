@@ -58,6 +58,7 @@
 	EM( FUSE_SYNCFS,		"FUSE_SYNCFS")		\
 	EM( FUSE_TMPFILE,		"FUSE_TMPFILE")		\
 	EM( FUSE_STATX,			"FUSE_STATX")		\
+	EM(FUSE_COPY_FILE_RANGE_64,	"FUSE_COPY_FILE_RANGE_64") \
 	EMe(CUSE_INIT,			"CUSE_INIT")
 
 /*
@@ -122,6 +123,44 @@ TRACE_EVENT(fuse_request_end,
 
 	TP_printk("connection %u req %llu len %u error %d", __entry->connection,
 		  __entry->unique, __entry->len, __entry->error)
+);
+
+TRACE_EVENT(fuse_extfuse_coherence,
+	TP_PROTO(dev_t connection, u64 unique, u32 opcode, u64 nodeid,
+		 u32 phase, u32 action, u32 reason, s32 error,
+		 u32 dependencies),
+
+	TP_ARGS(connection, unique, opcode, nodeid, phase, action, reason,
+		error, dependencies),
+
+	TP_STRUCT__entry(
+		__field(dev_t,	connection)
+		__field(u64,	unique)
+		__field(u32,	opcode)
+		__field(u64,	nodeid)
+		__field(u32,	phase)
+		__field(u32,	action)
+		__field(u32,	reason)
+		__field(s32,	error)
+		__field(u32,	dependencies)
+	),
+
+	TP_fast_assign(
+		__entry->connection = connection;
+		__entry->unique = unique;
+		__entry->opcode = opcode;
+		__entry->nodeid = nodeid;
+		__entry->phase = phase;
+		__entry->action = action;
+		__entry->reason = reason;
+		__entry->error = error;
+		__entry->dependencies = dependencies;
+	),
+
+	TP_printk("connection %u unique %llu opcode %u nodeid %llu phase %u action %u reason %u error %d dependencies %#x",
+		  __entry->connection, __entry->unique, __entry->opcode,
+		  __entry->nodeid, __entry->phase, __entry->action,
+		  __entry->reason, __entry->error, __entry->dependencies)
 );
 
 /*
