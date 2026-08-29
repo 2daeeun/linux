@@ -469,27 +469,27 @@ static void extfuse_global_end(struct fuse_conn *fc)
 static bool extfuse_target_stable(
 	const struct extfuse_target_state *state, u32 dependencies)
 {
-	struct extfuse_coherence_target current = { };
+	struct extfuse_coherence_target snapshot = { };
 	const struct extfuse_coherence_target *saved = &state->pre;
 
 	if (!state->inode)
 		return false;
 
-	extfuse_snapshot_inode(state->inode, dependencies, &current);
-	if (current.incarnation != saved->incarnation ||
-	    (current.active & dependencies))
+	extfuse_snapshot_inode(state->inode, dependencies, &snapshot);
+	if (snapshot.incarnation != saved->incarnation ||
+	    (snapshot.active & dependencies))
 		return false;
 	if ((dependencies & EXTFUSE_COHERENCE_DOMAIN_ATTR) &&
-	    current.attr_epoch != saved->attr_epoch)
+	    snapshot.attr_epoch != saved->attr_epoch)
 		return false;
 	if ((dependencies & EXTFUSE_COHERENCE_DOMAIN_XATTR) &&
-	    current.xattr_epoch != saved->xattr_epoch)
+	    snapshot.xattr_epoch != saved->xattr_epoch)
 		return false;
 	if ((dependencies & EXTFUSE_COHERENCE_DOMAIN_DATA) &&
-	    current.data_epoch != saved->data_epoch)
+	    snapshot.data_epoch != saved->data_epoch)
 		return false;
 	if ((dependencies & EXTFUSE_COHERENCE_DOMAIN_NAMESPACE) &&
-	    current.namespace_epoch != saved->namespace_epoch)
+	    snapshot.namespace_epoch != saved->namespace_epoch)
 		return false;
 
 	return true;
@@ -1580,7 +1580,7 @@ static bool extfuse_post_stable(struct fuse_conn *fc,
 			return false;
 	}
 	for (i = 0; i < state->target_count; i++) {
-		struct extfuse_coherence_target current = { };
+		struct extfuse_coherence_target snapshot = { };
 		u32 dependencies = state->targets[i].dependencies & validated;
 
 		if (!dependencies || !state->targets[i].inode)
@@ -1592,22 +1592,22 @@ static bool extfuse_post_stable(struct fuse_conn *fc,
 			continue;
 		}
 		extfuse_snapshot_inode(state->targets[i].inode, dependencies,
-					 &current);
+					 &snapshot);
 		if (!state->targets[i].mutation_completed ||
-		    current.incarnation != state->targets[i].pre.incarnation ||
-		    (current.active & dependencies))
+		    snapshot.incarnation != state->targets[i].pre.incarnation ||
+		    (snapshot.active & dependencies))
 			return false;
 		if ((dependencies & EXTFUSE_COHERENCE_DOMAIN_ATTR) &&
-		    current.attr_epoch != state->targets[i].pre.attr_epoch + 2)
+		    snapshot.attr_epoch != state->targets[i].pre.attr_epoch + 2)
 			return false;
 		if ((dependencies & EXTFUSE_COHERENCE_DOMAIN_XATTR) &&
-		    current.xattr_epoch != state->targets[i].pre.xattr_epoch + 2)
+		    snapshot.xattr_epoch != state->targets[i].pre.xattr_epoch + 2)
 			return false;
 		if ((dependencies & EXTFUSE_COHERENCE_DOMAIN_DATA) &&
-		    current.data_epoch != state->targets[i].pre.data_epoch + 2)
+		    snapshot.data_epoch != state->targets[i].pre.data_epoch + 2)
 			return false;
 		if ((dependencies & EXTFUSE_COHERENCE_DOMAIN_NAMESPACE) &&
-		    current.namespace_epoch !=
+		    snapshot.namespace_epoch !=
 			state->targets[i].pre.namespace_epoch + 2)
 			return false;
 	}
