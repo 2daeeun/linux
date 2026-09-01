@@ -225,6 +225,13 @@ struct fuse_inode {
 #endif
 	/** Submount specific lookup tracking */
 	struct fuse_submount_lookup *submount_lookup;
+
+	/** Canonical lower file registration for cached ExtFUSE passthrough */
+	struct fuse_backing *extfuse_wbcache_fb;
+
+	/** Number of cached ExtFUSE passthrough opens on this inode */
+	unsigned int extfuse_wbcache_open_count;
+
 #ifdef CONFIG_FUSE_PASSTHROUGH
 	/** Reference to backing file in passthrough mode */
 	struct fuse_backing *fb;
@@ -323,6 +330,10 @@ struct fuse_file {
 	/** Reference to backing file in passthrough mode */
 	struct file *passthrough;
 	const struct cred *cred;
+
+	/** Per-open lower file used by cached ExtFUSE passthrough */
+	struct file *extfuse_wbcache_file;
+	struct fuse_backing *extfuse_wbcache_fb;
 #endif
 
 	/** Has flock been performed on this file? */
@@ -376,6 +387,8 @@ struct fuse_args {
 	struct inode *extfuse_inode2;
 	struct inode *extfuse_inode3;
 	struct inode *extfuse_inode4;
+	/* Open-file identity for ordinary ExtFUSE READ/WRITE policy forwarding. */
+	struct fuse_file *extfuse_file;
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
@@ -487,6 +500,9 @@ struct fuse_req {
 	bool extfuse_reply_received:1;
 	/** The stable ExtFUSE PRE terminal event was emitted. */
 	bool extfuse_pre_traced:1;
+
+	/** Executes a page-backed ExtFUSE request outside inode spinlocks. */
+	struct work_struct extfuse_wbcache_work;
 
 	/** refcount */
 	refcount_t count;
@@ -953,6 +969,9 @@ struct fuse_conn {
 	/** Passthrough support for read/write IO */
 	unsigned int passthrough:1;
 
+	/** ExtFUSE forwarding below the ordinary FUSE writeback cache */
+	unsigned int extfuse_wbcache_passthrough;
+
 	/** Native passthrough ExtFUSE coherence protocol version (0, 1, or 2) */
 	unsigned int extfuse_passthrough_coherence;
 
@@ -985,6 +1004,9 @@ struct fuse_conn {
 
 	/** Maximum stack depth for passthrough backing files */
 	int max_stack_depth;
+
+	/** Sleepable lower-I/O workers for cached ExtFUSE passthrough */
+	struct workqueue_struct *extfuse_wbcache_wq;
 
 	/** The number of requests waiting for completion */
 	atomic_t num_waiting;
@@ -1765,6 +1787,62 @@ void fuse_backing_files_init(struct fuse_conn *fc);
 void fuse_backing_files_free(struct fuse_conn *fc);
 int fuse_backing_open(struct fuse_conn *fc, struct fuse_backing_map *map);
 int fuse_backing_close(struct fuse_conn *fc, int backing_id);
+
+/* wbcache_passthrough.c */
+struct fuse_wbcache_io;
+
+#ifdef CONFIG_FUSE_PASSTHROUGH
+int fuse_wbcache_passthrough_open(struct file *file, int backing_id);
+void fuse_wbcache_passthrough_release(struct fuse_file *ff);
+struct fuse_wbcache_io *fuse_wbcache_passthrough_prepare(struct fuse_req *req);
+ssize_t fuse_wbcache_passthrough_execute(struct fuse_req *req,
+					 struct fuse_wbcache_io *io);
+void fuse_wbcache_passthrough_finish(struct fuse_wbcache_io *io);
+#else
+static inline int fuse_wbcache_passthrough_open(struct file *file,
+						int backing_id)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void fuse_wbcache_passthrough_release(struct fuse_file *ff)
+{
+}
+
+static inline struct fuse_wbcache_io *
+fuse_wbcache_passthrough_prepare(struct fuse_req *req)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline ssize_t
+fuse_wbcache_passthrough_execute(struct fuse_req *req,
+				 struct fuse_wbcache_io *io)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void
+fuse_wbcache_passthrough_finish(struct fuse_wbcache_io *io)
+{
+}
+#endif
+
+static inline struct fuse_backing *
+fuse_file_wbcache_backing(struct fuse_file *ff)
+{
+#ifdef CONFIG_FUSE_PASSTHROUGH
+	return ff->extfuse_wbcache_fb;
+#else
+	return NULL;
+#endif
+}
+
+static inline struct fuse_backing *
+fuse_inode_wbcache_backing(struct fuse_inode *fi)
+{
+	return READ_ONCE(fi->extfuse_wbcache_fb);
+}
 
 /* passthrough.c */
 static inline struct fuse_backing *fuse_inode_backing(struct fuse_inode *fi)

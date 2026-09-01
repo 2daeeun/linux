@@ -84,6 +84,7 @@ struct extfuse_req_state {
 	bool global_mutation;
 	bool global_active_owned;
 	bool global_mutation_completed;
+	bool wbcache_forward;
 };
 
 static_assert(sizeof(struct extfuse_passthrough_in) == 8);
@@ -190,7 +191,7 @@ static bool fuse_args_to_extfuse_req(struct fuse_args *args,
 
 /*
  * Try to service @args from BPF. Returns:
- *   -ENOSYS : no program / handler miss / PASSTHRU -> normal upcall
+ *   -ENOSYS : no program / handler miss / PASSTHRU marker
  *   -511..-1: request failed in-kernel with this FUSE errno
  *   0       : request fully handled in-kernel with no variable payload
  *   > 0     : GETXATTR variable payload length
@@ -202,7 +203,7 @@ static ssize_t __extfuse_request_send_ctx(
 	struct fuse_conn *fc, struct fuse_args *args,
 	const struct fuse_in_header *inh,
 	const struct extfuse_coherence *coherence, bool post_daemon,
-	u32 *reason)
+	u32 *reason, bool *passthru)
 {
 	struct extfuse_data *data;
 	struct bpf_prog *prog;
@@ -215,6 +216,8 @@ static ssize_t __extfuse_request_send_ctx(
 
 	if (reason)
 		*reason = EXTFUSE_TRACE_REASON_NONE;
+	if (passthru)
+		*passthru = false;
 
 	/* Avoid RCU bookkeeping for connections that did not opt in. */
 	if (!rcu_access_pointer(fc->fc_priv)) {
@@ -252,7 +255,9 @@ static ssize_t __extfuse_request_send_ctx(
 	 * The current BPF ABI also hides request extensions, so a program may
 	 * perform conservative cache side effects but cannot complete them.
 	 */
-	force_upcall = (args->force && args->opcode != FUSE_FLUSH) ||
+	force_upcall = (args->force && args->opcode != FUSE_FLUSH &&
+			!(args->opcode == FUSE_WRITE && args->extfuse_file &&
+			  READ_ONCE(fc->extfuse_wbcache_passthrough))) ||
 		args->is_ext;
 
 	if (!fuse_args_to_extfuse_req(args, inh, coherence, post_daemon, &ctx)) {
@@ -300,11 +305,13 @@ static ssize_t __extfuse_request_send_ctx(
 
 	if (EXTFUSE_PASSTHRU(prog_ret)) {
 		/*
-		 * PASSTHRU means "handled the fast bits, now still send to the
-		 * daemon".  Returning -ENOSYS here continues the request through
-		 * the normal FUSE path without submitting it twice.
+		 * A typed PRE caller may route an eligible READ/WRITE to the
+		 * registered lower file.  Every other caller retains the original
+		 * meaning: finish the BPF side effects, then use the daemon path.
 		 */
-		if (reason)
+		if (passthru)
+			*passthru = true;
+		else if (reason)
 			*reason = EXTFUSE_TRACE_REASON_PROGRAM_FALLBACK;
 		ret = -ENOSYS;
 		goto out_unlock;
@@ -371,7 +378,8 @@ out_unlock:
 static ssize_t __extfuse_request_send(struct fuse_conn *fc,
 				      struct fuse_args *args)
 {
-	return __extfuse_request_send_ctx(fc, args, NULL, NULL, false, NULL);
+	return __extfuse_request_send_ctx(fc, args, NULL, NULL, false, NULL,
+					  NULL);
 }
 
 static void extfuse_trace_fc(struct fuse_conn *fc, u64 unique, u32 opcode,
@@ -1024,7 +1032,8 @@ static bool extfuse_opcode_is_mutation(u32 opcode)
 static bool extfuse_output_valid(struct fuse_req *req, ssize_t result);
 static bool extfuse_pre_output_valid(struct fuse_req *req, ssize_t result);
 
-ssize_t extfuse_request_pre(struct fuse_req *req, gfp_t gfp)
+static ssize_t extfuse_request_pre_result(struct fuse_req *req, gfp_t gfp,
+					  bool *passthru)
 {
 	struct fuse_conn *fc = req->fm->fc;
 	struct extfuse_req_state *state;
@@ -1068,8 +1077,16 @@ ssize_t extfuse_request_pre(struct fuse_req *req, gfp_t gfp)
 		pre.phase = EXTFUSE_COHERENCE_PHASE_PRE;
 		pre.unique = req->in.h.unique;
 		ret = __extfuse_request_send_ctx(fc, req->args, &req->in.h,
-						 &pre, false, &reason);
+						 &pre, false, &reason,
+						 passthru);
+		if (*passthru &&
+		    (!READ_ONCE(fc->extfuse_wbcache_passthrough) ||
+		     (req->args->opcode != FUSE_READ &&
+		      req->args->opcode != FUSE_WRITE)))
+			*passthru = false;
 		action = extfuse_pre_action(ret, reason);
+		if (*passthru)
+			action = EXTFUSE_TRACE_ACTION_FORWARD;
 		extfuse_trace(req, req->args->nodeid, EXTFUSE_TRACE_PHASE_PRE,
 			       action, reason, ret, 0);
 		req->extfuse_pre_traced = true;
@@ -1088,12 +1105,19 @@ ssize_t extfuse_request_pre(struct fuse_req *req, gfp_t gfp)
 		out_capacity = req->args->out_args[0].size;
 
 	ret = __extfuse_request_send_ctx(fc, req->args, &req->in.h,
-					 &pre, false, &reason);
-	if (state->mutation && !state->pre_hit_allowed && ret != -ENOSYS) {
+					 &pre, false, &reason, passthru);
+	if (*passthru &&
+	    (!READ_ONCE(fc->extfuse_wbcache_passthrough) ||
+	     (req->args->opcode != FUSE_READ &&
+	      req->args->opcode != FUSE_WRITE)))
+		*passthru = false;
+	if (state->mutation && !state->pre_hit_allowed && ret != -ENOSYS &&
+	    !*passthru) {
 		ret = -ENOSYS;
 		reason = EXTFUSE_TRACE_REASON_PROGRAM_FALLBACK;
 	}
-	if (ret != -ENOSYS && !extfuse_pre_output_valid(req, ret)) {
+	if (!*passthru && ret != -ENOSYS &&
+	    !extfuse_pre_output_valid(req, ret)) {
 		ret = -ENOSYS;
 		reason = EXTFUSE_TRACE_REASON_INVALID_OUTPUT;
 	}
@@ -1101,13 +1125,14 @@ ssize_t extfuse_request_pre(struct fuse_req *req, gfp_t gfp)
 	validated = state->request_dependencies;
 	if (req->args->opcode == FUSE_GETXATTR)
 		validated = extfuse_validated_dependencies(req->args, ret);
-	if (ret != -ENOSYS) {
+	if (ret != -ENOSYS || *passthru) {
 		for (i = 0; i < state->target_count; i++) {
 			u32 dependencies = state->targets[i].dependencies &
 				validated;
 
 			if (state->targets[i].pre.active & dependencies) {
 				ret = -ENOSYS;
+				*passthru = false;
 				reason = EXTFUSE_TRACE_REASON_ACTIVE;
 				break;
 			}
@@ -1115,6 +1140,7 @@ ssize_t extfuse_request_pre(struct fuse_req *req, gfp_t gfp)
 			    !extfuse_target_stable(&state->targets[i],
 						    dependencies)) {
 				ret = -ENOSYS;
+				*passthru = false;
 				reason = EXTFUSE_TRACE_REASON_RACE;
 				break;
 			}
@@ -1129,10 +1155,27 @@ ssize_t extfuse_request_pre(struct fuse_req *req, gfp_t gfp)
 		req->args->out_args[0].size = out_capacity;
 
 	action = extfuse_pre_action(ret, reason);
+	if (*passthru)
+		action = EXTFUSE_TRACE_ACTION_FORWARD;
 	extfuse_trace(req, req->args->nodeid, EXTFUSE_TRACE_PHASE_PRE,
 		       action, reason, ret, validated);
 	req->extfuse_pre_traced = true;
 	return ret;
+}
+
+enum extfuse_pre_route extfuse_request_pre(struct fuse_req *req, gfp_t gfp,
+					   ssize_t *result)
+{
+	bool passthru = false;
+
+	*result = extfuse_request_pre_result(req, gfp, &passthru);
+	if (passthru)
+		return EXTFUSE_PRE_WBCACHE_FORWARD;
+	if (*result == -ENOSYS)
+		return EXTFUSE_PRE_DAEMON;
+	if (*result < 0)
+		return EXTFUSE_PRE_ERROR;
+	return EXTFUSE_PRE_COMPLETE;
 }
 EXPORT_SYMBOL_GPL(extfuse_request_pre);
 
@@ -1300,6 +1343,47 @@ static void extfuse_request_end_mutation(struct fuse_req *req, int error)
 			       state->request_dependencies);
 	}
 }
+
+int extfuse_request_prepare_wbcache(struct fuse_req *req, gfp_t gfp)
+{
+	struct fuse_conn *fc = req->fm->fc;
+	struct extfuse_req_state *state;
+	int err;
+
+	if (!READ_ONCE(fc->extfuse_wbcache_passthrough) ||
+	    !req->args->extfuse_file ||
+	    (req->args->opcode != FUSE_READ &&
+	     req->args->opcode != FUSE_WRITE))
+		return -EOPNOTSUPP;
+
+	err = extfuse_request_prepare_daemon(req, gfp);
+	if (err)
+		return err;
+
+	state = req->extfuse_state;
+	if (!state || !state->mutation || !state->begun) {
+		extfuse_request_end_mutation(req, -EIO);
+		extfuse_optional_out_remove(req);
+		return -EIO;
+	}
+
+	/* A lower-VFS completion has no daemon reply or mutation trailer. */
+	extfuse_optional_out_remove(req);
+	state->wbcache_forward = true;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(extfuse_request_prepare_wbcache);
+
+void extfuse_request_complete_wbcache(struct fuse_req *req, int error)
+{
+	struct extfuse_req_state *state = req->extfuse_state;
+
+	if (!state || !state->wbcache_forward)
+		return;
+	extfuse_request_end_mutation(req, error);
+	extfuse_optional_out_remove(req);
+}
+EXPORT_SYMBOL_GPL(extfuse_request_complete_wbcache);
 
 static bool extfuse_getxattr_request_valid(struct fuse_args *args,
 					   const struct fuse_getxattr_in **in)
@@ -1654,7 +1738,7 @@ static void extfuse_post_daemon(struct fuse_req *req, u32 reason)
 					 &post.targets[i]);
 
 	ret = __extfuse_request_send_ctx(req->fm->fc, req->args, &req->in.h,
-					 &post, true, &post_reason);
+					 &post, true, &post_reason, NULL);
 	if (ret) {
 		extfuse_trace(req, req->args->nodeid,
 			       EXTFUSE_TRACE_PHASE_POST_DAEMON,
@@ -1677,6 +1761,10 @@ void extfuse_request_complete(struct fuse_req *req)
 
 	if (!state)
 		return;
+	if (state->wbcache_forward) {
+		extfuse_request_complete_wbcache(req, req->out.h.error);
+		return;
+	}
 	if (!req->extfuse_reply_received) {
 		reason = EXTFUSE_TRACE_REASON_POST_ERROR;
 	} else if (!extfuse_output_valid(req, req->out.h.error)) {
@@ -1915,7 +2003,7 @@ static int __extfuse_passthrough_notify(struct fuse_conn *fc,
 	}
 
 	ret = __extfuse_request_send_ctx(fc, &args, NULL, NULL, false,
-					 &reason);
+					 &reason, NULL);
 	if (!ret)
 		action = EXTFUSE_TRACE_ACTION_HIT;
 	else if (ret == -ENOSYS)

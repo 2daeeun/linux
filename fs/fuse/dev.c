@@ -676,12 +676,43 @@ static void fuse_args_to_req(struct fuse_req *req, struct fuse_args *args)
 		__set_bit(FR_ASYNC, &req->flags);
 }
 
+static ssize_t fuse_wbcache_request_execute(struct fuse_req *req, gfp_t gfp,
+					    bool *lower_started)
+{
+	struct fuse_wbcache_io *io;
+	ssize_t ret;
+	int err;
+
+	*lower_started = false;
+	io = fuse_wbcache_passthrough_prepare(req);
+	if (IS_ERR(io))
+		return PTR_ERR(io);
+
+	err = extfuse_request_prepare_wbcache(req, gfp);
+	if (err) {
+		fuse_wbcache_passthrough_finish(io);
+		return err;
+	}
+
+	/* From this point onward, never retry the operation through the daemon. */
+	*lower_started = true;
+	if (!READ_ONCE(req->fm->fc->connected))
+		ret = -ENOTCONN;
+	else
+		ret = fuse_wbcache_passthrough_execute(req, io);
+	extfuse_request_complete_wbcache(req, ret < 0 ? ret : 0);
+	fuse_wbcache_passthrough_finish(io);
+	return ret;
+}
+
 ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
 			      struct fuse_mount *fm,
 			      struct fuse_args *args)
 {
 	struct fuse_conn *fc = fm->fc;
 	struct fuse_req *req;
+	enum extfuse_pre_route route;
+	bool lower_started;
 	ssize_t ret;
 
 	if (args->force) {
@@ -708,10 +739,19 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
 	 * This preserves connection errors and legacy argument layouts.
 	 */
 	fuse_args_to_req(req, args);
-	ret = extfuse_request_pre(req, GFP_KERNEL);
-	if (ret != -ENOSYS) {
+	route = extfuse_request_pre(req, GFP_KERNEL, &ret);
+	if (route == EXTFUSE_PRE_COMPLETE || route == EXTFUSE_PRE_ERROR) {
 		fuse_put_request(req);
 		return ret;
+	}
+	if (route == EXTFUSE_PRE_WBCACHE_FORWARD) {
+		ret = fuse_wbcache_request_execute(req, GFP_KERNEL,
+						    &lower_started);
+		if (lower_started) {
+			fuse_put_request(req);
+			return ret;
+		}
+		/* Validation/allocation failed before lower I/O: use the daemon. */
 	}
 	ret = extfuse_request_prepare_daemon(req, GFP_KERNEL);
 	if (ret) {
@@ -783,10 +823,94 @@ static int fuse_request_queue_background(struct fuse_req *req)
 	return queued;
 }
 
+static void fuse_request_end_unqueued(struct fuse_req *req, int error)
+{
+	clear_bit(FR_PENDING, &req->flags);
+	req->out.h.error = error;
+	extfuse_request_cancel(req, error);
+	if (test_bit(FR_ASYNC, &req->flags))
+		req->args->end(req->fm, req->args, error);
+	fuse_put_request(req);
+}
+
+static void fuse_wbcache_background_work(struct work_struct *work)
+{
+	struct fuse_req *req = container_of(work, struct fuse_req,
+					    extfuse_wbcache_work);
+	struct fuse_conn *fc = req->fm->fc;
+	bool lower_started;
+	ssize_t ret;
+
+	ret = fuse_wbcache_request_execute(req, GFP_KERNEL, &lower_started);
+	if (!lower_started) {
+		ret = extfuse_request_prepare_daemon(req, GFP_KERNEL);
+		if (ret) {
+			req->out.h.error = ret;
+			clear_bit(FR_PENDING, &req->flags);
+			fuse_request_end(req);
+			return;
+		}
+		/*
+		 * Drop the local worker's background slot, then queue the same
+		 * admitted request through the selected daemon transport.
+		 */
+		spin_lock(&fc->bg_lock);
+		fuse_request_bg_finish(fc, req);
+		flush_bg_queue(fc);
+		__set_bit(FR_BACKGROUND, &req->flags);
+		spin_unlock(&fc->bg_lock);
+
+		if (fuse_request_queue_background(req))
+			return;
+		fuse_request_end_unqueued(req, -ENOTCONN);
+		return;
+	}
+
+	req->out.h.error = ret < 0 ? ret : 0;
+	clear_bit(FR_PENDING, &req->flags);
+	fuse_request_end(req);
+}
+
+static int fuse_request_queue_wbcache(struct fuse_req *req)
+{
+	struct fuse_conn *fc = req->fm->fc;
+	bool queued = false;
+
+	if (!test_bit(FR_WAITING, &req->flags)) {
+		__set_bit(FR_WAITING, &req->flags);
+		atomic_inc(&fc->num_waiting);
+	}
+	__set_bit(FR_ISREPLY, &req->flags);
+	INIT_WORK(&req->extfuse_wbcache_work, fuse_wbcache_background_work);
+
+	spin_lock(&fc->bg_lock);
+	if (likely(fc->connected && fc->extfuse_wbcache_wq)) {
+		fc->num_background++;
+		fc->active_background++;
+		if (fc->num_background == fc->max_background)
+			fc->blocked = 1;
+		queued = queue_work(fc->extfuse_wbcache_wq,
+				    &req->extfuse_wbcache_work);
+		if (WARN_ON_ONCE(!queued)) {
+			if (fc->num_background == fc->max_background) {
+				fc->blocked = 0;
+				wake_up(&fc->blocked_waitq);
+			}
+			fc->num_background--;
+			fc->active_background--;
+		}
+	}
+	spin_unlock(&fc->bg_lock);
+
+	return queued;
+}
+
 int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 			    gfp_t gfp_flags)
 {
 	struct fuse_req *req;
+	enum extfuse_pre_route route;
+	ssize_t result;
 	int err;
 
 	if (args->force) {
@@ -803,6 +927,26 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 	}
 
 	fuse_args_to_req(req, args);
+	/* Preserve the pre-existing C0-C2 background-request path exactly. */
+	if (READ_ONCE(fm->fc->extfuse_wbcache_passthrough)) {
+		route = extfuse_request_pre(req, gfp_flags, &result);
+		if (route == EXTFUSE_PRE_COMPLETE) {
+			fuse_request_end_unqueued(req, 0);
+			return 0;
+		}
+		if (route == EXTFUSE_PRE_ERROR) {
+			extfuse_request_cancel(req, result);
+			fuse_put_request(req);
+			return result;
+		}
+		if (route == EXTFUSE_PRE_WBCACHE_FORWARD) {
+			if (fuse_request_queue_wbcache(req))
+				return 0;
+			extfuse_request_cancel(req, -ENOTCONN);
+			fuse_put_request(req);
+			return -ENOTCONN;
+		}
+	}
 	err = extfuse_request_prepare_daemon(req, gfp_flags);
 	if (err) {
 		extfuse_request_cancel(req, err);

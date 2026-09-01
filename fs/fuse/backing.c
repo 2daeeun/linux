@@ -90,7 +90,8 @@ int fuse_backing_open(struct fuse_conn *fc, struct fuse_backing_map *map)
 
 	/* TODO: relax CAP_SYS_ADMIN once backing files are visible to lsof */
 	res = -EPERM;
-	if (!fc->passthrough || !capable(CAP_SYS_ADMIN))
+	if ((!fc->passthrough && !fc->extfuse_wbcache_passthrough) ||
+	    !capable(CAP_SYS_ADMIN))
 		goto out;
 
 	res = -EINVAL;
@@ -146,7 +147,8 @@ int fuse_backing_close(struct fuse_conn *fc, int backing_id)
 
 	/* TODO: relax CAP_SYS_ADMIN once backing files are visible to lsof */
 	err = -EPERM;
-	if (!fc->passthrough || !capable(CAP_SYS_ADMIN))
+	if ((!fc->passthrough && !fc->extfuse_wbcache_passthrough) ||
+	    !capable(CAP_SYS_ADMIN))
 		goto out;
 
 	err = -EINVAL;

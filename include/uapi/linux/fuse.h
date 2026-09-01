@@ -244,6 +244,9 @@
  *  7.46
  *  - add ExtFUSE coherence epochs and mutation metadata
  *  - add FUSE_NOTIFY_INVAL_XATTR
+ *
+ *  7.47
+ *  - add ExtFUSE writeback-cache passthrough
  */
 
 #ifndef _LINUX_FUSE_H
@@ -279,7 +282,7 @@
 #define FUSE_KERNEL_VERSION 7
 
 /** Minor version number of this interface */
-#define FUSE_KERNEL_MINOR_VERSION 46
+#define FUSE_KERNEL_MINOR_VERSION 47
 
 /** The node ID of the root inode */
 #define FUSE_ROOT_ID 1
@@ -387,6 +390,9 @@ struct fuse_file_lock {
  * FOPEN_NOFLUSH: don't flush data cache on close (unless FUSE_WRITEBACK_CACHE)
  * FOPEN_PARALLEL_DIRECT_WRITES: Allow concurrent direct writes on the same inode
  * FOPEN_PASSTHROUGH: passthrough read/write io for this open file
+ * FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH: keep FUSE page-cache semantics while an
+ *			 ExtFUSE policy forwards ordinary READ/WRITE requests to a
+ *			 registered lower file
  */
 #define FOPEN_DIRECT_IO		(1 << 0)
 #define FOPEN_KEEP_CACHE	(1 << 1)
@@ -396,6 +402,7 @@ struct fuse_file_lock {
 #define FOPEN_NOFLUSH		(1 << 5)
 #define FOPEN_PARALLEL_DIRECT_WRITES	(1 << 6)
 #define FOPEN_PASSTHROUGH	(1 << 7)
+#define FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH	(1 << 8)
 
 /**
  * INIT request/reply flags
@@ -474,6 +481,10 @@ struct fuse_file_lock {
  *			 trailer; requires FUSE_EXTFUSE_COHERENCE_EPOCHS
  * FUSE_HAS_NOTIFY_INVAL_XATTR: daemon may invalidate all cached xattr state
  *			 for one node; requires FUSE_EXTFUSE_COHERENCE_EPOCHS
+ * FUSE_EXTFUSE_WBCACHE_PASSTHROUGH: ExtFUSE may forward ordinary page-backed
+ *			 READ/WRITE requests to a registered lower file while
+ *			 retaining FUSE_WRITEBACK_CACHE; requires FS_EXTFUSE,
+ *			 coherence epochs and writeback cache
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -529,6 +540,7 @@ struct fuse_file_lock {
 #define FUSE_EXTFUSE_COHERENCE_EPOCHS (1ULL << 48)
 #define FUSE_MUTATION_METADATA	(1ULL << 49)
 #define FUSE_HAS_NOTIFY_INVAL_XATTR (1ULL << 50)
+#define FUSE_EXTFUSE_WBCACHE_PASSTHROUGH (1ULL << 51)
 
 /**
  * CUSE INIT request/reply flags

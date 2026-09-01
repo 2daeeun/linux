@@ -27,12 +27,14 @@ static inline bool fuse_is_io_cache_wait(struct fuse_inode *fi)
  * Blocks new parallel dio writes and waits for the in-progress parallel dio
  * writes to complete.
  */
-int fuse_file_cached_io_open(struct inode *inode, struct fuse_file *ff)
+static int fuse_file_cached_io_start(struct inode *inode, struct fuse_file *ff,
+				     struct fuse_backing *wbcache_fb)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_backing *inode_fb;
 
 	/* There are no io modes if server does not implement open */
-	if (!ff->args)
+	if (!ff->args && !wbcache_fb)
 		return 0;
 
 	spin_lock(&fi->lock);
@@ -57,6 +59,25 @@ int fuse_file_cached_io_open(struct inode *inode, struct fuse_file *ff)
 		return -ETXTBSY;
 	}
 
+	inode_fb = fi->extfuse_wbcache_fb;
+	if ((!wbcache_fb && inode_fb) ||
+	    (wbcache_fb && inode_fb && inode_fb != wbcache_fb) ||
+	    (wbcache_fb && !inode_fb && fi->iocachectr > 0)) {
+		spin_unlock(&fi->lock);
+		return -EBUSY;
+	}
+	if (wbcache_fb) {
+		if (!inode_fb) {
+			inode_fb = fuse_backing_get(wbcache_fb);
+			if (WARN_ON_ONCE(!inode_fb)) {
+				spin_unlock(&fi->lock);
+				return -ESTALE;
+			}
+			fi->extfuse_wbcache_fb = inode_fb;
+		}
+		fi->extfuse_wbcache_open_count++;
+	}
+
 	WARN_ON(ff->iomode == IOM_UNCACHED);
 	if (ff->iomode == IOM_NONE) {
 		ff->iomode = IOM_CACHED;
@@ -68,17 +89,39 @@ int fuse_file_cached_io_open(struct inode *inode, struct fuse_file *ff)
 	return 0;
 }
 
+int fuse_file_cached_io_open(struct inode *inode, struct fuse_file *ff)
+{
+	return fuse_file_cached_io_start(inode, ff, NULL);
+}
+
 static void fuse_file_cached_io_release(struct fuse_file *ff,
 					struct fuse_inode *fi)
 {
+	struct fuse_backing *inode_fb = NULL;
+	bool wbcache = !!fuse_file_wbcache_backing(ff);
+
 	spin_lock(&fi->lock);
 	WARN_ON(fi->iocachectr <= 0);
 	WARN_ON(ff->iomode != IOM_CACHED);
+	if (wbcache) {
+		WARN_ON(!fi->extfuse_wbcache_open_count);
+		if (fi->extfuse_wbcache_open_count)
+			fi->extfuse_wbcache_open_count--;
+		if (!fi->extfuse_wbcache_open_count) {
+			inode_fb = fi->extfuse_wbcache_fb;
+			fi->extfuse_wbcache_fb = NULL;
+		}
+	}
 	ff->iomode = IOM_NONE;
 	fi->iocachectr--;
 	if (fi->iocachectr == 0)
 		clear_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
 	spin_unlock(&fi->lock);
+
+	if (inode_fb)
+		fuse_backing_put(inode_fb);
+	if (wbcache)
+		fuse_wbcache_passthrough_release(ff);
 }
 
 /* Start strictly uncached io mode where cache access is not allowed */
@@ -192,26 +235,68 @@ static int fuse_file_passthrough_open(struct inode *inode, struct file *file)
 	return err;
 }
 
+#define FOPEN_EXTFUSE_WBCACHE_MASK \
+	(FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH | FOPEN_KEEP_CACHE | FOPEN_NOFLUSH)
+
+static int fuse_file_wbcache_passthrough_open(struct inode *inode,
+					      struct file *file)
+{
+	struct fuse_file *ff = file->private_data;
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	int err;
+
+	if (!IS_ENABLED(CONFIG_EXTFUSE) ||
+	    !IS_ENABLED(CONFIG_FUSE_PASSTHROUGH) ||
+	    !READ_ONCE(fc->extfuse_wbcache_passthrough) ||
+	    !READ_ONCE(fc->extfuse_coherence_epochs) || !fc->writeback_cache ||
+	    (ff->open_flags & ~FOPEN_EXTFUSE_WBCACHE_MASK))
+		return -EINVAL;
+
+	err = fuse_wbcache_passthrough_open(
+		file, ff->args->open_outarg.backing_id);
+	if (err)
+		return err;
+
+	err = fuse_file_cached_io_start(inode, ff,
+					fuse_file_wbcache_backing(ff));
+	if (err)
+		fuse_wbcache_passthrough_release(ff);
+	return err;
+}
+
 /* Request access to submit new io to inode via open file */
 int fuse_file_io_open(struct file *file, struct inode *inode)
 {
 	struct fuse_file *ff = file->private_data;
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	int err;
+	int err = -EINVAL;
 
 	/*
 	 * io modes are not relevant with DAX and with server that does not
 	 * implement open.
 	 */
-	if (FUSE_IS_DAX(inode) || !ff->args)
+	if ((FUSE_IS_DAX(inode) || !ff->args) &&
+	    !(ff->open_flags & FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH))
 		return 0;
+	if (FUSE_IS_DAX(inode) || !ff->args)
+		goto fail;
+
+	if ((ff->open_flags & FOPEN_PASSTHROUGH) &&
+	    (ff->open_flags & FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH))
+		goto fail;
+	if ((ff->open_flags & FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH) &&
+	    (ff->open_flags & (FOPEN_DIRECT_IO |
+			       FOPEN_PARALLEL_DIRECT_WRITES)))
+		goto fail;
 
 	/*
 	 * Server is expected to use FOPEN_PASSTHROUGH for all opens of an inode
 	 * which is already open for passthrough.
 	 */
-	err = -EINVAL;
 	if (fuse_inode_backing(fi) && !(ff->open_flags & FOPEN_PASSTHROUGH))
+		goto fail;
+	if (fuse_inode_wbcache_backing(fi) &&
+	    !(ff->open_flags & FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH))
 		goto fail;
 
 	/*
@@ -229,11 +314,14 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
 	 * so we put the inode in caching mode to prevent parallel dio.
 	 */
 	if ((ff->open_flags & FOPEN_DIRECT_IO) &&
-	    !(ff->open_flags & FOPEN_PASSTHROUGH))
+	    !(ff->open_flags & (FOPEN_PASSTHROUGH |
+				FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH)))
 		return 0;
 
 	if (ff->open_flags & FOPEN_PASSTHROUGH)
 		err = fuse_file_passthrough_open(inode, file);
+	else if (ff->open_flags & FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH)
+		err = fuse_file_wbcache_passthrough_open(inode, file);
 	else
 		err = fuse_file_cached_io_open(inode, ff);
 	if (err)

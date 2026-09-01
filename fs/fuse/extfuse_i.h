@@ -32,6 +32,14 @@ enum extfuse_trace_action {
 	EXTFUSE_TRACE_ACTION_POSTED = 4,
 	EXTFUSE_TRACE_ACTION_SKIPPED = 5,
 	EXTFUSE_TRACE_ACTION_MUTATION = 6,
+	EXTFUSE_TRACE_ACTION_FORWARD = 7,
+};
+
+enum extfuse_pre_route {
+	EXTFUSE_PRE_COMPLETE,
+	EXTFUSE_PRE_DAEMON,
+	EXTFUSE_PRE_WBCACHE_FORWARD,
+	EXTFUSE_PRE_ERROR,
 };
 
 enum extfuse_trace_reason {
@@ -78,8 +86,11 @@ int extfuse_load_prog(struct fuse_conn *fc, int fd);
 void extfuse_unload_prog(struct fuse_conn *fc);
 int extfuse_init_reply(struct fuse_conn *fc, struct fuse_args *args);
 ssize_t extfuse_request_send(struct fuse_conn *fc, struct fuse_args *args);
-ssize_t extfuse_request_pre(struct fuse_req *req, gfp_t gfp);
+enum extfuse_pre_route extfuse_request_pre(struct fuse_req *req, gfp_t gfp,
+					   ssize_t *result);
 int extfuse_request_prepare_daemon(struct fuse_req *req, gfp_t gfp);
+int extfuse_request_prepare_wbcache(struct fuse_req *req, gfp_t gfp);
+void extfuse_request_complete_wbcache(struct fuse_req *req, int error);
 void extfuse_request_complete(struct fuse_req *req);
 void extfuse_request_cancel(struct fuse_req *req, int error);
 void extfuse_request_free(struct fuse_req *req);
@@ -127,15 +138,28 @@ static inline ssize_t extfuse_request_send(struct fuse_conn *fc,
 	return -ENOSYS;
 }
 
-static inline ssize_t extfuse_request_pre(struct fuse_req *req, gfp_t gfp)
+static inline enum extfuse_pre_route
+extfuse_request_pre(struct fuse_req *req, gfp_t gfp, ssize_t *result)
 {
-	return -ENOSYS;
+	*result = -ENOSYS;
+	return EXTFUSE_PRE_DAEMON;
 }
 
 static inline int extfuse_request_prepare_daemon(struct fuse_req *req,
 						  gfp_t gfp)
 {
 	return 0;
+}
+
+static inline int extfuse_request_prepare_wbcache(struct fuse_req *req,
+						   gfp_t gfp)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void
+extfuse_request_complete_wbcache(struct fuse_req *req, int error)
+{
 }
 
 static inline void extfuse_request_complete(struct fuse_req *req)

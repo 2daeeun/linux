@@ -1060,6 +1060,10 @@ void fuse_conn_put(struct fuse_conn *fc)
 	cancel_work_sync(&fc->epoch_work);
 	if (fiq->ops->release)
 		fiq->ops->release(fiq);
+	if (fc->extfuse_wbcache_wq) {
+		destroy_workqueue(fc->extfuse_wbcache_wq);
+		fc->extfuse_wbcache_wq = NULL;
+	}
 	put_pid_ns(fc->pid_ns);
 	bucket = rcu_dereference_protected(fc->curr_bucket, 1);
 	if (bucket) {
@@ -1562,6 +1566,35 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				else
 					fc->extfuse_notify_inval_xattr = 1;
 			}
+			if (flags & FUSE_EXTFUSE_WBCACHE_PASSTHROUGH) {
+				if (arg->minor < 47 ||
+				    !IS_ENABLED(CONFIG_EXTFUSE) ||
+				    !IS_ENABLED(CONFIG_FUSE_PASSTHROUGH) ||
+				    !(flags & FUSE_FS_EXTFUSE) ||
+				    !(flags & FUSE_WRITEBACK_CACHE) ||
+				    !(flags & FUSE_EXTFUSE_COHERENCE_EPOCHS) ||
+				    !fc->writeback_cache ||
+				    !fc->extfuse_coherence_epochs ||
+				    (flags & FUSE_PASSTHROUGH) ||
+				    arg->max_stack_depth <= 0 ||
+				    arg->max_stack_depth >
+					FILESYSTEM_MAX_STACK_DEPTH) {
+					ok = false;
+				} else {
+					fc->extfuse_wbcache_wq = alloc_workqueue(
+						"fuse-wbcache",
+						WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+					if (!fc->extfuse_wbcache_wq) {
+						ok = false;
+					} else {
+						fc->extfuse_wbcache_passthrough = 1;
+						fc->max_stack_depth =
+							arg->max_stack_depth;
+						fm->sb->s_stack_depth =
+							arg->max_stack_depth;
+					}
+				}
+			}
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1582,6 +1615,11 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 	kfree(ia);
 
 	if (!ok) {
+		if (fc->extfuse_wbcache_wq) {
+			destroy_workqueue(fc->extfuse_wbcache_wq);
+			fc->extfuse_wbcache_wq = NULL;
+		}
+		fc->extfuse_wbcache_passthrough = 0;
 		fc->io_uring = 0;
 		fc->conn_init = 0;
 		fc->conn_error = 1;
@@ -1622,6 +1660,9 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 			flags |= FUSE_EXTFUSE_COHERENCE_EPOCHS |
 				 FUSE_MUTATION_METADATA |
 				 FUSE_HAS_NOTIFY_INVAL_XATTR;
+		if (IS_ENABLED(CONFIG_EXTFUSE) &&
+		    IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
+			flags |= FUSE_EXTFUSE_WBCACHE_PASSTHROUGH;
 		if (IS_ENABLED(CONFIG_EXTFUSE) &&
 		    IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 			flags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE |

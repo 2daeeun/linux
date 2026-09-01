@@ -649,6 +649,7 @@ void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
 	args->opcode = opcode;
 	args->nodeid = ff->nodeid;
 	args->extfuse_inode = file_inode(file);
+	args->extfuse_file = ff;
 	args->in_numargs = 1;
 	args->in_args[0].size = sizeof(ia->read.in);
 	args->in_args[0].value = &ia->read.in;
@@ -1179,6 +1180,7 @@ static void fuse_write_args_fill(struct fuse_io_args *ia, struct fuse_file *ff,
 	ia->write.in.size = count;
 	args->opcode = FUSE_WRITE;
 	args->nodeid = ff->nodeid;
+	args->extfuse_file = ff;
 	args->in_numargs = 2;
 	if (ff->fm->fc->minor < 9)
 		args->in_args[0].size = FUSE_COMPAT_WRITE_IN_SIZE;
