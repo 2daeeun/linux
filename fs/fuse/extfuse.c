@@ -504,6 +504,43 @@ static bool extfuse_target_stable(
 	return true;
 }
 
+static bool extfuse_target_identity_current(
+	const struct extfuse_target_state *state)
+{
+	struct extfuse_coherence_target snapshot = { };
+
+	if (!state->inode)
+		return false;
+
+	extfuse_snapshot_inode(state->inode, state->dependencies, &snapshot);
+	return snapshot.nodeid == state->pre.nodeid &&
+	       snapshot.incarnation == state->pre.incarnation;
+}
+
+static bool extfuse_is_wbcache_write_forward(
+	const struct fuse_req *req, const struct extfuse_req_state *state,
+	bool passthru)
+{
+	const u32 dependencies = EXTFUSE_COHERENCE_DOMAIN_ATTR |
+		EXTFUSE_COHERENCE_DOMAIN_DATA;
+	const struct extfuse_target_state *target;
+
+	if (!passthru ||
+	    !READ_ONCE(req->fm->fc->extfuse_wbcache_passthrough) ||
+	    req->args->opcode != FUSE_WRITE || !req->args->extfuse_file ||
+	    !req->args->extfuse_inode || req->args->is_ext ||
+	    !state->mutation || !state->trailer_capable ||
+	    state->global_mutation || state->target_count != 1 ||
+	    state->request_dependencies != dependencies)
+		return false;
+
+	target = &state->targets[0];
+	return target->inode == req->args->extfuse_inode &&
+	       target->dependencies == dependencies &&
+	       target->pre.dependencies == dependencies &&
+	       target->pre.nodeid == req->args->nodeid;
+}
+
 static int extfuse_inode_begin(struct inode *inode, u32 dependencies)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -1038,6 +1075,7 @@ static ssize_t extfuse_request_pre_result(struct fuse_req *req, gfp_t gfp,
 	struct fuse_conn *fc = req->fm->fc;
 	struct extfuse_req_state *state;
 	struct extfuse_coherence pre = { };
+	bool wbcache_write_forward;
 	u32 validated;
 	u32 reason = EXTFUSE_TRACE_REASON_NONE;
 	u32 action;
@@ -1125,24 +1163,42 @@ static ssize_t extfuse_request_pre_result(struct fuse_req *req, gfp_t gfp,
 	validated = state->request_dependencies;
 	if (req->args->opcode == FUSE_GETXATTR)
 		validated = extfuse_validated_dependencies(req->args, ret);
+	wbcache_write_forward = extfuse_is_wbcache_write_forward(req, state,
+								 *passthru);
 	if (ret != -ENOSYS || *passthru) {
-		for (i = 0; i < state->target_count; i++) {
-			u32 dependencies = state->targets[i].dependencies &
-				validated;
-
-			if (state->targets[i].pre.active & dependencies) {
-				ret = -ENOSYS;
-				*passthru = false;
-				reason = EXTFUSE_TRACE_REASON_ACTIVE;
-				break;
-			}
-			if (dependencies &&
-			    !extfuse_target_stable(&state->targets[i],
-						    dependencies)) {
+		/*
+		 * A WBCache WRITE PASSTHRU result admits a mutation; it is not a
+		 * cached reply.  Concurrent writers may change the active mask and
+		 * epochs.  prepare_wbcache() adds this write to the same active
+		 * counters before lower I/O, keeping metadata hits blocked until all
+		 * writers finish.  Keep identity stable here; full file and request
+		 * validation still runs before the lower write.
+		 */
+		if (wbcache_write_forward) {
+			if (!extfuse_target_identity_current(&state->targets[0])) {
 				ret = -ENOSYS;
 				*passthru = false;
 				reason = EXTFUSE_TRACE_REASON_RACE;
-				break;
+			}
+		} else {
+			for (i = 0; i < state->target_count; i++) {
+				u32 dependencies =
+					state->targets[i].dependencies & validated;
+
+				if (state->targets[i].pre.active & dependencies) {
+					ret = -ENOSYS;
+					*passthru = false;
+					reason = EXTFUSE_TRACE_REASON_ACTIVE;
+					break;
+				}
+				if (dependencies &&
+				    !extfuse_target_stable(&state->targets[i],
+							    dependencies)) {
+					ret = -ENOSYS;
+					*passthru = false;
+					reason = EXTFUSE_TRACE_REASON_RACE;
+					break;
+				}
 			}
 		}
 	}
