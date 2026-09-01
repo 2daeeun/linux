@@ -737,7 +737,7 @@ ssize_t fuse_dax_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (ret <= 0)
 		goto out;
 	local_write = !file_extending_write(iocb, from);
-	if (local_write && READ_ONCE(fc->extfuse_coherence_v3)) {
+	if (local_write && READ_ONCE(fc->extfuse_coherence_epochs)) {
 		ret = extfuse_coherence_begin_inode(fc, inode,
 					EXTFUSE_COHERENCE_DOMAIN_ATTR |
 					EXTFUSE_COHERENCE_DOMAIN_DATA);
@@ -852,10 +852,10 @@ int fuse_dax_mmap(struct file *file, struct vm_area_struct *vma)
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	int ret;
 
-	if (READ_ONCE(fc->extfuse_coherence_v3)) {
-		ret = extfuse_passthrough_notify(fc, get_node_id(inode),
-						 EXTFUSE_PASSTHROUGH_MMAP,
-						 EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
+	if (READ_ONCE(fc->extfuse_coherence_epochs)) {
+		ret = extfuse_passthrough_notify_inode(
+			fc, inode, EXTFUSE_PASSTHROUGH_MMAP,
+			EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
 		if (ret)
 			return ret;
 		fuse_invalidate_attr(inode);

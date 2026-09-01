@@ -1883,7 +1883,7 @@ static int fuse_notify_store(struct fuse_conn *fc, unsigned int size,
 	inode = fuse_ilookup(fc, nodeid,  NULL);
 	if (!inode)
 		goto out_up_killsb;
-	if (READ_ONCE(fc->extfuse_coherence_v3)) {
+	if (READ_ONCE(fc->extfuse_coherence_epochs)) {
 		err = extfuse_coherence_begin_inode(fc, inode,
 					EXTFUSE_COHERENCE_DOMAIN_ATTR |
 					EXTFUSE_COHERENCE_DOMAIN_DATA);

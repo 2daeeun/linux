@@ -99,9 +99,8 @@ static int fuse_passthrough_extfuse_notify(struct file *file, u32 opcode,
 {
 	struct fuse_file *ff = file->private_data;
 
-	return extfuse_passthrough_notify(ff->fm->fc,
-					 get_node_id(file_inode(file)), opcode,
-					 phase);
+	return extfuse_passthrough_notify_inode(ff->fm->fc, file_inode(file),
+					       opcode, phase);
 }
 
 static int fuse_passthrough_begin_io(struct kiocb *iocb, bool write)

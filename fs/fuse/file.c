@@ -343,7 +343,7 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 	extfuse_release_mutation = passthrough && fi &&
 		opcode == FUSE_RELEASE && S_ISREG(fi->inode.i_mode) &&
 		(flags & O_ACCMODE) != O_RDONLY &&
-		READ_ONCE(fc->extfuse_coherence_v3);
+		READ_ONCE(fc->extfuse_coherence_epochs);
 	if (extfuse_release_mutation) {
 		extfuse_err = extfuse_coherence_begin_inode(fc, &fi->inode,
 				EXTFUSE_COHERENCE_DOMAIN_ATTR |
@@ -1566,7 +1566,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	task_io_account_write(count);
 
-	if (fc->writeback_cache && READ_ONCE(fc->extfuse_coherence_v3)) {
+	if (fc->writeback_cache && READ_ONCE(fc->extfuse_coherence_epochs)) {
 		err = extfuse_coherence_begin_inode(fc, inode,
 					EXTFUSE_COHERENCE_DOMAIN_ATTR |
 					EXTFUSE_COHERENCE_DOMAIN_DATA);
@@ -2491,10 +2491,10 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 	if ((ff->open_flags & FOPEN_DIRECT_IO) &&
 	    (vma->vm_flags & VM_MAYSHARE) && !fc->direct_io_allow_mmap)
 		return -ENODEV;
-	if (READ_ONCE(fc->extfuse_coherence_v3)) {
-		rc = extfuse_passthrough_notify(fc, get_node_id(inode),
-					 EXTFUSE_PASSTHROUGH_MMAP,
-					 EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
+	if (READ_ONCE(fc->extfuse_coherence_epochs)) {
+		rc = extfuse_passthrough_notify_inode(
+			fc, inode, EXTFUSE_PASSTHROUGH_MMAP,
+			EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
 		if (rc)
 			return rc;
 		fuse_invalidate_attr(inode);

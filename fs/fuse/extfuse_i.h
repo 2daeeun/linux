@@ -91,6 +91,9 @@ void extfuse_coherence_invalidate_namespace(struct fuse_conn *fc);
 int extfuse_coherence_begin_inode(struct fuse_conn *fc, struct inode *inode,
 				    u32 dependencies);
 void extfuse_coherence_end_inode(struct inode *inode, u32 dependencies);
+int extfuse_passthrough_notify_inode(struct fuse_conn *fc,
+				     struct inode *inode, u32 opcode,
+				     u32 phase);
 int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode,
 			       u32 phase);
 int extfuse_passthrough_attr_prepare(struct fuse_conn *fc, u64 nodeid,
@@ -174,6 +177,13 @@ extfuse_coherence_begin_inode(struct fuse_conn *fc, struct inode *inode,
 static inline void extfuse_coherence_end_inode(struct inode *inode,
 					      u32 dependencies)
 {
+}
+
+static inline int
+extfuse_passthrough_notify_inode(struct fuse_conn *fc, struct inode *inode,
+				 u32 opcode, u32 phase)
+{
+	return 0;
 }
 
 static inline int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid,

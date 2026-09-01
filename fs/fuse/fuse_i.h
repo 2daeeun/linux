@@ -147,7 +147,7 @@ struct fuse_inode {
 	/** Version of last attribute change */
 	u64 attr_version;
 
-	/** Serializes the ExtFUSE V3 epoch and active-mutation state. */
+	/** Serializes the ExtFUSE epoch and active-mutation state. */
 	spinlock_t extfuse_coherence_lock;
 
 	/** Distinguishes reuse of the same daemon-provided node ID. */
@@ -371,7 +371,7 @@ struct fuse_args {
 	/* Internal context for a release-barrier GETATTR retry. */
 	struct inode *extfuse_getattr_inode;
 	void (*extfuse_getattr_refresh)(struct inode *inode);
-	/* Direct inode identities for ExtFUSE V3 mutation tracking. */
+	/* Direct inode identities for ExtFUSE epoch mutation tracking. */
 	struct inode *extfuse_inode;
 	struct inode *extfuse_inode2;
 	struct inode *extfuse_inode3;
@@ -481,7 +481,7 @@ struct fuse_req {
 	/* Input/output arguments */
 	struct fuse_args *args;
 
-	/** Optional ExtFUSE V3 PRE/POST and mutation state. */
+	/** Optional ExtFUSE epoch PRE/POST and mutation state. */
 	struct extfuse_req_state *extfuse_state;
 	/** A transport validated and accepted the daemon reply. */
 	bool extfuse_reply_received:1;
@@ -962,8 +962,8 @@ struct fuse_conn {
 	/** Serialize passthrough RELEASE with ExtFUSE GETATTR refresh */
 	unsigned int extfuse_passthrough_attr_release_barrier;
 
-	/** Kernel-owned ExtFUSE inode epochs and two-phase BPF dispatch */
-	unsigned int extfuse_coherence_v3;
+	/** Kernel-owned ExtFUSE inode coherence epochs */
+	unsigned int extfuse_coherence_epochs;
 
 	/** Daemon replies may append struct fuse_mutation_out */
 	unsigned int extfuse_mutation_metadata;

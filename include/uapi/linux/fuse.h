@@ -242,7 +242,7 @@
  *  - add FUSE_NOTIFY_PRUNE
  *
  *  7.46
- *  - add ExtFUSE coherence V3 and mutation metadata
+ *  - add ExtFUSE coherence epochs and mutation metadata
  *  - add FUSE_NOTIFY_INVAL_XATTR
  */
 
@@ -466,12 +466,14 @@ struct fuse_file_lock {
  *			 ATTR_REFRESH; the daemon must finish cache publication
  *			 before the RELEASE reply and must not recurse through the
  *			 same mount for GETATTR while handling RELEASE
- * FUSE_EXTFUSE_COHERENCE_V3: expose kernel-owned inode coherence epochs to
- *			 ExtFUSE before and after daemon requests
+ * FUSE_EXTFUSE_COHERENCE_EPOCHS: expose kernel-owned inode coherence epochs
+ *			 to ExtFUSE before and after daemon requests; native
+ *			 passthrough runs one BPF policy hook before lower I/O and
+ *			 closes the matching epoch in the driver
  * FUSE_MUTATION_METADATA: mutation replies may append a validated metadata
- *			 trailer; requires FUSE_EXTFUSE_COHERENCE_V3
+ *			 trailer; requires FUSE_EXTFUSE_COHERENCE_EPOCHS
  * FUSE_HAS_NOTIFY_INVAL_XATTR: daemon may invalidate all cached xattr state
- *			 for one node; requires FUSE_EXTFUSE_COHERENCE_V3
+ *			 for one node; requires FUSE_EXTFUSE_COHERENCE_EPOCHS
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -524,7 +526,7 @@ struct fuse_file_lock {
 #define FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2 (1ULL << 45)
 #define FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH (1ULL << 46)
 #define FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER (1ULL << 47)
-#define FUSE_EXTFUSE_COHERENCE_V3 (1ULL << 48)
+#define FUSE_EXTFUSE_COHERENCE_EPOCHS (1ULL << 48)
 #define FUSE_MUTATION_METADATA	(1ULL << 49)
 #define FUSE_HAS_NOTIFY_INVAL_XATTR (1ULL << 50)
 

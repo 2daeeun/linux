@@ -11,7 +11,7 @@
  *   - the request-send hook now runs on struct fuse_args (the 5.2 code
  *     hooked fuse_request_send() on struct fuse_req; that path was
  *     refactored into __fuse_simple_request() and the args/req split),
- *   - BPF_PROG_RUN() -> preemption-disabled bpf_prog_run() so V3 programs
+ *   - BPF_PROG_RUN() -> preemption-disabled bpf_prog_run() so epoch programs
  *     can safely retain per-CPU scratch across tail calls,
  *   - probe_kernel_read()/probe_kernel_write() ->
  *     copy_from_kernel_nofault()/copy_to_kernel_nofault(),
@@ -262,8 +262,9 @@ static ssize_t __extfuse_request_send_ctx(
 		goto out_unlock;
 	}
 	/*
-	 * V3 programs use per-CPU scratch across tail calls.  Pinning migration
-	 * alone permits same-CPU preemption reentry to corrupt that scratch, so
+	 * Epoch-coherent programs use per-CPU scratch across tail calls. Pinning
+	 * migration alone permits same-CPU preemption reentry to corrupt that
+	 * scratch, so
 	 * keep the complete program invocation non-preemptible.
 	 */
 	preempt_disable();
@@ -427,7 +428,7 @@ static void extfuse_snapshot_inode(
 	spin_lock(&fi->extfuse_coherence_lock);
 	target->nodeid = get_node_id(inode);
 	target->incarnation = fi->extfuse_incarnation;
-	/* Fold filesystem-wide mutations into the fixed-size V3 epoch ABI. */
+	/* Fold filesystem-wide mutations into the fixed-size epoch ABI. */
 	target->attr_epoch = fi->extfuse_epoch[EXTFUSE_DOMAIN_ATTR] +
 		global_epoch;
 	target->xattr_epoch = fi->extfuse_epoch[EXTFUSE_DOMAIN_XATTR] +
@@ -537,7 +538,7 @@ static void extfuse_inode_end(struct inode *inode, u32 dependencies)
 int extfuse_coherence_begin_inode(struct fuse_conn *fc, struct inode *inode,
 				    u32 dependencies)
 {
-	if (!READ_ONCE(fc->extfuse_coherence_v3) || !inode || !dependencies)
+	if (!READ_ONCE(fc->extfuse_coherence_epochs) || !inode || !dependencies)
 		return -EOPNOTSUPP;
 
 	return extfuse_inode_begin(inode, dependencies);
@@ -567,7 +568,7 @@ void extfuse_coherence_invalidate_inode(struct fuse_conn *fc,
 	struct fuse_inode *fi;
 	unsigned int i;
 
-	if (!READ_ONCE(fc->extfuse_coherence_v3) || !inode || !dependencies)
+	if (!READ_ONCE(fc->extfuse_coherence_epochs) || !inode || !dependencies)
 		return;
 
 	fi = get_fuse_inode(inode);
@@ -584,7 +585,7 @@ void extfuse_coherence_invalidate(struct fuse_conn *fc, u64 nodeid,
 {
 	struct inode *inode;
 
-	if (!READ_ONCE(fc->extfuse_coherence_v3) || !dependencies)
+	if (!READ_ONCE(fc->extfuse_coherence_epochs) || !dependencies)
 		return;
 	inode = extfuse_lookup_node(fc, nodeid);
 	if (!inode)
@@ -597,7 +598,7 @@ EXPORT_SYMBOL_GPL(extfuse_coherence_invalidate);
 
 void extfuse_coherence_invalidate_namespace(struct fuse_conn *fc)
 {
-	if (READ_ONCE(fc->extfuse_coherence_v3))
+	if (READ_ONCE(fc->extfuse_coherence_epochs))
 		atomic64_inc(&fc->extfuse_namespace_epoch);
 }
 EXPORT_SYMBOL_GPL(extfuse_coherence_invalidate_namespace);
@@ -691,7 +692,7 @@ static u32 extfuse_validated_dependencies(const struct fuse_args *args,
 		       EXTFUSE_COHERENCE_DOMAIN_DATA;
 	inarg = args->in_args[0].value;
 	/*
-	 * Narrowing this exact negative capability probe is a V3
+	 * Narrowing this exact negative capability probe is an epoch-coherence
 	 * passthrough-daemon/lower-VFS policy contract, not a generic FUSE
 	 * guarantee.  Every other GETXATTR result remains DATA-dependent.
 	 */
@@ -1036,7 +1037,7 @@ ssize_t extfuse_request_pre(struct fuse_req *req, gfp_t gfp)
 	unsigned int i = 0;
 	int err;
 
-	if (!READ_ONCE(fc->extfuse_coherence_v3))
+	if (!READ_ONCE(fc->extfuse_coherence_epochs))
 		return extfuse_request_send(fc, req->args);
 	if (!req->in.h.unique)
 		req->in.h.unique = fuse_get_unique(&fc->iq);
@@ -1161,7 +1162,7 @@ int extfuse_request_prepare_daemon(struct fuse_req *req, gfp_t gfp)
 	unsigned int i = 0;
 	int err;
 
-	if (!READ_ONCE(fc->extfuse_coherence_v3))
+	if (!READ_ONCE(fc->extfuse_coherence_epochs))
 		return 0;
 	if (!req->in.h.unique)
 		req->in.h.unique = fuse_get_unique(&fc->iq);
@@ -1844,22 +1845,19 @@ int extfuse_passthrough_attr_commit(struct fuse_conn *fc, u64 nodeid,
 EXPORT_SYMBOL_GPL(extfuse_passthrough_attr_commit);
 
 /*
- * Native passthrough does not create an ordinary FUSE READ/WRITE request, so
- * run a private BPF notification for metadata-cache invalidation. A negotiated
- * connection treats a missing or failing handler as an I/O error rather than
- * risking a stale fast-path reply.
+ * Native passthrough does not create an ordinary FUSE READ/WRITE request.
+ * Epoch coherence therefore runs one private BPF policy hook before lower
+ * I/O and completes the matching epoch entirely in the kernel. A missing or
+ * failing BEGIN handler prevents lower I/O rather than risking a stale hit.
  */
-int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode,
-			       u32 phase)
+static int __extfuse_passthrough_notify(struct fuse_conn *fc,
+					struct inode *inode, u64 nodeid,
+					u32 opcode, u32 phase)
 {
 	struct extfuse_passthrough_in in = {
 		.phase = phase,
 	};
-	struct fuse_args args = {
-		.nodeid = nodeid,
-		.opcode = opcode,
-	};
-	struct inode *inode = NULL;
+	struct fuse_args args = { };
 	u32 dependencies = opcode == EXTFUSE_PASSTHROUGH_READ ?
 		EXTFUSE_COHERENCE_DOMAIN_ATTR :
 		EXTFUSE_COHERENCE_DOMAIN_ATTR |
@@ -1868,44 +1866,52 @@ int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode,
 	u32 action;
 	ssize_t ret;
 	unsigned int coherence;
-	bool coherence_v3 = READ_ONCE(fc->extfuse_coherence_v3);
-	bool mutation = coherence_v3 &&
+	bool coherence_epochs = READ_ONCE(fc->extfuse_coherence_epochs);
+	bool epoch_mutation = coherence_epochs &&
 		(opcode == EXTFUSE_PASSTHROUGH_READ ||
 		 opcode == EXTFUSE_PASSTHROUGH_WRITE);
 
+	if (coherence_epochs && !inode)
+		return -EINVAL;
+	args.nodeid = nodeid;
+	args.opcode = opcode;
+	args.extfuse_inode = inode;
+
 	coherence = READ_ONCE(fc->extfuse_passthrough_coherence);
-	if (!coherence && !coherence_v3)
+	if (!coherence && !coherence_epochs)
 		return 0;
-	if (coherence_v3)
+	if (coherence_epochs)
 		coherence = max(coherence, 2U);
 	if (phase != EXTFUSE_PASSTHROUGH_PHASE_BEGIN &&
 	    phase != EXTFUSE_PASSTHROUGH_PHASE_END)
 		return -EINVAL;
+	if (epoch_mutation && phase == EXTFUSE_PASSTHROUGH_PHASE_END) {
+		extfuse_inode_end(inode, dependencies);
+		extfuse_trace_fc(fc, 0, opcode, nodeid,
+				  EXTFUSE_TRACE_PHASE_END,
+				  EXTFUSE_TRACE_ACTION_MUTATION,
+				  EXTFUSE_TRACE_REASON_NONE, 0,
+				  dependencies);
+		return 0;
+	}
 	if (coherence >= 2) {
 		args.in_numargs = 1;
 		args.in_args[0].size = sizeof(in);
 		args.in_args[0].value = &in;
 	}
-	if (mutation) {
-		inode = extfuse_lookup_node(fc, nodeid);
-		if (!inode)
-			return -ESTALE;
-		if (phase == EXTFUSE_PASSTHROUGH_PHASE_BEGIN) {
-			ret = extfuse_inode_begin(inode, dependencies);
-			if (ret) {
-				iput(inode);
-				return ret;
-			}
-			extfuse_trace_fc(fc, 0, opcode, nodeid,
-					  EXTFUSE_TRACE_PHASE_BEGIN,
-					  EXTFUSE_TRACE_ACTION_MUTATION,
-					  EXTFUSE_TRACE_REASON_NONE, 0,
-					  dependencies);
-		}
-	} else if (coherence_v3 &&
+	if (epoch_mutation) {
+		ret = extfuse_inode_begin(inode, dependencies);
+		if (ret)
+			return ret;
+		extfuse_trace_fc(fc, 0, opcode, nodeid,
+				  EXTFUSE_TRACE_PHASE_BEGIN,
+				  EXTFUSE_TRACE_ACTION_MUTATION,
+				  EXTFUSE_TRACE_REASON_NONE, 0,
+				  dependencies);
+	} else if (coherence_epochs &&
 		   opcode == EXTFUSE_PASSTHROUGH_MMAP &&
 		   phase == EXTFUSE_PASSTHROUGH_PHASE_BEGIN) {
-		extfuse_coherence_invalidate(fc, nodeid, dependencies);
+		extfuse_coherence_invalidate_inode(fc, inode, dependencies);
 	}
 
 	ret = __extfuse_request_send_ctx(fc, &args, NULL, NULL, false,
@@ -1919,14 +1925,7 @@ int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode,
 	extfuse_trace_fc(fc, 0, opcode, nodeid, EXTFUSE_TRACE_PHASE_PRE,
 			  action, reason, ret, dependencies);
 
-	if (mutation && phase == EXTFUSE_PASSTHROUGH_PHASE_END) {
-		extfuse_inode_end(inode, dependencies);
-		extfuse_trace_fc(fc, 0, opcode, nodeid,
-				  EXTFUSE_TRACE_PHASE_END,
-				  EXTFUSE_TRACE_ACTION_MUTATION,
-				  EXTFUSE_TRACE_REASON_NONE, ret,
-				  dependencies);
-	} else if (mutation && ret) {
+	if (epoch_mutation && ret) {
 		extfuse_inode_end(inode, dependencies);
 		extfuse_trace_fc(fc, 0, opcode, nodeid,
 				  EXTFUSE_TRACE_PHASE_END,
@@ -1934,14 +1933,45 @@ int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode,
 				  EXTFUSE_TRACE_REASON_PROGRAM_ERROR, ret,
 				  dependencies);
 	}
-	if (inode)
-		iput(inode);
 	if (!ret)
 		return 0;
 
 	pr_warn_ratelimited("native passthrough notification %u failed: %zd\n",
 			    opcode, ret);
 	return ret < 0 && ret != -ENOSYS ? (int)ret : -EIO;
+}
+
+int extfuse_passthrough_notify_inode(struct fuse_conn *fc,
+				     struct inode *inode, u32 opcode,
+				     u32 phase)
+{
+	if (!inode)
+		return -EINVAL;
+
+	return __extfuse_passthrough_notify(fc, inode, get_node_id(inode),
+					      opcode, phase);
+}
+EXPORT_SYMBOL_GPL(extfuse_passthrough_notify_inode);
+
+/* Compatibility entry point for callers that only retain a node ID. */
+int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode,
+			       u32 phase)
+{
+	struct inode *inode;
+	int ret;
+
+	if (!READ_ONCE(fc->extfuse_passthrough_coherence) &&
+	    !READ_ONCE(fc->extfuse_coherence_epochs))
+		return 0;
+	if (!READ_ONCE(fc->extfuse_coherence_epochs))
+		return __extfuse_passthrough_notify(fc, NULL, nodeid, opcode,
+						    phase);
+	inode = extfuse_lookup_node(fc, nodeid);
+	if (!inode)
+		return -ESTALE;
+	ret = extfuse_passthrough_notify_inode(fc, inode, opcode, phase);
+	iput(inode);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(extfuse_passthrough_notify);
 
@@ -1954,7 +1984,7 @@ void extfuse_unload_prog(struct fuse_conn *fc)
 	WRITE_ONCE(fc->extfuse_passthrough_coherence, 0);
 	WRITE_ONCE(fc->extfuse_notify_inval_xattr, 0);
 	WRITE_ONCE(fc->extfuse_mutation_metadata, 0);
-	WRITE_ONCE(fc->extfuse_coherence_v3, 0);
+	WRITE_ONCE(fc->extfuse_coherence_epochs, 0);
 	spin_lock(&fc->extfuse_lock);
 	data = rcu_replace_pointer(fc->fc_priv, NULL,
 				   lockdep_is_held(&fc->extfuse_lock));

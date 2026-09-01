@@ -1537,18 +1537,18 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				else
 					fc->extfuse_passthrough_attr_release_barrier = 1;
 			}
-			if (flags & FUSE_EXTFUSE_COHERENCE_V3) {
+			if (flags & FUSE_EXTFUSE_COHERENCE_EPOCHS) {
 				if (arg->minor < 46 ||
 				    !(flags & FUSE_FS_EXTFUSE))
 					ok = false;
 				else
-					fc->extfuse_coherence_v3 = 1;
+					fc->extfuse_coherence_epochs = 1;
 			}
 			if (flags & FUSE_MUTATION_METADATA) {
 				if (arg->minor < 46 ||
 				    !(flags & FUSE_FS_EXTFUSE) ||
-				    !(flags & FUSE_EXTFUSE_COHERENCE_V3) ||
-				    !fc->extfuse_coherence_v3)
+				    !(flags & FUSE_EXTFUSE_COHERENCE_EPOCHS) ||
+				    !fc->extfuse_coherence_epochs)
 					ok = false;
 				else
 					fc->extfuse_mutation_metadata = 1;
@@ -1556,8 +1556,8 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 			if (flags & FUSE_HAS_NOTIFY_INVAL_XATTR) {
 				if (arg->minor < 46 ||
 				    !(flags & FUSE_FS_EXTFUSE) ||
-				    !(flags & FUSE_EXTFUSE_COHERENCE_V3) ||
-				    !fc->extfuse_coherence_v3)
+				    !(flags & FUSE_EXTFUSE_COHERENCE_EPOCHS) ||
+				    !fc->extfuse_coherence_epochs)
 					ok = false;
 				else
 					fc->extfuse_notify_inval_xattr = 1;
@@ -1619,7 +1619,7 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 	if (fm->fc->iq.ops == &fuse_dev_fiq_ops) {
 		flags |= EXTFUSE_FLAGS;
 		if (IS_ENABLED(CONFIG_EXTFUSE))
-			flags |= FUSE_EXTFUSE_COHERENCE_V3 |
+			flags |= FUSE_EXTFUSE_COHERENCE_EPOCHS |
 				 FUSE_MUTATION_METADATA |
 				 FUSE_HAS_NOTIFY_INVAL_XATTR;
 		if (IS_ENABLED(CONFIG_EXTFUSE) &&
