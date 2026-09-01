@@ -130,6 +130,9 @@ struct fuse_ring {
 	/* log */
 	unsigned long teardown_time;
 
+	/* Round-robin cursor used only for background requests. */
+	atomic_t bg_queue_seq;
+
 	atomic_t queue_refs;
 
 	bool ready;
