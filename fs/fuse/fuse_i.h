@@ -468,6 +468,7 @@ struct fuse_io_priv {
  * FR_PRIVATE:		request is on private list
  * FR_ASYNC:		request is asynchronous
  * FR_URING:		request is handled through fuse-io-uring
+ * FR_WBCACHE:		request is handled by ExtFUSE lower cached-I/O forwarding
  */
 enum fuse_req_flag {
 	FR_ISREPLY,
@@ -483,6 +484,7 @@ enum fuse_req_flag {
 	FR_PRIVATE,
 	FR_ASYNC,
 	FR_URING,
+	FR_WBCACHE,
 };
 
 /**

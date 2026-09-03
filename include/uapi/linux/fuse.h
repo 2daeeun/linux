@@ -476,7 +476,7 @@ struct fuse_file_lock {
  *			 state from the same registered backing inode used by native
  *			 or WBCache passthrough; requires FS_EXTFUSE and either
  *			 PASSTHROUGH coherence V1/V2 or WBCache passthrough with
- *			 coherence epochs and writeback cache
+ *			 writeback cache
  * FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER: serialize regular-file
  *			 RELEASE metadata publication with ExtFUSE GETATTR refresh;
  *			 requires FS_EXTFUSE, PASSTHROUGH, coherence V1/V2 and

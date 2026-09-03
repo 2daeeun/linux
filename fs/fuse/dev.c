@@ -438,9 +438,11 @@ void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
 	fiq->ops->send_forget(fiq, forget);
 }
 
-static void flush_bg_queue(struct fuse_conn *fc)
+void fuse_flush_bg_queue(struct fuse_conn *fc)
 {
 	struct fuse_iqueue *fiq = &fc->iq;
+
+	lockdep_assert_held(&fc->bg_lock);
 
 	while (fc->active_background < fc->max_background &&
 	       !list_empty(&fc->bg_queue)) {
@@ -449,7 +451,15 @@ static void flush_bg_queue(struct fuse_conn *fc)
 		req = list_first_entry(&fc->bg_queue, struct fuse_req, list);
 		list_del(&req->list);
 		fc->active_background++;
-		fuse_send_one(fiq, req);
+		if (test_bit(FR_WBCACHE, &req->flags)) {
+			bool queued;
+
+			queued = queue_work(fc->extfuse_wbcache_wq,
+					    &req->extfuse_wbcache_work);
+			WARN_ON_ONCE(!queued);
+		} else {
+			fuse_send_one(fiq, req);
+		}
 	}
 }
 
@@ -458,6 +468,7 @@ void fuse_request_bg_finish(struct fuse_conn *fc, struct fuse_req *req)
 	lockdep_assert_held(&fc->bg_lock);
 
 	clear_bit(FR_BACKGROUND, &req->flags);
+	clear_bit(FR_WBCACHE, &req->flags);
 	if (fc->num_background == fc->max_background) {
 		fc->blocked = 0;
 		wake_up(&fc->blocked_waitq);
@@ -511,7 +522,7 @@ void fuse_request_end(struct fuse_req *req)
 	if (test_bit(FR_BACKGROUND, &req->flags)) {
 		spin_lock(&fc->bg_lock);
 		fuse_request_bg_finish(fc, req);
-		flush_bg_queue(fc);
+		fuse_flush_bg_queue(fc);
 		spin_unlock(&fc->bg_lock);
 	} else {
 		/* Wake up waiter sleeping in request_wait_answer() */
@@ -819,7 +830,7 @@ static int fuse_request_queue_background(struct fuse_req *req)
 		if (fc->num_background == fc->max_background)
 			fc->blocked = 1;
 		list_add_tail(&req->list, &fc->bg_queue);
-		flush_bg_queue(fc);
+		fuse_flush_bg_queue(fc);
 		queued = true;
 	}
 	spin_unlock(&fc->bg_lock);
@@ -860,7 +871,7 @@ static void fuse_wbcache_background_work(struct work_struct *work)
 		 */
 		spin_lock(&fc->bg_lock);
 		fuse_request_bg_finish(fc, req);
-		flush_bg_queue(fc);
+		fuse_flush_bg_queue(fc);
 		__set_bit(FR_BACKGROUND, &req->flags);
 		spin_unlock(&fc->bg_lock);
 
@@ -885,26 +896,21 @@ static int fuse_request_queue_wbcache(struct fuse_req *req)
 		atomic_inc(&fc->num_waiting);
 	}
 	__set_bit(FR_ISREPLY, &req->flags);
+	__set_bit(FR_WBCACHE, &req->flags);
 	INIT_WORK(&req->extfuse_wbcache_work, fuse_wbcache_background_work);
 
 	spin_lock(&fc->bg_lock);
 	if (likely(fc->connected && fc->extfuse_wbcache_wq)) {
 		fc->num_background++;
-		fc->active_background++;
 		if (fc->num_background == fc->max_background)
 			fc->blocked = 1;
-		queued = queue_work(fc->extfuse_wbcache_wq,
-				    &req->extfuse_wbcache_work);
-		if (WARN_ON_ONCE(!queued)) {
-			if (fc->num_background == fc->max_background) {
-				fc->blocked = 0;
-				wake_up(&fc->blocked_waitq);
-			}
-			fc->num_background--;
-			fc->active_background--;
-		}
+		list_add_tail(&req->list, &fc->bg_queue);
+		fuse_flush_bg_queue(fc);
+		queued = true;
 	}
 	spin_unlock(&fc->bg_lock);
+	if (!queued)
+		clear_bit(FR_WBCACHE, &req->flags);
 
 	return queued;
 }
@@ -2836,7 +2842,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		spin_lock(&fc->bg_lock);
 		fc->blocked = 0;
 		fc->max_background = UINT_MAX;
-		flush_bg_queue(fc);
+		fuse_flush_bg_queue(fc);
 		spin_unlock(&fc->bg_lock);
 
 		spin_lock(&fiq->lock);

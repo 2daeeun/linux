@@ -69,7 +69,7 @@ MODULE_PARM_DESC(max_user_congthresh,
  * two locally rebuilt fuse.ko instances with the same EXTRAVERSION.
  */
 #define FUSE_EXTFUSE_RUNTIME_CONTRACT \
-	"extfuse-paper-wbcache-forwarding-20260903"
+	"extfuse-paper-bg-admission-stream-uring-20260903"
 static char extfuse_runtime_contract[] = FUSE_EXTFUSE_RUNTIME_CONTRACT;
 module_param_string(extfuse_runtime_contract, extfuse_runtime_contract,
 		    sizeof(extfuse_runtime_contract), 0444);
@@ -1554,7 +1554,6 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 					(flags &
 					 FUSE_EXTFUSE_WBCACHE_PASSTHROUGH) &&
 					(flags & FUSE_WRITEBACK_CACHE) &&
-					(flags & FUSE_EXTFUSE_COHERENCE_EPOCHS) &&
 					fc->writeback_cache &&
 					!(flags & FUSE_PASSTHROUGH) &&
 					arg->max_stack_depth > 0 &&

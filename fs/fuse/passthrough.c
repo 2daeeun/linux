@@ -25,7 +25,7 @@ fuse_attr_refresh_backing_get(struct fuse_conn *fc, struct fuse_inode *fi)
 	native_mode = fc->passthrough &&
 		READ_ONCE(fc->extfuse_passthrough_coherence) >= 2;
 	wbcache_mode = READ_ONCE(fc->extfuse_wbcache_passthrough) &&
-		READ_ONCE(fc->extfuse_coherence_epochs);
+		fc->writeback_cache;
 	if (native_mode == wbcache_mode)
 		return NULL;
 
