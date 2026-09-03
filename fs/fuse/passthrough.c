@@ -14,12 +14,28 @@
 #include <linux/splice.h>
 
 static struct fuse_backing *
-fuse_passthrough_inode_backing_get(struct fuse_inode *fi)
+fuse_attr_refresh_backing_get(struct fuse_conn *fc, struct fuse_inode *fi)
 {
-	struct fuse_backing *fb;
+	struct fuse_backing *native_fb;
+	struct fuse_backing *wbcache_fb;
+	struct fuse_backing *fb = NULL;
+	bool native_mode;
+	bool wbcache_mode;
+
+	native_mode = fc->passthrough &&
+		READ_ONCE(fc->extfuse_passthrough_coherence) >= 2;
+	wbcache_mode = READ_ONCE(fc->extfuse_wbcache_passthrough) &&
+		READ_ONCE(fc->extfuse_coherence_epochs);
+	if (native_mode == wbcache_mode)
+		return NULL;
 
 	spin_lock(&fi->lock);
-	fb = fuse_backing_get(fuse_inode_backing(fi));
+	native_fb = fuse_inode_backing(fi);
+	wbcache_fb = fuse_inode_wbcache_backing(fi);
+	if (native_mode && native_fb && !wbcache_fb)
+		fb = fuse_backing_get(native_fb);
+	else if (wbcache_mode && wbcache_fb && !native_fb)
+		fb = fuse_backing_get(wbcache_fb);
 	spin_unlock(&fi->lock);
 
 	return fb;
@@ -48,9 +64,10 @@ static void fuse_passthrough_kstat_to_attr(struct fuse_conn *fc,
 }
 
 /*
- * Best-effort synchronization of the daemon's GETATTR cache from the backing
- * inode.  Every failure is an optimization miss: the caller always sends the
- * original request and exposes only that request's result to userspace.
+ * Best-effort synchronization of the daemon's GETATTR cache from the sole
+ * native or WBCache backing inode.  Every failure is an optimization miss: the
+ * caller always sends the original request and exposes only that request's
+ * result to userspace.
  */
 void fuse_passthrough_attr_refresh(struct inode *inode)
 {
@@ -68,7 +85,7 @@ void fuse_passthrough_attr_refresh(struct inode *inode)
 	    !READ_ONCE(fc->extfuse_passthrough_attr_refresh))
 		return;
 
-	fb = fuse_passthrough_inode_backing_get(fi);
+	fb = fuse_attr_refresh_backing_get(fc, fi);
 	if (!fb)
 		return;
 

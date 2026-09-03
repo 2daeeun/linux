@@ -6,6 +6,7 @@
  */
 
 #include "fuse_i.h"
+#include "dev_uring_i.h"
 
 #include <linux/kernel.h>
 #include <linux/sched.h>
@@ -248,7 +249,7 @@ static int fuse_file_wbcache_passthrough_open(struct inode *inode,
 	if (!IS_ENABLED(CONFIG_EXTFUSE) ||
 	    !IS_ENABLED(CONFIG_FUSE_PASSTHROUGH) ||
 	    !READ_ONCE(fc->extfuse_wbcache_passthrough) ||
-	    !READ_ONCE(fc->extfuse_coherence_epochs) || !fc->writeback_cache ||
+	    !fc->writeback_cache ||
 	    (ff->open_flags & ~FOPEN_EXTFUSE_WBCACHE_MASK))
 		return -EINVAL;
 
@@ -269,6 +270,7 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
 {
 	struct fuse_file *ff = file->private_data;
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
 	int err = -EINVAL;
 
 	/*
@@ -284,6 +286,15 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
 	if ((ff->open_flags & FOPEN_PASSTHROUGH) &&
 	    (ff->open_flags & FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH))
 		goto fail;
+	if (ff->open_flags & FOPEN_IO_URING_ZERO_COPY) {
+		/* Zero-copy is a C2 transport, never a passthrough file mode. */
+		if (!S_ISREG(inode->i_mode) || !READ_ONCE(fc->io_uring) ||
+		    !READ_ONCE(fc->io_uring_bufpool) ||
+		    !fuse_uring_zero_copy_ready(fc) ||
+		    (ff->open_flags & (FOPEN_PASSTHROUGH |
+				       FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH)))
+			goto fail;
+	}
 	if ((ff->open_flags & FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH) &&
 	    (ff->open_flags & (FOPEN_DIRECT_IO |
 			       FOPEN_PARALLEL_DIRECT_WRITES)))

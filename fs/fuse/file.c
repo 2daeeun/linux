@@ -656,6 +656,9 @@ void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
 	args->out_argvar = true;
 	args->out_numargs = 1;
 	args->out_args[0].size = count;
+	args->zero_copy =
+		READ_ONCE(ff->fm->fc->io_uring_bufpool) &&
+		(ff->open_flags & FOPEN_IO_URING_ZERO_COPY);
 }
 
 static void fuse_release_user_pages(struct fuse_args_pages *ap, ssize_t nres,
@@ -1191,6 +1194,9 @@ static void fuse_write_args_fill(struct fuse_io_args *ia, struct fuse_file *ff,
 	args->out_numargs = 1;
 	args->out_args[0].size = sizeof(ia->write.out);
 	args->out_args[0].value = &ia->write.out;
+	args->zero_copy =
+		READ_ONCE(ff->fm->fc->io_uring_bufpool) &&
+		(ff->open_flags & FOPEN_IO_URING_ZERO_COPY);
 }
 
 static unsigned int fuse_write_flags(struct kiocb *iocb)
@@ -1545,8 +1551,11 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = mapping->host;
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	const u32 extfuse_dependencies = EXTFUSE_COHERENCE_DOMAIN_ATTR |
+		EXTFUSE_COHERENCE_DOMAIN_DATA;
 	bool writeback = false;
 	bool extfuse_outer_begun = false;
+	bool extfuse_outer_wbcache = false;
 
 	if (fc->writeback_cache) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
@@ -1569,9 +1578,15 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	task_io_account_write(count);
 
 	if (fc->writeback_cache && READ_ONCE(fc->extfuse_coherence_epochs)) {
-		err = extfuse_coherence_begin_inode(fc, inode,
-					EXTFUSE_COHERENCE_DOMAIN_ATTR |
-					EXTFUSE_COHERENCE_DOMAIN_DATA);
+		if (writeback && !(iocb->ki_flags & IOCB_DIRECT) &&
+		    READ_ONCE(fc->extfuse_wbcache_passthrough)) {
+			err = extfuse_cached_write_begin(fc, inode,
+							 extfuse_dependencies);
+			extfuse_outer_wbcache = !err;
+		} else {
+			err = extfuse_coherence_begin_inode(fc, inode,
+							    extfuse_dependencies);
+		}
 		if (err)
 			goto out;
 		extfuse_outer_begun = true;
@@ -1582,9 +1597,10 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		goto out;
 	if (extfuse_outer_begun &&
 	    (!writeback || (iocb->ki_flags & IOCB_DIRECT))) {
-		extfuse_coherence_end_inode(inode,
-					EXTFUSE_COHERENCE_DOMAIN_ATTR |
-					EXTFUSE_COHERENCE_DOMAIN_DATA);
+		if (extfuse_outer_wbcache)
+			extfuse_cached_write_end(inode, extfuse_dependencies);
+		else
+			extfuse_coherence_end_inode(inode, extfuse_dependencies);
 		extfuse_outer_begun = false;
 	}
 
@@ -1607,10 +1623,12 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		written = fuse_perform_write(iocb, from);
 	}
 out:
-	if (extfuse_outer_begun)
-		extfuse_coherence_end_inode(inode,
-					EXTFUSE_COHERENCE_DOMAIN_ATTR |
-					EXTFUSE_COHERENCE_DOMAIN_DATA);
+	if (extfuse_outer_begun) {
+		if (extfuse_outer_wbcache)
+			extfuse_cached_write_end(inode, extfuse_dependencies);
+		else
+			extfuse_coherence_end_inode(inode, extfuse_dependencies);
+	}
 	inode_unlock(inode);
 	if (written > 0)
 		written = generic_write_sync(iocb, written);
@@ -2445,7 +2463,23 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 {
 	struct folio *folio = page_folio(vmf->page);
 	struct inode *inode = file_inode(vmf->vma->vm_file);
-	FUSE_CPU_SCOPE(get_fuse_conn(inode));
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	int err;
+
+	FUSE_CPU_SCOPE(fc);
+
+	/*
+	 * Mark only an actual cached shared-mmap write.  Read-only mappings must
+	 * retain metadata-cache eligibility, while a write can change attributes
+	 * before delayed writeback supplies an ordinary FUSE_WRITE coherence span.
+	 */
+	if (READ_ONCE(fc->extfuse_coherence_epochs)) {
+		err = extfuse_passthrough_notify_inode(
+			fc, inode, EXTFUSE_PASSTHROUGH_MMAP,
+			EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
+		if (err)
+			return vmf_fs_error(err);
+	}
 
 	file_update_time(vmf->vma->vm_file);
 	folio_lock(folio);
@@ -2455,7 +2489,7 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	}
 
 	folio_wait_writeback(folio);
-	extfuse_coherence_invalidate_inode(get_fuse_conn(inode), inode,
+	extfuse_coherence_invalidate_inode(fc, inode,
 					   EXTFUSE_COHERENCE_DOMAIN_ATTR |
 					   EXTFUSE_COHERENCE_DOMAIN_DATA);
 	return VM_FAULT_LOCKED;
@@ -2493,14 +2527,6 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 	if ((ff->open_flags & FOPEN_DIRECT_IO) &&
 	    (vma->vm_flags & VM_MAYSHARE) && !fc->direct_io_allow_mmap)
 		return -ENODEV;
-	if (READ_ONCE(fc->extfuse_coherence_epochs)) {
-		rc = extfuse_passthrough_notify_inode(
-			fc, inode, EXTFUSE_PASSTHROUGH_MMAP,
-			EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
-		if (rc)
-			return rc;
-		fuse_invalidate_attr(inode);
-	}
 
 	/*
 	 * FOPEN_DIRECT_IO handling is special compared to O_DIRECT,

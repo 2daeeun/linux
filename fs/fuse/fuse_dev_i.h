@@ -34,6 +34,8 @@ struct fuse_copy_state {
 	bool write:1;
 	bool move_folios:1;
 	bool is_uring:1;
+	/* Page-backed payload is already present in a registered buffer slot. */
+	bool skip_folio_copy:1;
 	struct {
 		unsigned int copied_sz; /* copied size into the user buffer */
 	} ring;
@@ -77,4 +79,3 @@ bool fuse_remove_pending_req(struct fuse_req *req, spinlock_t *lock);
 bool fuse_request_expired(struct fuse_conn *fc, struct list_head *list);
 
 #endif
-

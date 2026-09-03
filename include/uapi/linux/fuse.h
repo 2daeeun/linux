@@ -247,6 +247,11 @@
  *
  *  7.47
  *  - add ExtFUSE writeback-cache passthrough
+ *
+ *  7.48
+ *  - add FUSE_HAS_IO_URING_BUFPOOL
+ *  - add FUSE_IO_URING_CMD_ADD_QUEUE and FUSE_IO_URING_CMD_ADD_BUFPOOL
+ *  - add io-uring registered buffer pools and zero-copy request payloads
  */
 
 #ifndef _LINUX_FUSE_H
@@ -282,7 +287,7 @@
 #define FUSE_KERNEL_VERSION 7
 
 /** Minor version number of this interface */
-#define FUSE_KERNEL_MINOR_VERSION 47
+#define FUSE_KERNEL_MINOR_VERSION 48
 
 /** The node ID of the root inode */
 #define FUSE_ROOT_ID 1
@@ -393,6 +398,8 @@ struct fuse_file_lock {
  * FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH: keep FUSE page-cache semantics while an
  *			 ExtFUSE policy forwards ordinary READ/WRITE requests to a
  *			 registered lower file
+ * FOPEN_IO_URING_ZERO_COPY: use io-uring registered request pages for this
+ *			 open file; valid only with negotiated io-uring buffer pools
  */
 #define FOPEN_DIRECT_IO		(1 << 0)
 #define FOPEN_KEEP_CACHE	(1 << 1)
@@ -403,6 +410,7 @@ struct fuse_file_lock {
 #define FOPEN_PARALLEL_DIRECT_WRITES	(1 << 6)
 #define FOPEN_PASSTHROUGH	(1 << 7)
 #define FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH	(1 << 8)
+#define FOPEN_IO_URING_ZERO_COPY	(1 << 9)
 
 /**
  * INIT request/reply flags
@@ -465,8 +473,10 @@ struct fuse_file_lock {
  * FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2: notifications carry explicit
  *			 BEGIN/END phases for a shared per-inode sequence protocol
  * FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH: refresh regular-file daemon GETATTR
- *			 state from the same native inode used for passthrough;
- *			 requires FS_EXTFUSE, PASSTHROUGH and coherence V1/V2
+ *			 state from the same registered backing inode used by native
+ *			 or WBCache passthrough; requires FS_EXTFUSE and either
+ *			 PASSTHROUGH coherence V1/V2 or WBCache passthrough with
+ *			 coherence epochs and writeback cache
  * FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER: serialize regular-file
  *			 RELEASE metadata publication with ExtFUSE GETATTR refresh;
  *			 requires FS_EXTFUSE, PASSTHROUGH, coherence V1/V2 and
@@ -475,16 +485,19 @@ struct fuse_file_lock {
  *			 same mount for GETATTR while handling RELEASE
  * FUSE_EXTFUSE_COHERENCE_EPOCHS: expose kernel-owned inode coherence epochs
  *			 to ExtFUSE before and after daemon requests; native
- *			 passthrough runs one BPF policy hook before lower I/O and
- *			 closes the matching epoch in the driver
+ *			 passthrough brackets lower I/O with BPF BEGIN/END policy
+ *			 hooks and the matching driver-owned epoch
  * FUSE_MUTATION_METADATA: mutation replies may append a validated metadata
  *			 trailer; requires FUSE_EXTFUSE_COHERENCE_EPOCHS
  * FUSE_HAS_NOTIFY_INVAL_XATTR: daemon may invalidate all cached xattr state
  *			 for one node; requires FUSE_EXTFUSE_COHERENCE_EPOCHS
  * FUSE_EXTFUSE_WBCACHE_PASSTHROUGH: ExtFUSE may forward ordinary page-backed
  *			 READ/WRITE requests to a registered lower file while
- *			 retaining FUSE_WRITEBACK_CACHE; requires FS_EXTFUSE,
- *			 coherence epochs and writeback cache
+ *			 retaining FUSE_WRITEBACK_CACHE; requires FS_EXTFUSE and
+ *			 writeback cache. Coherence epochs select the optional strict
+ *			 policy rather than being a forwarding prerequisite
+ * FUSE_HAS_IO_URING_BUFPOOL: kernel supports io-uring buffer pools and
+ *			 per-request registered page payloads
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -541,6 +554,7 @@ struct fuse_file_lock {
 #define FUSE_MUTATION_METADATA	(1ULL << 49)
 #define FUSE_HAS_NOTIFY_INVAL_XATTR (1ULL << 50)
 #define FUSE_EXTFUSE_WBCACHE_PASSTHROUGH (1ULL << 51)
+#define FUSE_HAS_IO_URING_BUFPOOL (1ULL << 52)
 
 /**
  * CUSE INIT request/reply flags
@@ -1326,6 +1340,14 @@ struct fuse_supp_groups {
 #define FUSE_URING_IN_OUT_HEADER_SZ 128
 #define FUSE_URING_OP_IN_OUT_SZ 128
 
+/**
+ * fuse_uring_ent_in_out flags
+ *
+ * FUSE_URING_ENT_ZERO_COPY: the page-backed request payload is registered in
+ *                           this entry's zero-copy buffer-table slot
+ */
+#define FUSE_URING_ENT_ZERO_COPY	(1 << 0)
+
 /* Used as part of the fuse_uring_req_header */
 struct fuse_uring_ent_in_out {
 	uint64_t flags;
@@ -1338,7 +1360,9 @@ struct fuse_uring_ent_in_out {
 
 	/* size of user payload buffer */
 	uint32_t payload_sz;
-	uint32_t padding;
+
+	/* offset into the queue buffer pool, if one is configured */
+	uint32_t offset;
 
 	uint64_t reserved;
 };
@@ -1367,7 +1391,16 @@ enum fuse_uring_cmd {
 
 	/* commit fuse request result and fetch next request */
 	FUSE_IO_URING_CMD_COMMIT_AND_FETCH = 2,
+
+	/* create a queue before configuring its payload buffers */
+	FUSE_IO_URING_CMD_ADD_QUEUE = 3,
+
+	/* add one shared payload buffer pool to an existing queue */
+	FUSE_IO_URING_CMD_ADD_BUFPOOL = 4,
 };
+
+/* Supported fuse_uring_cmd_req flags for FUSE_IO_URING_CMD_ADD_QUEUE. */
+#define FUSE_URING_ZERO_COPY		(1 << 0)
 
 /**
  * In the 80B command area of the SQE.
@@ -1381,6 +1414,22 @@ struct fuse_uring_cmd_req {
 	/* queue the command is for (queue index) */
 	uint16_t qid;
 	uint8_t padding[6];
+
+	union {
+		struct {
+			/* base address and total length of the shared payload pool */
+			uint64_t uaddr;
+			uint32_t len;
+			uint32_t reserved;
+		} bufpool;
+
+		/*
+		 * Sparse registered-buffer slot for this entry's request pages.
+		 * Zero is reserved for the queue payload pool; zero-copy entries
+		 * therefore use slots 1 and above.
+		 */
+		uint16_t ent_zero_copy_buf_index;
+	};
 };
 
 #endif /* _LINUX_FUSE_H */

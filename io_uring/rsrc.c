@@ -1000,6 +1000,98 @@ unlock:
 }
 EXPORT_SYMBOL_GPL(io_buffer_register_bvec);
 
+/*
+ * Register a caller-owned bio_vec array in an existing sparse buffer slot.
+ * The array is copied before return.  On success @release owns @priv and is
+ * called after the slot and all in-flight fixed-buffer users release it; on
+ * failure ownership remains with the caller.
+ *
+ * Keep this separate from io_buffer_register_bvec(), whose request-based ABI
+ * is used by ublk in this kernel series.
+ */
+int io_buffer_register_bvec_array(struct io_uring_cmd *cmd,
+				  const struct bio_vec *bvs,
+				  unsigned int nr_bvecs,
+				  void (*release)(void *), void *priv,
+				  u8 dir, unsigned int index,
+				  unsigned int issue_flags)
+{
+	struct io_ring_ctx *ctx = cmd_to_io_kiocb(cmd)->ctx;
+	struct io_rsrc_data *data = &ctx->buf_table;
+	struct io_mapped_ubuf *imu;
+	struct io_rsrc_node *node;
+	unsigned int total_bytes = 0;
+	unsigned int i;
+	int ret = 0;
+
+	BUILD_BUG_ON((unsigned int)IO_BUF_DEST !=
+		     (unsigned int)IO_IMU_DEST);
+	BUILD_BUG_ON((unsigned int)IO_BUF_SOURCE !=
+		     (unsigned int)IO_IMU_SOURCE);
+
+	if (!bvs || !nr_bvecs || nr_bvecs > INT_MAX || !release ||
+	    !dir || (dir & ~(IO_BUF_DEST | IO_BUF_SOURCE)))
+		return -EINVAL;
+
+	for (i = 0; i < nr_bvecs; i++) {
+		const struct bio_vec *bv = &bvs[i];
+		size_t folio_bytes;
+
+		if (!bv->bv_page || !bv->bv_len)
+			return -EINVAL;
+		folio_bytes = folio_size(page_folio(bv->bv_page));
+		if (bv->bv_offset >= folio_bytes ||
+		    bv->bv_len > folio_bytes - bv->bv_offset)
+			return -EINVAL;
+		if (check_add_overflow(total_bytes, bv->bv_len, &total_bytes) ||
+		    total_bytes > MAX_RW_COUNT)
+			return -EOVERFLOW;
+	}
+
+	io_ring_submit_lock(ctx, issue_flags);
+	if (index >= data->nr) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	index = array_index_nospec(index, data->nr);
+	if (data->nodes[index]) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+
+	node = io_rsrc_node_alloc(ctx, IORING_RSRC_BUFFER);
+	if (!node) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+
+	imu = io_alloc_imu(ctx, nr_bvecs);
+	if (!imu) {
+		io_cache_free(&ctx->node_cache, node);
+		ret = -ENOMEM;
+		goto unlock;
+	}
+
+	imu->ubuf = 0;
+	imu->len = total_bytes;
+	imu->nr_bvecs = nr_bvecs;
+	imu->acct_pages = 0;
+	imu->folio_shift = PAGE_SHIFT;
+	refcount_set(&imu->refs, 1);
+	imu->release = release;
+	imu->priv = priv;
+	imu->is_kbuf = true;
+	imu->dir = dir;
+	memcpy(imu->bvec, bvs, array_size(nr_bvecs, sizeof(*bvs)));
+
+	node->buf = imu;
+	data->nodes[index] = node;
+unlock:
+	io_ring_submit_unlock(ctx, issue_flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(io_buffer_register_bvec_array);
+
 int io_buffer_unregister_bvec(struct io_uring_cmd *cmd, unsigned int index,
 			      unsigned int issue_flags)
 {

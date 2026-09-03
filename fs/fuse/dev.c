@@ -170,15 +170,18 @@ static void __fuse_put_request(struct fuse_req *req)
 
 void fuse_set_initialized(struct fuse_conn *fc)
 {
-	/* Make sure stores before this are seen on another CPU */
-	smp_wmb();
-	fc->initialized = 1;
+	/* Pairs with smp_load_acquire() readers of fc->initialized. */
+	smp_store_release(&fc->initialized, 1);
 }
 
 static bool fuse_block_alloc(struct fuse_conn *fc, bool for_background)
 {
-	return !fc->initialized || (for_background && fc->blocked) ||
-	       (fc->io_uring && fc->connected && !fuse_uring_ready(fc));
+	/* Pairs with smp_store_release() in fuse_set_initialized(). */
+	if (!smp_load_acquire(&fc->initialized))
+		return true;
+
+	return (for_background && fc->blocked) ||
+		(fc->io_uring && fc->connected && !fuse_uring_ready(fc));
 }
 
 static void fuse_drop_waiting(struct fuse_conn *fc)
@@ -217,9 +220,6 @@ static struct fuse_req *fuse_get_req(struct mnt_idmap *idmap,
 				(TASK_KILLABLE | TASK_FREEZABLE)))
 			goto out;
 	}
-	/* Matches smp_wmb() in fuse_set_initialized() */
-	smp_rmb();
-
 	err = -ENOTCONN;
 	if (!fc->connected)
 		goto out;
@@ -684,6 +684,10 @@ static ssize_t fuse_wbcache_request_execute(struct fuse_req *req, gfp_t gfp,
 	int err;
 
 	*lower_started = false;
+	if (!READ_ONCE(req->fm->fc->extfuse_coherence_epochs))
+		return fuse_wbcache_passthrough_execute_paper(req,
+							       lower_started);
+
 	io = fuse_wbcache_passthrough_prepare(req);
 	if (IS_ERR(io))
 		return PTR_ERR(io);
@@ -927,8 +931,16 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 	}
 
 	fuse_args_to_req(req, args);
-	/* Preserve the pre-existing C0-C2 background-request path exactly. */
-	if (READ_ONCE(fm->fc->extfuse_wbcache_passthrough)) {
+	/*
+	 * Paper-like C1/C2 WRITE still needs the ordinary ExtFUSE hook before
+	 * its daemon data path: the hook stales cached attributes and removes a
+	 * positive security.capability entry.  A forced request cannot be
+	 * completed by BPF, so it continues to the daemon after those side
+	 * effects.  Keep C0 on the original path by requiring a loaded program.
+	 */
+	if (READ_ONCE(fm->fc->extfuse_wbcache_passthrough) ||
+	    (args->opcode == FUSE_WRITE &&
+	     rcu_access_pointer(fm->fc->fc_priv))) {
 		route = extfuse_request_pre(req, gfp_flags, &result);
 		if (route == EXTFUSE_PRE_COMPLETE) {
 			fuse_request_end_unqueued(req, 0);
@@ -1306,11 +1318,22 @@ static int fuse_copy_folio(struct fuse_copy_state *cs, struct folio **foliop,
 
 	if (folio) {
 		size = folio_size(folio);
-		if (zeroing && count < size)
-			folio_zero_range(folio, 0, size);
+		if (zeroing && count < size) {
+			/*
+			 * Registered read pages already contain the valid payload.
+			 * Preserve [offset, offset + count) and clear only the
+			 * unfilled portions.  The copy path clears the whole folio
+			 * first so a later copy failure cannot expose stale data.
+			 */
+			if (cs->skip_folio_copy)
+				folio_zero_segments(folio, 0, offset,
+						    offset + count, size);
+			else
+				folio_zero_range(folio, 0, size);
+		}
 	}
 
-	while (count) {
+	while (!cs->skip_folio_copy && count) {
 		if (cs->write && cs->pipebufs && folio) {
 			/*
 			 * Can't control lifetime of pipe buffers, so always
@@ -2827,6 +2850,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		spin_unlock(&fiq->lock);
 		kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
 		end_polls(fc);
+		wake_up_all(&fc->extfuse_wbcache_waitq);
 		wake_up_all(&fc->blocked_waitq);
 		spin_unlock(&fc->lock);
 

@@ -77,7 +77,7 @@ struct extfuse_data {
 
 #define EXTFUSE_FLAGS		FUSE_FS_EXTFUSE
 
-/* Private BPF tail-call slots used only by native passthrough coherence. */
+/* Private BPF slots used by optional strict/native passthrough coherence. */
 #define EXTFUSE_PASSTHROUGH_READ	65
 #define EXTFUSE_PASSTHROUGH_WRITE	66
 #define EXTFUSE_PASSTHROUGH_MMAP	67
@@ -102,6 +102,9 @@ void extfuse_coherence_invalidate_namespace(struct fuse_conn *fc);
 int extfuse_coherence_begin_inode(struct fuse_conn *fc, struct inode *inode,
 				    u32 dependencies);
 void extfuse_coherence_end_inode(struct inode *inode, u32 dependencies);
+int extfuse_cached_write_begin(struct fuse_conn *fc, struct inode *inode,
+			       u32 dependencies);
+void extfuse_cached_write_end(struct inode *inode, u32 dependencies);
 int extfuse_passthrough_notify_inode(struct fuse_conn *fc,
 				     struct inode *inode, u32 opcode,
 				     u32 phase);
@@ -200,6 +203,18 @@ extfuse_coherence_begin_inode(struct fuse_conn *fc, struct inode *inode,
 
 static inline void extfuse_coherence_end_inode(struct inode *inode,
 					      u32 dependencies)
+{
+}
+
+static inline int
+extfuse_cached_write_begin(struct fuse_conn *fc, struct inode *inode,
+			   u32 dependencies)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void
+extfuse_cached_write_end(struct inode *inode, u32 dependencies)
 {
 }
 

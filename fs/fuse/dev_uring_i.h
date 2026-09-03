@@ -7,6 +7,8 @@
 #ifndef _FS_FUSE_DEV_URING_I_H
 #define _FS_FUSE_DEV_URING_I_H
 
+#include <linux/uio.h>
+
 #include "fuse_i.h"
 
 #ifdef CONFIG_FUSE_IO_URING
@@ -36,11 +38,36 @@ enum fuse_ring_req_state {
 	FRRS_RELEASED,
 };
 
+enum fuse_queue_payload_mode {
+	/* Queue exists, but REGISTER has not fixed its payload mode yet. */
+	FUSE_PAYLOAD_UNSET = 0,
+	/* Legacy ABI: every REGISTER supplies a private payload buffer. */
+	FUSE_PAYLOAD_PER_ENT,
+	/* One queue-wide buffer pool supplies payload buffers on demand. */
+	FUSE_PAYLOAD_BUFPOOL,
+};
+
+struct fuse_bufpool {
+	bool registered;
+	u16 registered_index;
+	uintptr_t base_uaddr;
+	size_t buf_size;
+	unsigned int nr_bufs;
+	unsigned long free_map[];
+};
+
 /** A fuse ring entry, part of the ring queue */
 struct fuse_ring_ent {
 	/* userspace buffer */
 	struct fuse_uring_req_header __user *headers;
-	void __user *payload;
+	struct iovec payload;
+
+	/* Queue-pool buffer selected for this request, if any. */
+	unsigned int buf_id;
+
+	/* Sparse registered-buffer slot containing request folios. */
+	bool zero_copied;
+	unsigned int zero_copy_index;
 
 	/* the ring queue that owns the request */
 	struct fuse_ring_queue *queue;
@@ -62,6 +89,8 @@ struct fuse_ring_queue {
 	 * queue
 	 */
 	struct fuse_ring *ring;
+	/* Immutable identity of the io_uring context that owns this queue. */
+	void *uring_ctx;
 
 	/* queue id, corresponds to the cpu core */
 	unsigned int qid;
@@ -99,6 +128,10 @@ struct fuse_ring_queue {
 	unsigned int active_background;
 
 	bool stopped;
+	bool zero_copy;
+
+	enum fuse_queue_payload_mode payload_mode;
+	struct fuse_bufpool *bufpool;
 };
 
 /**
@@ -147,6 +180,7 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req);
 bool fuse_uring_queue_bq_req(struct fuse_req *req);
 bool fuse_uring_remove_pending_req(struct fuse_req *req);
 bool fuse_uring_request_expired(struct fuse_conn *fc);
+bool fuse_uring_zero_copy_ready(struct fuse_conn *fc);
 
 static inline void fuse_uring_abort(struct fuse_conn *fc)
 {
@@ -207,6 +241,11 @@ static inline bool fuse_uring_remove_pending_req(struct fuse_req *req)
 }
 
 static inline bool fuse_uring_request_expired(struct fuse_conn *fc)
+{
+	return false;
+}
+
+static inline bool fuse_uring_zero_copy_ready(struct fuse_conn *fc)
 {
 	return false;
 }

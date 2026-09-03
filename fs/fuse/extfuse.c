@@ -55,10 +55,25 @@ enum extfuse_domain_index {
 	EXTFUSE_DOMAIN_COUNT,
 };
 
+enum extfuse_mutation_owner {
+	EXTFUSE_MUTATION_BLOCKING,
+	EXTFUSE_MUTATION_WBCACHE,
+	EXTFUSE_MUTATION_WBCACHE_RELAXED_READ,
+};
+
+enum extfuse_passthrough_policy_result {
+	EXTFUSE_PASSTHROUGH_POLICY_STRICT,
+	EXTFUSE_PASSTHROUGH_POLICY_RELAXED_READ,
+};
+
+/* The paired generation-map policy packs its active count into 16 bits. */
+#define EXTFUSE_POLICY_ACTIVE_MAX U16_MAX
+
 struct extfuse_target_state {
 	struct inode *inode;
 	u32 dependencies;
 	struct extfuse_coherence_target pre;
+	enum extfuse_mutation_owner active_owner;
 	bool active_owned;
 	bool mutation_completed;
 };
@@ -84,8 +99,18 @@ struct extfuse_req_state {
 	bool global_mutation;
 	bool global_active_owned;
 	bool global_mutation_completed;
+	bool wbcache_admitted;
 	bool wbcache_forward;
+	bool wbcache_policy_begun;
+	bool wbcache_relaxed_read;
+	bool wbcache_completed;
 };
+
+static int extfuse_passthrough_bpf_notify(struct fuse_conn *fc,
+					  struct inode *inode, u64 nodeid,
+					  u32 opcode, u32 phase,
+					  bool force_v2,
+					  bool allow_relaxed_read);
 
 static_assert(sizeof(struct extfuse_passthrough_in) == 8);
 static_assert(sizeof(struct extfuse_passthrough_attr_cookie) == 16);
@@ -256,7 +281,8 @@ static ssize_t __extfuse_request_send_ctx(
 	 * perform conservative cache side effects but cannot complete them.
 	 */
 	force_upcall = (args->force && args->opcode != FUSE_FLUSH &&
-			!(args->opcode == FUSE_WRITE && args->extfuse_file &&
+			!((args->opcode == FUSE_READ ||
+			   args->opcode == FUSE_WRITE) && args->extfuse_file &&
 			  READ_ONCE(fc->extfuse_wbcache_passthrough))) ||
 		args->is_ext;
 
@@ -419,6 +445,17 @@ static u32 extfuse_active_mask(const struct fuse_inode *fi)
 	return active;
 }
 
+static u32 extfuse_blocking_active_mask(const struct fuse_inode *fi)
+{
+	u32 active = 0;
+	unsigned int i;
+
+	for (i = 0; i < EXTFUSE_DOMAIN_COUNT; i++)
+		if (fi->extfuse_blocking_active[i])
+			active |= BIT(i);
+	return active;
+}
+
 static void extfuse_snapshot_inode(
 	struct inode *inode, u32 dependencies,
 	struct extfuse_coherence_target *target)
@@ -426,7 +463,7 @@ static void extfuse_snapshot_inode(
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	u64 global_epoch;
-	bool global_active;
+	u32 global_active;
 
 	spin_lock(&fc->extfuse_global_coherence_lock);
 	global_epoch = fc->extfuse_global_epoch;
@@ -473,6 +510,7 @@ static void extfuse_global_end(struct fuse_conn *fc)
 		fc->extfuse_global_epoch++;
 	}
 	spin_unlock(&fc->extfuse_global_coherence_lock);
+	wake_up_all(&fc->extfuse_wbcache_waitq);
 }
 
 static bool extfuse_target_stable(
@@ -517,67 +555,251 @@ static bool extfuse_target_identity_current(
 	       snapshot.incarnation == state->pre.incarnation;
 }
 
-static bool extfuse_is_wbcache_write_forward(
-	const struct fuse_req *req, const struct extfuse_req_state *state,
-	bool passthru)
+static bool extfuse_wbcache_read_ready(
+	struct fuse_conn *fc, const struct extfuse_target_state *target)
 {
-	const u32 dependencies = EXTFUSE_COHERENCE_DOMAIN_ATTR |
-		EXTFUSE_COHERENCE_DOMAIN_DATA;
+	struct fuse_inode *fi = get_fuse_inode(target->inode);
+	bool ready;
+
+	if (!READ_ONCE(fc->connected))
+		return true;
+
+	spin_lock(&fc->extfuse_global_coherence_lock);
+	spin_lock(&fi->extfuse_coherence_lock);
+	ready = !READ_ONCE(fc->connected) ||
+		target->pre.nodeid != get_node_id(target->inode) ||
+		target->pre.incarnation != fi->extfuse_incarnation ||
+		(!fc->extfuse_global_active &&
+		 !(extfuse_blocking_active_mask(fi) & target->dependencies));
+	spin_unlock(&fi->extfuse_coherence_lock);
+	spin_unlock(&fc->extfuse_global_coherence_lock);
+
+	return ready;
+}
+
+static bool extfuse_is_wbcache_data_forward(const struct fuse_req *req,
+					    const struct extfuse_req_state *state,
+					    bool passthru)
+{
+	const struct fuse_args *args = req->args;
+	const struct fuse_file *ff = args->extfuse_file;
+	struct fuse_conn *fc = req->fm->fc;
 	const struct extfuse_target_state *target;
+	u32 dependencies;
 
 	if (!passthru ||
-	    !READ_ONCE(req->fm->fc->extfuse_wbcache_passthrough) ||
-	    req->args->opcode != FUSE_WRITE || !req->args->extfuse_file ||
-	    !req->args->extfuse_inode || req->args->is_ext ||
-	    !state->mutation || !state->trailer_capable ||
+	    !READ_ONCE(fc->extfuse_wbcache_passthrough) ||
+	    !ff || ff->fm != req->fm ||
+	    (ff->open_flags &
+	     (FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH | FOPEN_PASSTHROUGH)) !=
+		    FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH ||
+	    (ff->open_flags & (FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES |
+			       FOPEN_IO_URING_ZERO_COPY)) ||
+	    ff->nodeid != args->nodeid || !args->extfuse_inode ||
+	    get_fuse_conn(args->extfuse_inode) != fc || args->is_ext ||
+	    !state->mutation || state->begun || state->optional_out ||
 	    state->global_mutation || state->target_count != 1 ||
-	    state->request_dependencies != dependencies)
+	    state->global_active_owned || state->wbcache_forward ||
+	    state->wbcache_policy_begun || state->wbcache_completed)
+		return false;
+
+	switch (args->opcode) {
+	case FUSE_READ:
+		dependencies = EXTFUSE_COHERENCE_DOMAIN_ATTR;
+		if (!state->pre_hit_allowed || !state->pre_hit_invalidate ||
+		    state->trailer_capable)
+			return false;
+		break;
+	case FUSE_WRITE:
+		dependencies = EXTFUSE_COHERENCE_DOMAIN_ATTR |
+			EXTFUSE_COHERENCE_DOMAIN_DATA;
+		if (state->pre_hit_allowed || state->pre_hit_invalidate ||
+		    !state->trailer_capable)
+			return false;
+		break;
+	default:
+		return false;
+	}
+	if (state->request_dependencies != dependencies)
 		return false;
 
 	target = &state->targets[0];
-	return target->inode == req->args->extfuse_inode &&
+	return target->inode == args->extfuse_inode && !target->active_owned &&
+	       !target->mutation_completed &&
 	       target->dependencies == dependencies &&
 	       target->pre.dependencies == dependencies &&
-	       target->pre.nodeid == req->args->nodeid;
+	       target->pre.nodeid == args->nodeid &&
+	       target->pre.incarnation != 0;
 }
 
-static int extfuse_inode_begin(struct inode *inode, u32 dependencies)
+/*
+ * The paper data path uses the ordinary FUSE_READ/FUSE_WRITE program once and
+ * interprets PASSTHRU as a lower-file routing decision.  It deliberately does
+ * not depend on an attribute-cache row: the daemon-installed open/backing-file
+ * association is the authority for data forwarding.  The lower-I/O helper
+ * performs the complete request-shape and backing-file validation before it
+ * reports that lower I/O has started.
+ */
+static bool extfuse_is_paper_wbcache_request(const struct fuse_req *req)
+{
+	const struct fuse_args *args = req->args;
+	const struct fuse_file *ff = args->extfuse_file;
+	struct fuse_conn *fc = req->fm->fc;
+
+	if (READ_ONCE(fc->extfuse_coherence_epochs) ||
+	    !READ_ONCE(fc->extfuse_wbcache_passthrough) || !ff ||
+	    ff->fm != req->fm ||
+	    (ff->open_flags &
+	     (FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH | FOPEN_PASSTHROUGH)) !=
+		    FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH ||
+	    (ff->open_flags & (FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES |
+			       FOPEN_IO_URING_ZERO_COPY)) ||
+	    ff->nodeid != args->nodeid || !args->extfuse_inode ||
+	    get_fuse_conn(args->extfuse_inode) != fc || args->is_ext)
+		return false;
+
+	return args->opcode == FUSE_READ || args->opcode == FUSE_WRITE;
+}
+
+static int __extfuse_inode_begin(struct inode *inode, u32 dependencies,
+				 enum extfuse_mutation_owner owner)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	unsigned int i;
 
 	spin_lock(&fi->extfuse_coherence_lock);
-	for (i = 0; i < EXTFUSE_DOMAIN_COUNT; i++)
-		if ((dependencies & BIT(i)) && fi->extfuse_active[i] == U32_MAX) {
+	for (i = 0; i < EXTFUSE_DOMAIN_COUNT; i++) {
+		if (!(dependencies & BIT(i)))
+			continue;
+		if (fi->extfuse_active[i] == EXTFUSE_POLICY_ACTIVE_MAX ||
+		    (owner == EXTFUSE_MUTATION_BLOCKING &&
+		     fi->extfuse_blocking_active[i] ==
+			     EXTFUSE_POLICY_ACTIVE_MAX)) {
 			spin_unlock(&fi->extfuse_coherence_lock);
 			return -EOVERFLOW;
 		}
+	}
 	for (i = 0; i < EXTFUSE_DOMAIN_COUNT; i++) {
 		if (!(dependencies & BIT(i)))
 			continue;
 		fi->extfuse_active[i]++;
 		fi->extfuse_epoch[i]++;
+		if (owner == EXTFUSE_MUTATION_BLOCKING)
+			fi->extfuse_blocking_active[i]++;
 	}
 	spin_unlock(&fi->extfuse_coherence_lock);
 
 	return 0;
 }
 
-static void extfuse_inode_end(struct inode *inode, u32 dependencies)
+static int extfuse_inode_begin(struct inode *inode, u32 dependencies)
+{
+	return __extfuse_inode_begin(inode, dependencies,
+				     EXTFUSE_MUTATION_BLOCKING);
+}
+
+static int extfuse_wbcache_inode_begin(struct fuse_conn *fc,
+				       struct extfuse_target_state *target,
+				       enum extfuse_mutation_owner owner,
+				       u32 opcode)
+{
+	struct fuse_inode *fi = get_fuse_inode(target->inode);
+	u32 dependencies = target->dependencies;
+	unsigned int i;
+	int err = -EAGAIN;
+	bool guard_blocking = opcode == FUSE_READ;
+	bool track_public_epoch = owner == EXTFUSE_MUTATION_WBCACHE;
+
+	if (opcode != FUSE_READ && opcode != FUSE_WRITE)
+		return -EINVAL;
+	if (!track_public_epoch &&
+	    (owner != EXTFUSE_MUTATION_WBCACHE_RELAXED_READ ||
+	     opcode != FUSE_READ))
+		return -EINVAL;
+
+	/*
+	 * A worker that races a completed FLUSH/RELEASE must not become a daemon
+	 * READ merely because the blocking epoch changed after PRE.  Wait for only
+	 * the currently active blockers, then revalidate backing identity while the
+	 * global and inode state locks are held.  WRITE retains its identity-only
+	 * admission because normal writeback owns the public ATTR/DATA epoch.
+	 */
+
+retry:
+	if (!READ_ONCE(fc->connected))
+		return -ENOTCONN;
+
+	spin_lock(&fc->extfuse_global_coherence_lock);
+	spin_lock(&fi->extfuse_coherence_lock);
+	if (target->pre.nodeid != get_node_id(target->inode) ||
+	    target->pre.incarnation != fi->extfuse_incarnation)
+		goto out_inode;
+	if (guard_blocking &&
+	    (fc->extfuse_global_active ||
+	     (extfuse_blocking_active_mask(fi) & dependencies))) {
+		spin_unlock(&fi->extfuse_coherence_lock);
+		spin_unlock(&fc->extfuse_global_coherence_lock);
+		wait_event(fc->extfuse_wbcache_waitq,
+			   extfuse_wbcache_read_ready(fc, target));
+		goto retry;
+	}
+	for (i = 0; i < EXTFUSE_DOMAIN_COUNT; i++) {
+		if (!(dependencies & BIT(i)))
+			continue;
+		if (track_public_epoch &&
+		    fi->extfuse_active[i] == EXTFUSE_POLICY_ACTIVE_MAX) {
+			err = -EOVERFLOW;
+			goto out_inode;
+		}
+	}
+	if (track_public_epoch) {
+		for (i = 0; i < EXTFUSE_DOMAIN_COUNT; i++) {
+			if (!(dependencies & BIT(i)))
+				continue;
+			fi->extfuse_active[i]++;
+			fi->extfuse_epoch[i]++;
+		}
+	}
+	err = 0;
+
+out_inode:
+	spin_unlock(&fi->extfuse_coherence_lock);
+	spin_unlock(&fc->extfuse_global_coherence_lock);
+	return err;
+}
+
+static void __extfuse_inode_end(struct inode *inode, u32 dependencies,
+				enum extfuse_mutation_owner owner)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
 	unsigned int i;
+
+	/* The paper-like READ policy deliberately excludes atime coherence. */
+	if (owner == EXTFUSE_MUTATION_WBCACHE_RELAXED_READ)
+		return;
 
 	spin_lock(&fi->extfuse_coherence_lock);
 	for (i = 0; i < EXTFUSE_DOMAIN_COUNT; i++) {
 		if (!(dependencies & BIT(i)))
 			continue;
-		if (WARN_ON_ONCE(!fi->extfuse_active[i]))
+		if (WARN_ON_ONCE(!fi->extfuse_active[i]) ||
+		    (owner == EXTFUSE_MUTATION_BLOCKING &&
+		     WARN_ON_ONCE(!fi->extfuse_blocking_active[i])))
 			continue;
 		fi->extfuse_active[i]--;
 		fi->extfuse_epoch[i]++;
+		if (owner == EXTFUSE_MUTATION_BLOCKING)
+			fi->extfuse_blocking_active[i]--;
 	}
 	spin_unlock(&fi->extfuse_coherence_lock);
+	if (owner == EXTFUSE_MUTATION_BLOCKING)
+		wake_up_all(&fc->extfuse_wbcache_waitq);
+}
+
+static void extfuse_inode_end(struct inode *inode, u32 dependencies)
+{
+	__extfuse_inode_end(inode, dependencies, EXTFUSE_MUTATION_BLOCKING);
 }
 
 int extfuse_coherence_begin_inode(struct fuse_conn *fc, struct inode *inode,
@@ -596,6 +818,32 @@ void extfuse_coherence_end_inode(struct inode *inode, u32 dependencies)
 		extfuse_inode_end(inode, dependencies);
 }
 EXPORT_SYMBOL_GPL(extfuse_coherence_end_inode);
+
+int extfuse_cached_write_begin(struct fuse_conn *fc, struct inode *inode,
+			       u32 dependencies)
+{
+	if (!READ_ONCE(fc->extfuse_coherence_epochs) ||
+	    !READ_ONCE(fc->extfuse_wbcache_passthrough) ||
+	    !inode || !dependencies)
+		return -EOPNOTSUPP;
+
+	/*
+	 * The upper cached write is the producer of later WBCache FUSE_WRITE
+	 * requests.  Keep its public active/epoch transition so metadata hits
+	 * fail closed, but do not let it block its own lower-write forwarding.
+	 */
+	return __extfuse_inode_begin(inode, dependencies,
+				     EXTFUSE_MUTATION_WBCACHE);
+}
+EXPORT_SYMBOL_GPL(extfuse_cached_write_begin);
+
+void extfuse_cached_write_end(struct inode *inode, u32 dependencies)
+{
+	if (inode && dependencies)
+		__extfuse_inode_end(inode, dependencies,
+				    EXTFUSE_MUTATION_WBCACHE);
+}
+EXPORT_SYMBOL_GPL(extfuse_cached_write_end);
 
 static struct inode *extfuse_lookup_node(struct fuse_conn *fc, u64 nodeid)
 {
@@ -1069,21 +1317,72 @@ static bool extfuse_opcode_is_mutation(u32 opcode)
 static bool extfuse_output_valid(struct fuse_req *req, ssize_t result);
 static bool extfuse_pre_output_valid(struct fuse_req *req, ssize_t result);
 
+static ssize_t extfuse_request_pre_paper_wbcache(struct fuse_req *req,
+						  bool *passthru)
+{
+	struct fuse_conn *fc = req->fm->fc;
+	struct extfuse_coherence pre = {
+		.version = EXTFUSE_COHERENCE_VERSION,
+		.phase = EXTFUSE_COHERENCE_PHASE_PRE,
+	};
+	u32 reason = EXTFUSE_TRACE_REASON_NONE;
+	u32 action;
+	unsigned int out_capacity = 0;
+	ssize_t ret;
+
+	if (!req->in.h.unique)
+		req->in.h.unique = fuse_get_unique(&fc->iq);
+	pre.unique = req->in.h.unique;
+	if (req->args->out_argvar && req->args->out_numargs)
+		out_capacity = req->args->out_args[0].size;
+
+	/*
+	 * A zero-target PRE is intentional: this mode asks the standard data
+	 * handler for a routing decision, not for an epoch-protected cache hit.
+	 */
+	ret = __extfuse_request_send_ctx(fc, req->args, &req->in.h, &pre,
+					 false, &reason, passthru);
+	if (!*passthru && ret >= 0) {
+		/* Never treat a page-backed data request as a cached completion. */
+		ret = -ENOSYS;
+		reason = EXTFUSE_TRACE_REASON_INVALID_OUTPUT;
+	}
+	if (ret == -ENOSYS && out_capacity)
+		req->args->out_args[0].size = out_capacity;
+
+	action = *passthru ? EXTFUSE_TRACE_ACTION_FORWARD :
+		extfuse_pre_action(ret, reason);
+	extfuse_trace(req, req->args->nodeid, EXTFUSE_TRACE_PHASE_PRE, action,
+		       reason, ret, 0);
+	req->extfuse_pre_traced = true;
+	return ret;
+}
+
 static ssize_t extfuse_request_pre_result(struct fuse_req *req, gfp_t gfp,
 					  bool *passthru)
 {
 	struct fuse_conn *fc = req->fm->fc;
 	struct extfuse_req_state *state;
 	struct extfuse_coherence pre = { };
-	bool wbcache_write_forward;
+	bool wbcache_data_forward;
 	u32 validated;
 	u32 reason = EXTFUSE_TRACE_REASON_NONE;
+	u32 wbcache_reason;
 	u32 action;
 	ssize_t ret;
 	unsigned int out_capacity = 0;
 	unsigned int i = 0;
 	int err;
 
+	/*
+	 * Preserve the original ExtFUSE path for ordinary requests.  WBCache
+	 * passthrough additionally consumes the standard READ/WRITE PASSTHRU result
+	 * without allocating strict-coherence request state or invoking private
+	 * BEGIN/END programs.
+	 */
+	if (!READ_ONCE(fc->extfuse_coherence_epochs) &&
+	    extfuse_is_paper_wbcache_request(req))
+		return extfuse_request_pre_paper_wbcache(req, passthru);
 	if (!READ_ONCE(fc->extfuse_coherence_epochs))
 		return extfuse_request_send(fc, req->args);
 	if (!req->in.h.unique)
@@ -1117,11 +1416,12 @@ static ssize_t extfuse_request_pre_result(struct fuse_req *req, gfp_t gfp,
 		ret = __extfuse_request_send_ctx(fc, req->args, &req->in.h,
 						 &pre, false, &reason,
 						 passthru);
-		if (*passthru &&
-		    (!READ_ONCE(fc->extfuse_wbcache_passthrough) ||
-		     (req->args->opcode != FUSE_READ &&
-		      req->args->opcode != FUSE_WRITE)))
+		/* A lower-I/O decision without its private target state is invalid. */
+		if (*passthru) {
 			*passthru = false;
+			ret = -ENOSYS;
+			reason = EXTFUSE_TRACE_REASON_INVALID_OUTPUT;
+		}
 		action = extfuse_pre_action(ret, reason);
 		if (*passthru)
 			action = EXTFUSE_TRACE_ACTION_FORWARD;
@@ -1144,11 +1444,6 @@ static ssize_t extfuse_request_pre_result(struct fuse_req *req, gfp_t gfp,
 
 	ret = __extfuse_request_send_ctx(fc, req->args, &req->in.h,
 					 &pre, false, &reason, passthru);
-	if (*passthru &&
-	    (!READ_ONCE(fc->extfuse_wbcache_passthrough) ||
-	     (req->args->opcode != FUSE_READ &&
-	      req->args->opcode != FUSE_WRITE)))
-		*passthru = false;
 	if (state->mutation && !state->pre_hit_allowed && ret != -ENOSYS &&
 	    !*passthru) {
 		ret = -ENOSYS;
@@ -1163,22 +1458,32 @@ static ssize_t extfuse_request_pre_result(struct fuse_req *req, gfp_t gfp,
 	validated = state->request_dependencies;
 	if (req->args->opcode == FUSE_GETXATTR)
 		validated = extfuse_validated_dependencies(req->args, ret);
-	wbcache_write_forward = extfuse_is_wbcache_write_forward(req, state,
-								 *passthru);
+	wbcache_data_forward = extfuse_is_wbcache_data_forward(req, state,
+							       *passthru);
+	if (*passthru && !wbcache_data_forward) {
+		ret = -ENOSYS;
+		*passthru = false;
+		reason = EXTFUSE_TRACE_REASON_INVALID_OUTPUT;
+	}
 	if (ret != -ENOSYS || *passthru) {
 		/*
-		 * A WBCache WRITE PASSTHRU result admits a mutation; it is not a
-		 * cached reply.  Concurrent writers may change the active mask and
-		 * epochs.  prepare_wbcache() adds this write to the same active
-		 * counters before lower I/O, keeping metadata hits blocked until all
-		 * writers finish.  Keep identity stable here; full file and request
-		 * validation still runs before the lower write.
+		 * A WBCache READ/WRITE PASSTHRU result admits lower I/O, not a cached
+		 * reply.  PRE validates only backing identity; the sleepable worker
+		 * waits out a currently active READ blocker and checks identity again
+		 * immediately before lower-I/O admission.  WRITE keeps its public epoch
+		 * and the same two identity checks without waiting on writeback history.
 		 */
-		if (wbcache_write_forward) {
-			if (!extfuse_target_identity_current(&state->targets[0])) {
+		if (wbcache_data_forward) {
+			wbcache_reason =
+				extfuse_target_identity_current(&state->targets[0]) ?
+				EXTFUSE_TRACE_REASON_NONE :
+				EXTFUSE_TRACE_REASON_RACE;
+			if (wbcache_reason != EXTFUSE_TRACE_REASON_NONE) {
 				ret = -ENOSYS;
 				*passthru = false;
-				reason = EXTFUSE_TRACE_REASON_RACE;
+				reason = wbcache_reason;
+			} else {
+				state->wbcache_admitted = true;
 			}
 		} else {
 			for (i = 0; i < state->target_count; i++) {
@@ -1202,7 +1507,14 @@ static ssize_t extfuse_request_pre_result(struct fuse_req *req, gfp_t gfp,
 			}
 		}
 	}
-	if (ret != -ENOSYS && ret >= 0 && state->pre_hit_invalidate)
+	/*
+	 * Strict WBCache passthrough enters the normal mutation epoch before lower
+	 * I/O.  The BPF-selected paper-like READ relaxation instead excludes atime
+	 * from the public epoch while retaining the same blocking-state admission.
+	 * Invalidating either path here would add a redundant coherence transaction.
+	 */
+	if (!*passthru && ret != -ENOSYS && ret >= 0 &&
+	    state->pre_hit_invalidate)
 		for (i = 0; i < state->target_count; i++)
 			extfuse_coherence_invalidate_inode(fc,
 						 state->targets[i].inode,
@@ -1253,12 +1565,86 @@ static void extfuse_optional_out_remove(struct fuse_req *req)
 	state->optional_out = false;
 }
 
+static int extfuse_request_begin_mutation(struct fuse_req *req,
+					  enum extfuse_mutation_owner owner)
+{
+	struct extfuse_req_state *state = req->extfuse_state;
+	struct fuse_conn *fc = req->fm->fc;
+	struct fuse_args *args = req->args;
+	unsigned int i = 0;
+	int err;
+
+	if (!state || !state->mutation || state->begun)
+		return 0;
+	if (owner == EXTFUSE_MUTATION_WBCACHE && state->global_mutation)
+		return -EINVAL;
+	if (state->global_mutation) {
+		err = extfuse_global_begin(fc);
+		if (err)
+			goto undo;
+		state->global_active_owned = true;
+		extfuse_trace(req, args->nodeid, EXTFUSE_TRACE_PHASE_BEGIN,
+			      EXTFUSE_TRACE_ACTION_MUTATION,
+			      EXTFUSE_TRACE_REASON_NONE, 0,
+			      state->request_dependencies);
+	}
+	for (i = 0; i < state->target_count; i++) {
+		struct extfuse_target_state *target = &state->targets[i];
+
+		if (!target->inode) {
+			err = -ESTALE;
+			goto undo;
+		}
+		if (owner == EXTFUSE_MUTATION_WBCACHE ||
+		    owner == EXTFUSE_MUTATION_WBCACHE_RELAXED_READ)
+			err = extfuse_wbcache_inode_begin(fc, target, owner,
+						   args->opcode);
+		else
+			err = extfuse_inode_begin(target->inode,
+						  target->dependencies);
+		if (err)
+			goto undo;
+		target->active_owner = owner;
+		target->active_owned = true;
+		extfuse_trace(req, target->pre.nodeid, EXTFUSE_TRACE_PHASE_BEGIN,
+			      EXTFUSE_TRACE_ACTION_MUTATION,
+			      EXTFUSE_TRACE_REASON_NONE, 0,
+			      target->dependencies);
+	}
+	state->begun = true;
+	return 0;
+
+undo:
+	while (i--) {
+		struct extfuse_target_state *target = &state->targets[i];
+
+		if (!target->active_owned)
+			continue;
+		__extfuse_inode_end(target->inode, target->dependencies,
+				    target->active_owner);
+		target->active_owned = false;
+		extfuse_trace(req, target->pre.nodeid, EXTFUSE_TRACE_PHASE_END,
+			      EXTFUSE_TRACE_ACTION_MUTATION,
+			      EXTFUSE_TRACE_REASON_PROGRAM_ERROR, err,
+			      target->dependencies);
+	}
+	if (state->global_active_owned) {
+		extfuse_global_end(fc);
+		state->global_active_owned = false;
+		extfuse_trace(req, args->nodeid, EXTFUSE_TRACE_PHASE_END,
+			      EXTFUSE_TRACE_ACTION_MUTATION,
+			      EXTFUSE_TRACE_REASON_PROGRAM_ERROR, err,
+			      state->request_dependencies);
+	}
+	extfuse_optional_out_remove(req);
+	return err;
+}
+
 int extfuse_request_prepare_daemon(struct fuse_req *req, gfp_t gfp)
 {
 	struct fuse_conn *fc = req->fm->fc;
 	struct extfuse_req_state *state;
 	struct fuse_args *args = req->args;
-	unsigned int i = 0;
 	int err;
 
 	if (!READ_ONCE(fc->extfuse_coherence_epochs))
@@ -1311,60 +1697,8 @@ int extfuse_request_prepare_daemon(struct fuse_req *req, gfp_t gfp)
 		req->extfuse_pre_traced = true;
 	}
 
-	if (!state->mutation || state->begun)
-		return 0;
-	if (state->global_mutation) {
-		err = extfuse_global_begin(fc);
-		if (err)
-			goto undo;
-		state->global_active_owned = true;
-		extfuse_trace(req, args->nodeid, EXTFUSE_TRACE_PHASE_BEGIN,
-			       EXTFUSE_TRACE_ACTION_MUTATION,
-			       EXTFUSE_TRACE_REASON_NONE, 0,
-			       state->request_dependencies);
-	}
-	for (i = 0; i < state->target_count; i++) {
-		if (!state->targets[i].inode) {
-			err = -ESTALE;
-			goto undo;
-		}
-		err = extfuse_inode_begin(state->targets[i].inode,
-					  state->targets[i].dependencies);
-		if (err)
-			goto undo;
-		state->targets[i].active_owned = true;
-		extfuse_trace(req, state->targets[i].pre.nodeid,
-			       EXTFUSE_TRACE_PHASE_BEGIN,
-			       EXTFUSE_TRACE_ACTION_MUTATION,
-			       EXTFUSE_TRACE_REASON_NONE, 0,
-			       state->targets[i].dependencies);
-	}
-	state->begun = true;
-	return 0;
-
-undo:
-	while (i--) {
-		if (!state->targets[i].active_owned)
-			continue;
-		extfuse_inode_end(state->targets[i].inode,
-				   state->targets[i].dependencies);
-		state->targets[i].active_owned = false;
-		extfuse_trace(req, state->targets[i].pre.nodeid,
-			       EXTFUSE_TRACE_PHASE_END,
-			       EXTFUSE_TRACE_ACTION_MUTATION,
-			       EXTFUSE_TRACE_REASON_PROGRAM_ERROR, err,
-			       state->targets[i].dependencies);
-	}
-	if (state->global_active_owned) {
-		extfuse_global_end(fc);
-		state->global_active_owned = false;
-		extfuse_trace(req, args->nodeid, EXTFUSE_TRACE_PHASE_END,
-			       EXTFUSE_TRACE_ACTION_MUTATION,
-			       EXTFUSE_TRACE_REASON_PROGRAM_ERROR, err,
-			       state->request_dependencies);
-	}
-	extfuse_optional_out_remove(req);
-	return err;
+	return extfuse_request_begin_mutation(req,
+					      EXTFUSE_MUTATION_BLOCKING);
 }
 EXPORT_SYMBOL_GPL(extfuse_request_prepare_daemon);
 
@@ -1379,8 +1713,9 @@ static void extfuse_request_end_mutation(struct fuse_req *req, int error)
 	for (i = 0; i < state->target_count; i++) {
 		if (!state->targets[i].active_owned)
 			continue;
-		extfuse_inode_end(state->targets[i].inode,
-				   state->targets[i].dependencies);
+		__extfuse_inode_end(state->targets[i].inode,
+				    state->targets[i].dependencies,
+				    state->targets[i].active_owner);
 		state->targets[i].active_owned = false;
 		state->targets[i].mutation_completed = true;
 		extfuse_trace(req, state->targets[i].pre.nodeid,
@@ -1404,22 +1739,59 @@ int extfuse_request_prepare_wbcache(struct fuse_req *req, gfp_t gfp)
 {
 	struct fuse_conn *fc = req->fm->fc;
 	struct extfuse_req_state *state;
-	int err;
+	enum extfuse_mutation_owner owner;
+	u32 policy_opcode;
+	int err, policy_result;
 
 	if (!READ_ONCE(fc->extfuse_wbcache_passthrough) ||
 	    !req->args->extfuse_file ||
 	    (req->args->opcode != FUSE_READ &&
 	     req->args->opcode != FUSE_WRITE))
 		return -EOPNOTSUPP;
+	/* The paper path has no private hook, request state, or epoch bracket. */
+	if (!READ_ONCE(fc->extfuse_coherence_epochs))
+		return 0;
 
-	err = extfuse_request_prepare_daemon(req, gfp);
+	err = extfuse_build_state(req, gfp);
 	if (err)
 		return err;
-
 	state = req->extfuse_state;
-	if (!state || !state->mutation || !state->begun) {
-		extfuse_request_end_mutation(req, -EIO);
+	if (!state || !state->wbcache_admitted ||
+	    !extfuse_is_wbcache_data_forward(req, state, true))
+		return -EIO;
+
+	state->wbcache_admitted = false;
+	policy_opcode = req->args->opcode == FUSE_READ ?
+		EXTFUSE_PASSTHROUGH_READ : EXTFUSE_PASSTHROUGH_WRITE;
+	policy_result = extfuse_passthrough_bpf_notify(
+		fc, state->targets[0].inode, state->targets[0].pre.nodeid,
+		policy_opcode, EXTFUSE_PASSTHROUGH_PHASE_BEGIN, true, true);
+	if (policy_result < 0) {
+		/* No lower I/O or kernel epoch has started: rebuild before fallback. */
 		extfuse_optional_out_remove(req);
+		extfuse_state_put(state);
+		req->extfuse_state = NULL;
+		return policy_result;
+	}
+	state->wbcache_policy_begun = true;
+	state->wbcache_relaxed_read =
+		policy_result == EXTFUSE_PASSTHROUGH_POLICY_RELAXED_READ;
+	owner = state->wbcache_relaxed_read ?
+		EXTFUSE_MUTATION_WBCACHE_RELAXED_READ :
+		EXTFUSE_MUTATION_WBCACHE;
+	err = extfuse_request_begin_mutation(req, owner);
+	if (err) {
+		/* Close the successful BPF BEGIN before a fresh daemon fallback. */
+		extfuse_request_complete_wbcache(req, err);
+		extfuse_state_put(state);
+		req->extfuse_state = NULL;
+		return err;
+	}
+	if (WARN_ON_ONCE(!state->begun || !state->targets[0].active_owned ||
+			 state->targets[0].active_owner != owner)) {
+		extfuse_request_complete_wbcache(req, -EIO);
+		extfuse_state_put(state);
+		req->extfuse_state = NULL;
 		return -EIO;
 	}
 
@@ -1433,9 +1805,30 @@ EXPORT_SYMBOL_GPL(extfuse_request_prepare_wbcache);
 void extfuse_request_complete_wbcache(struct fuse_req *req, int error)
 {
 	struct extfuse_req_state *state = req->extfuse_state;
+	u32 policy_opcode;
 
-	if (!state || !state->wbcache_forward)
+	if (!state || state->wbcache_completed ||
+	    (!state->wbcache_forward &&
+	     !state->wbcache_policy_begun))
 		return;
+	state->wbcache_forward = false;
+	state->wbcache_completed = true;
+	if (state->wbcache_policy_begun) {
+		state->wbcache_policy_begun = false;
+		policy_opcode = req->args->opcode == FUSE_READ ?
+			EXTFUSE_PASSTHROUGH_READ : EXTFUSE_PASSTHROUGH_WRITE;
+		/*
+		 * The lower operation is already complete.  A policy END failure must
+		 * leave the generation row unserviceable, never replay the I/O or
+		 * replace its result.
+		 */
+		(void)extfuse_passthrough_bpf_notify(req->fm->fc,
+						       state->targets[0].inode,
+						       state->targets[0].pre.nodeid,
+						       policy_opcode,
+						       EXTFUSE_PASSTHROUGH_PHASE_END,
+						       true, false);
+	}
 	extfuse_request_end_mutation(req, error);
 	extfuse_optional_out_remove(req);
 }
@@ -1486,16 +1879,17 @@ static bool extfuse_output_valid(struct fuse_req *req, ssize_t result)
 	case FUSE_GETATTR:
 	case FUSE_SETATTR: {
 		const struct fuse_attr_out *out;
+		struct inode *inode = args->extfuse_inode;
 
 		if (!args->out_numargs || !args->out_args[0].value ||
 		    args->out_args[0].size < sizeof(*out))
 			return false;
+		if (state && state->target_count && state->targets[0].inode)
+			inode = state->targets[0].inode;
 		out = args->out_args[0].value;
 		return out->attr_valid_nsec < NSEC_PER_SEC &&
 		       !fuse_invalid_attr((struct fuse_attr *)&out->attr) &&
-		       (!state->targets[0].inode ||
-			!inode_wrong_type(state->targets[0].inode,
-					  out->attr.mode));
+		       (!inode || !inode_wrong_type(inode, out->attr.mode));
 	}
 	case FUSE_LOOKUP: {
 		const struct fuse_entry_out *out;
@@ -1817,7 +2211,9 @@ void extfuse_request_complete(struct fuse_req *req)
 
 	if (!state)
 		return;
-	if (state->wbcache_forward) {
+	if (state->wbcache_completed)
+		return;
+	if (state->wbcache_forward || state->wbcache_policy_begun) {
 		extfuse_request_complete_wbcache(req, req->out.h.error);
 		return;
 	}
@@ -1839,6 +2235,10 @@ EXPORT_SYMBOL_GPL(extfuse_request_complete);
 
 void extfuse_request_cancel(struct fuse_req *req, int error)
 {
+	if (req->extfuse_state &&
+	    (req->extfuse_state->wbcache_forward ||
+	     req->extfuse_state->wbcache_policy_begun))
+		extfuse_request_complete_wbcache(req, error);
 	extfuse_request_end_mutation(req, error);
 	extfuse_optional_out_remove(req);
 }
@@ -1846,6 +2246,10 @@ EXPORT_SYMBOL_GPL(extfuse_request_cancel);
 
 void extfuse_request_free(struct fuse_req *req)
 {
+	if (req->extfuse_state &&
+	    (req->extfuse_state->wbcache_forward ||
+	     req->extfuse_state->wbcache_policy_begun))
+		extfuse_request_complete_wbcache(req, -ECANCELED);
 	extfuse_request_end_mutation(req, -ECANCELED);
 	extfuse_optional_out_remove(req);
 	extfuse_state_put(req->extfuse_state);
@@ -1988,15 +2392,12 @@ int extfuse_passthrough_attr_commit(struct fuse_conn *fc, u64 nodeid,
 }
 EXPORT_SYMBOL_GPL(extfuse_passthrough_attr_commit);
 
-/*
- * Native passthrough does not create an ordinary FUSE READ/WRITE request.
- * Epoch coherence therefore runs one private BPF policy hook before lower
- * I/O and completes the matching epoch entirely in the kernel. A missing or
- * failing BEGIN handler prevents lower I/O rather than risking a stale hit.
- */
-static int __extfuse_passthrough_notify(struct fuse_conn *fc,
-					struct inode *inode, u64 nodeid,
-					u32 opcode, u32 phase)
+/* Run only the generation-map policy hook; kernel epoch ownership stays local. */
+static int extfuse_passthrough_bpf_notify(struct fuse_conn *fc,
+					  struct inode *inode, u64 nodeid,
+					  u32 opcode, u32 phase,
+					  bool force_v2,
+					  bool allow_relaxed_read)
 {
 	struct extfuse_passthrough_in in = {
 		.phase = phase,
@@ -2008,42 +2409,96 @@ static int __extfuse_passthrough_notify(struct fuse_conn *fc,
 		EXTFUSE_COHERENCE_DOMAIN_DATA;
 	u32 reason = EXTFUSE_TRACE_REASON_NONE;
 	u32 action;
+	bool passthru = false;
 	ssize_t ret;
 	unsigned int coherence;
-	bool coherence_epochs = READ_ONCE(fc->extfuse_coherence_epochs);
-	bool epoch_mutation = coherence_epochs &&
-		(opcode == EXTFUSE_PASSTHROUGH_READ ||
-		 opcode == EXTFUSE_PASSTHROUGH_WRITE);
 
-	if (coherence_epochs && !inode)
-		return -EINVAL;
-	args.nodeid = nodeid;
-	args.opcode = opcode;
-	args.extfuse_inode = inode;
-
-	coherence = READ_ONCE(fc->extfuse_passthrough_coherence);
-	if (!coherence && !coherence_epochs)
-		return 0;
-	if (coherence_epochs)
-		coherence = max(coherence, 2U);
 	if (phase != EXTFUSE_PASSTHROUGH_PHASE_BEGIN &&
 	    phase != EXTFUSE_PASSTHROUGH_PHASE_END)
 		return -EINVAL;
-	if (epoch_mutation && phase == EXTFUSE_PASSTHROUGH_PHASE_END) {
-		extfuse_inode_end(inode, dependencies);
-		extfuse_trace_fc(fc, 0, opcode, nodeid,
-				  EXTFUSE_TRACE_PHASE_END,
-				  EXTFUSE_TRACE_ACTION_MUTATION,
-				  EXTFUSE_TRACE_REASON_NONE, 0,
-				  dependencies);
+	coherence = READ_ONCE(fc->extfuse_passthrough_coherence);
+	if (!coherence && !force_v2)
 		return 0;
-	}
+	if (force_v2)
+		coherence = max(coherence, 2U);
+
+	args.nodeid = nodeid;
+	args.opcode = opcode;
+	args.extfuse_inode = inode;
 	if (coherence >= 2) {
 		args.in_numargs = 1;
 		args.in_args[0].size = sizeof(in);
 		args.in_args[0].value = &in;
 	}
-	if (epoch_mutation) {
+
+	ret = __extfuse_request_send_ctx(fc, &args, NULL, NULL, false,
+					 &reason, &passthru);
+	if (passthru) {
+		if (allow_relaxed_read &&
+		    READ_ONCE(fc->extfuse_wbcache_passthrough) &&
+		    opcode == EXTFUSE_PASSTHROUGH_READ &&
+		    phase == EXTFUSE_PASSTHROUGH_PHASE_BEGIN) {
+			ret = EXTFUSE_PASSTHROUGH_POLICY_RELAXED_READ;
+			reason = EXTFUSE_TRACE_REASON_NONE;
+		} else {
+			ret = -EIO;
+			reason = EXTFUSE_TRACE_REASON_INVALID_OUTPUT;
+		}
+	}
+	if (ret >= 0)
+		action = EXTFUSE_TRACE_ACTION_HIT;
+	else if (ret == -ENOSYS)
+		action = EXTFUSE_TRACE_ACTION_FALLBACK;
+	else
+		action = EXTFUSE_TRACE_ACTION_ERROR;
+	/*
+	 * BEGIN and END are one private policy bracket, not two logical I/O
+	 * requests.  Publish the completed bracket once at END.  MMAP has a
+	 * session-lifetime BEGIN only, and a failed BEGIN must remain observable.
+	 */
+	if (phase == EXTFUSE_PASSTHROUGH_PHASE_END || ret < 0 ||
+	    opcode == EXTFUSE_PASSTHROUGH_MMAP)
+		extfuse_trace_fc(fc, 0, opcode, nodeid,
+				 EXTFUSE_TRACE_PHASE_PRE, action, reason,
+				 ret < 0 ? ret : 0,
+				 dependencies);
+	if (ret >= 0)
+		return ret;
+
+	pr_warn_ratelimited("passthrough policy notification %u failed: %zd\n",
+			    opcode, ret);
+	return ret < 0 && ret != -ENOSYS ? (int)ret : -EIO;
+}
+
+/*
+ * Native passthrough has no ordinary FUSE READ/WRITE request.  Bracket lower
+ * I/O with both the kernel epoch and the generation-map policy.  A BEGIN
+ * failure prevents lower I/O; END always releases kernel ownership even when
+ * the map remains deliberately active so later metadata requests fail closed.
+ * MMAP is instead a session-lifetime marker shared by native/DAX mappings and
+ * an actual cached shared-mmap write fault; it never owns a finite epoch span.
+ */
+static int __extfuse_passthrough_notify(struct fuse_conn *fc,
+					struct inode *inode, u64 nodeid,
+					u32 opcode, u32 phase)
+{
+	u32 dependencies = opcode == EXTFUSE_PASSTHROUGH_READ ?
+		EXTFUSE_COHERENCE_DOMAIN_ATTR :
+		EXTFUSE_COHERENCE_DOMAIN_ATTR |
+		EXTFUSE_COHERENCE_DOMAIN_DATA;
+	bool coherence_epochs = READ_ONCE(fc->extfuse_coherence_epochs);
+	bool epoch_mutation = coherence_epochs &&
+		(opcode == EXTFUSE_PASSTHROUGH_READ ||
+		 opcode == EXTFUSE_PASSTHROUGH_WRITE);
+	int ret;
+
+	if (coherence_epochs && !inode)
+		return -EINVAL;
+	if (phase != EXTFUSE_PASSTHROUGH_PHASE_BEGIN &&
+	    phase != EXTFUSE_PASSTHROUGH_PHASE_END)
+		return -EINVAL;
+
+	if (epoch_mutation && phase == EXTFUSE_PASSTHROUGH_PHASE_BEGIN) {
 		ret = extfuse_inode_begin(inode, dependencies);
 		if (ret)
 			return ret;
@@ -2058,18 +2513,17 @@ static int __extfuse_passthrough_notify(struct fuse_conn *fc,
 		extfuse_coherence_invalidate_inode(fc, inode, dependencies);
 	}
 
-	ret = __extfuse_request_send_ctx(fc, &args, NULL, NULL, false,
-					 &reason, NULL);
-	if (!ret)
-		action = EXTFUSE_TRACE_ACTION_HIT;
-	else if (ret == -ENOSYS)
-		action = EXTFUSE_TRACE_ACTION_FALLBACK;
-	else
-		action = EXTFUSE_TRACE_ACTION_ERROR;
-	extfuse_trace_fc(fc, 0, opcode, nodeid, EXTFUSE_TRACE_PHASE_PRE,
-			  action, reason, ret, dependencies);
-
-	if (epoch_mutation && ret) {
+	ret = extfuse_passthrough_bpf_notify(fc, inode, nodeid, opcode, phase,
+					     coherence_epochs, false);
+	if (epoch_mutation && phase == EXTFUSE_PASSTHROUGH_PHASE_END) {
+		extfuse_inode_end(inode, dependencies);
+		extfuse_trace_fc(fc, 0, opcode, nodeid,
+				 EXTFUSE_TRACE_PHASE_END,
+				 EXTFUSE_TRACE_ACTION_MUTATION,
+				 ret ? EXTFUSE_TRACE_REASON_PROGRAM_ERROR :
+				       EXTFUSE_TRACE_REASON_NONE,
+				 ret, dependencies);
+	} else if (epoch_mutation && ret) {
 		extfuse_inode_end(inode, dependencies);
 		extfuse_trace_fc(fc, 0, opcode, nodeid,
 				  EXTFUSE_TRACE_PHASE_END,
@@ -2077,12 +2531,7 @@ static int __extfuse_passthrough_notify(struct fuse_conn *fc,
 				  EXTFUSE_TRACE_REASON_PROGRAM_ERROR, ret,
 				  dependencies);
 	}
-	if (!ret)
-		return 0;
-
-	pr_warn_ratelimited("native passthrough notification %u failed: %zd\n",
-			    opcode, ret);
-	return ret < 0 && ret != -ENOSYS ? (int)ret : -EIO;
+	return ret;
 }
 
 int extfuse_passthrough_notify_inode(struct fuse_conn *fc,

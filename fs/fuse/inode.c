@@ -62,6 +62,20 @@ MODULE_PARM_DESC(max_user_congthresh,
  "Global limit for the maximum congestion threshold an "
  "unprivileged user can set");
 
+/*
+ * Runtime identity for the paired ExtFUSE userspace and experiment runners.
+ * Keep this read-only and bump it whenever the semantics covered by the
+ * source-pin contract change.  The kernel release alone cannot distinguish
+ * two locally rebuilt fuse.ko instances with the same EXTRAVERSION.
+ */
+#define FUSE_EXTFUSE_RUNTIME_CONTRACT \
+	"extfuse-paper-wbcache-forwarding-20260903"
+static char extfuse_runtime_contract[] = FUSE_EXTFUSE_RUNTIME_CONTRACT;
+module_param_string(extfuse_runtime_contract, extfuse_runtime_contract,
+		    sizeof(extfuse_runtime_contract), 0444);
+MODULE_PARM_DESC(extfuse_runtime_contract,
+		 "Read-only identity of the ExtFUSE runtime semantics");
+
 #define FUSE_DEFAULT_BLKSIZE 512
 
 /** Maximum number of outstanding background requests */
@@ -1015,6 +1029,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	spin_lock_init(&fc->extfuse_global_coherence_lock);
 	fc->extfuse_global_epoch = 1;
 	fc->extfuse_global_active = 0;
+	init_waitqueue_head(&fc->extfuse_wbcache_waitq);
 	spin_lock_init(&fc->extfuse_lock);
 	RCU_INIT_POINTER(fc->fc_priv, NULL);
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
@@ -1490,6 +1505,14 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 			}
 			if (flags & FUSE_OVER_IO_URING && fuse_uring_enabled())
 				fc->io_uring = 1;
+			if (flags & FUSE_HAS_IO_URING_BUFPOOL) {
+				if (arg->minor < 48 ||
+				    !(flags & FUSE_OVER_IO_URING) ||
+				    !fc->io_uring)
+					ok = false;
+				else
+					fc->io_uring_bufpool = 1;
+			}
 
 			if (flags & FUSE_REQUEST_TIMEOUT)
 				timeout = arg->request_timeout;
@@ -1514,12 +1537,31 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 					fc->extfuse_passthrough_coherence = 2;
 			}
 			if (flags & FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH) {
-				if (!(flags & FUSE_FS_EXTFUSE) ||
-				    !(flags & FUSE_PASSTHROUGH) ||
-				    !(flags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE) ||
-				    !(flags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2) ||
-				    !fc->passthrough ||
-				    fc->extfuse_passthrough_coherence < 2)
+				bool native_refresh =
+					(flags & FUSE_FS_EXTFUSE) &&
+					(flags & FUSE_PASSTHROUGH) &&
+					(flags &
+					 FUSE_EXTFUSE_PASSTHROUGH_COHERENCE) &&
+					(flags &
+					 FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2) &&
+					fc->passthrough &&
+					fc->extfuse_passthrough_coherence >= 2;
+				bool wbcache_refresh =
+					arg->minor >= 47 &&
+					IS_ENABLED(CONFIG_EXTFUSE) &&
+					IS_ENABLED(CONFIG_FUSE_PASSTHROUGH) &&
+					(flags & FUSE_FS_EXTFUSE) &&
+					(flags &
+					 FUSE_EXTFUSE_WBCACHE_PASSTHROUGH) &&
+					(flags & FUSE_WRITEBACK_CACHE) &&
+					(flags & FUSE_EXTFUSE_COHERENCE_EPOCHS) &&
+					fc->writeback_cache &&
+					!(flags & FUSE_PASSTHROUGH) &&
+					arg->max_stack_depth > 0 &&
+					arg->max_stack_depth <=
+					FILESYSTEM_MAX_STACK_DEPTH;
+
+				if (!native_refresh && !wbcache_refresh)
 					ok = false;
 				else
 					fc->extfuse_passthrough_attr_refresh = 1;
@@ -1567,14 +1609,13 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 					fc->extfuse_notify_inval_xattr = 1;
 			}
 			if (flags & FUSE_EXTFUSE_WBCACHE_PASSTHROUGH) {
+				/* Coherence epochs opt into the strict policy, not forwarding. */
 				if (arg->minor < 47 ||
 				    !IS_ENABLED(CONFIG_EXTFUSE) ||
 				    !IS_ENABLED(CONFIG_FUSE_PASSTHROUGH) ||
 				    !(flags & FUSE_FS_EXTFUSE) ||
 				    !(flags & FUSE_WRITEBACK_CACHE) ||
-				    !(flags & FUSE_EXTFUSE_COHERENCE_EPOCHS) ||
 				    !fc->writeback_cache ||
-				    !fc->extfuse_coherence_epochs ||
 				    (flags & FUSE_PASSTHROUGH) ||
 				    arg->max_stack_depth <= 0 ||
 				    arg->max_stack_depth >
@@ -1621,6 +1662,7 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 		}
 		fc->extfuse_wbcache_passthrough = 0;
 		fc->io_uring = 0;
+		fc->io_uring_bufpool = 0;
 		fc->conn_init = 0;
 		fc->conn_error = 1;
 	}
@@ -1681,12 +1723,9 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 	if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 		flags |= FUSE_PASSTHROUGH;
 
-	/*
-	 * This is just an information flag for fuse server. No need to check
-	 * the reply - server is either sending IORING_OP_URING_CMD or not.
-	 */
+	/* The server must echo these capabilities before uring_cmd is accepted. */
 	if (fuse_uring_enabled())
-		flags |= FUSE_OVER_IO_URING;
+		flags |= FUSE_OVER_IO_URING | FUSE_HAS_IO_URING_BUFPOOL;
 
 	ia->in.flags = flags;
 	ia->in.flags2 = flags >> 32;

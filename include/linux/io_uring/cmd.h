@@ -5,6 +5,7 @@
 #include <uapi/linux/io_uring.h>
 #include <linux/io_uring_types.h>
 #include <linux/blk-mq.h>
+#include <linux/uio.h>
 
 /* only top 8 bits of sqe->uring_cmd_flags for kernel internal use */
 #define IORING_URING_CMD_CANCELABLE	(1U << 30)
@@ -24,6 +25,12 @@ static inline const void *io_uring_sqe_cmd(const struct io_uring_sqe *sqe)
 {
 	return sqe->cmd;
 }
+
+#define io_uring_sqe128_cmd(sqe, type) ({					\
+	BUILD_BUG_ON(sizeof(type) > ((2 * sizeof(struct io_uring_sqe)) -	\
+				     offsetof(struct io_uring_sqe, cmd)));	\
+	(const type *)(sqe)->cmd;					\
+})
 
 static inline void io_uring_cmd_private_sz_check(size_t cmd_sz)
 {
@@ -175,9 +182,21 @@ static inline void io_uring_cmd_done32(struct io_uring_cmd *ioucmd, s32 ret,
 	return __io_uring_cmd_done(ioucmd, ret, res2, issue_flags, true);
 }
 
+/* Access directions accepted by io_buffer_register_bvec_array(). */
+enum io_uring_buf_direction {
+	IO_BUF_DEST	= 1 << ITER_DEST,
+	IO_BUF_SOURCE	= 1 << ITER_SOURCE,
+};
+
 int io_buffer_register_bvec(struct io_uring_cmd *cmd, struct request *rq,
 			    void (*release)(void *), unsigned int index,
 			    unsigned int issue_flags);
+int io_buffer_register_bvec_array(struct io_uring_cmd *cmd,
+				  const struct bio_vec *bvs,
+				  unsigned int nr_bvecs,
+				  void (*release)(void *), void *priv,
+				  u8 dir, unsigned int index,
+				  unsigned int issue_flags);
 int io_buffer_unregister_bvec(struct io_uring_cmd *cmd, unsigned int index,
 			      unsigned int issue_flags);
 

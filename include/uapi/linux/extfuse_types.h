@@ -75,11 +75,12 @@ struct extfuse_req {
 };
 
 /*
- * Private native-passthrough notifications use one input argument to bracket
+ * Private passthrough I/O notifications use one input argument to bracket
  * lower I/O.  Upper-file preparation such as privilege removal completes via
  * the filesystem's ordinary operations first.  BEGIN is then emitted before
  * direct backing-file I/O can mutate metadata; END is emitted after completion,
- * including asynchronous completion.
+ * including asynchronous completion.  MMAP uses BEGIN alone as a persistent
+ * marker when later page faults cannot be represented by a finite I/O bracket.
  */
 #define EXTFUSE_PASSTHROUGH_PHASE_BEGIN	1
 #define EXTFUSE_PASSTHROUGH_PHASE_END	2

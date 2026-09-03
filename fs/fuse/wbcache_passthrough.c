@@ -12,7 +12,10 @@
 #include <linux/backing-file.h>
 #include <linux/bvec.h>
 #include <linux/file.h>
+#include <linux/overflow.h>
 #include <linux/uio.h>
+
+#define FUSE_WBCACHE_INLINE_BVECS 32
 
 struct fuse_wbcache_io {
 	struct file *file;
@@ -23,7 +26,48 @@ struct fuse_wbcache_io {
 	size_t count;
 	rwf_t rwf;
 	bool write;
+	bool refs_owned;
+	bool bvec_owned;
 };
+
+struct fuse_wbcache_alloc {
+	struct fuse_wbcache_io io;
+	struct bio_vec bvec[];
+};
+
+struct fuse_wbcache_paper_io {
+	struct fuse_wbcache_io io;
+	/* 512 bytes on 64-bit builds; larger requests use a heap fallback. */
+	struct bio_vec inline_bvec[FUSE_WBCACHE_INLINE_BVECS];
+};
+
+static int fuse_wbcache_folio_count(struct fuse_req *req,
+				    unsigned int *nr_folios)
+{
+	struct fuse_args *args = req->args;
+	struct fuse_args_pages *ap;
+
+	switch (args->opcode) {
+	case FUSE_READ:
+		if (!args->out_pages || args->in_pages)
+			return -EINVAL;
+		break;
+	case FUSE_WRITE:
+		if (!args->in_pages || args->out_pages)
+			return -EINVAL;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	ap = container_of(args, struct fuse_args_pages, args);
+	if (!ap->folios || !ap->descs || !ap->num_folios ||
+	    ap->num_folios > req->fm->fc->max_pages)
+		return -EINVAL;
+
+	*nr_folios = ap->num_folios;
+	return 0;
+}
 
 static int fuse_wbcache_lower_open_flags(const struct file *file)
 {
@@ -120,6 +164,7 @@ static int fuse_wbcache_request_shape(struct fuse_req *req,
 			return -EINVAL;
 		in = args->in_args[0].value;
 		if (in->padding || in->fh != ff->fh || !in->size ||
+		    (in->flags & O_DIRECT) ||
 		    args->out_args[0].size < in->size || in->offset > LLONG_MAX)
 			return -EINVAL;
 		io->pos = in->offset;
@@ -141,6 +186,7 @@ static int fuse_wbcache_request_shape(struct fuse_req *req,
 		in = args->in_args[0].value;
 		out = args->out_args[0].value;
 		if (in->padding || in->fh != ff->fh || !in->size ||
+		    (in->flags & O_DIRECT) ||
 		    args->in_args[1].size != in->size || in->offset > LLONG_MAX)
 			return -EINVAL;
 		memset(out, 0, sizeof(*out));
@@ -165,10 +211,6 @@ static int fuse_wbcache_request_shape(struct fuse_req *req,
 	    ap->num_folios > fc->max_pages)
 		return -EINVAL;
 
-	io->bvec = kcalloc(ap->num_folios, sizeof(*io->bvec), GFP_KERNEL);
-	if (!io->bvec)
-		return -ENOMEM;
-
 	remaining = io->count;
 	for (i = 0; i < ap->num_folios && remaining; i++) {
 		struct fuse_folio_desc *desc = &ap->descs[i];
@@ -188,25 +230,88 @@ static int fuse_wbcache_request_shape(struct fuse_req *req,
 	return remaining ? -EINVAL : 0;
 }
 
-struct fuse_wbcache_io *fuse_wbcache_passthrough_prepare(struct fuse_req *req)
+static int fuse_wbcache_passthrough_init(struct fuse_req *req,
+					 struct fuse_wbcache_io *io,
+					 struct bio_vec *preallocated_bvec,
+					 unsigned int preallocated_nr,
+					 bool own_refs,
+					 gfp_t gfp)
 {
-	struct fuse_wbcache_io *io;
 	struct fuse_file *ff = req->args->extfuse_file;
+	unsigned int nr_folios;
 	int err;
 
-	io = kzalloc(sizeof(*io), GFP_KERNEL);
-	if (!io)
-		return ERR_PTR(-ENOMEM);
+	memset(io, 0, sizeof(*io));
+	err = fuse_wbcache_folio_count(req, &nr_folios);
+	if (err)
+		return err;
+
+	if (nr_folios <= preallocated_nr) {
+		io->bvec = preallocated_bvec;
+	} else {
+		io->bvec = kcalloc(nr_folios, sizeof(*io->bvec), gfp);
+		if (!io->bvec)
+			return -ENOMEM;
+		io->bvec_owned = true;
+	}
 
 	err = fuse_wbcache_request_shape(req, io);
 	if (err) {
+		if (io->bvec_owned)
+			kfree(io->bvec);
+		io->bvec = NULL;
+		return err;
+	}
+
+	if (own_refs) {
+		io->file = get_file(ff->extfuse_wbcache_file);
+		io->cred = get_cred(ff->extfuse_wbcache_fb->cred);
+		io->refs_owned = true;
+	} else {
+		/*
+		 * The request owner holds ff until completion: synchronous I/O has
+		 * the VFS file reference, while readahead and writeback hold explicit
+		 * fuse_file references.  fuse_file_io_release() therefore cannot
+		 * release these backing objects while this lower operation runs.
+		 */
+		io->file = ff->extfuse_wbcache_file;
+		io->cred = ff->extfuse_wbcache_fb->cred;
+	}
+	return 0;
+}
+
+static void fuse_wbcache_passthrough_cleanup(struct fuse_wbcache_io *io)
+{
+	if (io->refs_owned) {
+		put_cred(io->cred);
+		fput(io->file);
+	}
+	if (io->bvec_owned)
 		kfree(io->bvec);
-		kfree(io);
+}
+
+struct fuse_wbcache_io *fuse_wbcache_passthrough_prepare(struct fuse_req *req)
+{
+	struct fuse_wbcache_alloc *alloc;
+	struct fuse_wbcache_io *io;
+	unsigned int nr_folios;
+	int err;
+
+	err = fuse_wbcache_folio_count(req, &nr_folios);
+	if (err)
+		return ERR_PTR(err);
+	alloc = kmalloc(struct_size(alloc, bvec, nr_folios), GFP_KERNEL);
+	if (!alloc)
+		return ERR_PTR(-ENOMEM);
+	io = &alloc->io;
+
+	err = fuse_wbcache_passthrough_init(req, io, alloc->bvec, nr_folios,
+					    true, GFP_KERNEL);
+	if (err) {
+		kfree(alloc);
 		return ERR_PTR(err);
 	}
 
-	io->file = get_file(ff->extfuse_wbcache_file);
-	io->cred = get_cred(ff->extfuse_wbcache_fb->cred);
 	return io;
 }
 
@@ -253,8 +358,34 @@ ssize_t fuse_wbcache_passthrough_execute(struct fuse_req *req,
 
 void fuse_wbcache_passthrough_finish(struct fuse_wbcache_io *io)
 {
-	put_cred(io->cred);
-	fput(io->file);
-	kfree(io->bvec);
-	kfree(io);
+	struct fuse_wbcache_alloc *alloc =
+		container_of(io, struct fuse_wbcache_alloc, io);
+
+	fuse_wbcache_passthrough_cleanup(io);
+	kfree(alloc);
+}
+
+ssize_t fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
+						bool *lower_started)
+{
+	struct fuse_wbcache_paper_io paper_io;
+	struct fuse_wbcache_io *io = &paper_io.io;
+	ssize_t ret;
+	int err;
+
+	*lower_started = false;
+	err = fuse_wbcache_passthrough_init(req, io, paper_io.inline_bvec,
+					    ARRAY_SIZE(paper_io.inline_bvec), false,
+					    GFP_KERNEL);
+	if (err)
+		return err;
+
+	/* Validation is complete.  From here onward the request is never replayed. */
+	*lower_started = true;
+	if (!READ_ONCE(req->fm->fc->connected))
+		ret = -ENOTCONN;
+	else
+		ret = fuse_wbcache_passthrough_execute(req, io);
+	fuse_wbcache_passthrough_cleanup(io);
+	return ret;
 }

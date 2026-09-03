@@ -159,6 +159,13 @@ struct fuse_inode {
 	/** In-flight mutation counts for the corresponding epoch domains. */
 	u32 extfuse_active[4];
 
+	/**
+	 * In-flight counts for mutations that block WBCache lower I/O.
+	 * Concurrent WBCache forwards update the ordinary state above but not this
+	 * kernel-private discriminator.
+	 */
+	u32 extfuse_blocking_active[4];
+
 	union {
 		/* read/write io cache (regular file only) */
 		struct {
@@ -379,6 +386,8 @@ struct fuse_args {
 	bool is_ext:1;
 	bool is_pinned:1;
 	bool invalidate_vmap:1;
+	/* Server selected registered-page io-uring transport for READ/WRITE. */
+	bool zero_copy:1;
 	/* Internal context for a release-barrier GETATTR retry. */
 	struct inode *extfuse_getattr_inode;
 	void (*extfuse_getattr_refresh)(struct inode *inode);
@@ -975,7 +984,7 @@ struct fuse_conn {
 	/** Native passthrough ExtFUSE coherence protocol version (0, 1, or 2) */
 	unsigned int extfuse_passthrough_coherence;
 
-	/** Refresh daemon attributes from the native passthrough inode */
+	/** Refresh daemon attributes from the native or WBCache backing inode */
 	unsigned int extfuse_passthrough_attr_refresh;
 
 	/** Serialize passthrough RELEASE with ExtFUSE GETATTR refresh */
@@ -1001,6 +1010,9 @@ struct fuse_conn {
 
 	/* Use io_uring for communication */
 	unsigned int io_uring;
+
+	/* Connection negotiated io-uring buffer-pool/zero-copy protocol. */
+	unsigned int io_uring_bufpool;
 
 	/** Maximum stack depth for passthrough backing files */
 	int max_stack_depth;
@@ -1041,6 +1053,9 @@ struct fuse_conn {
 	/** Epoch and active count folded into every ExtFUSE target snapshot. */
 	u64 extfuse_global_epoch;
 	u32 extfuse_global_active;
+
+	/** Waits for blocking mutations before WBCache lower READ admission. */
+	wait_queue_head_t extfuse_wbcache_waitq;
 
 	/* maximum file name length */
 	u32 name_max;
@@ -1798,6 +1813,8 @@ struct fuse_wbcache_io *fuse_wbcache_passthrough_prepare(struct fuse_req *req);
 ssize_t fuse_wbcache_passthrough_execute(struct fuse_req *req,
 					 struct fuse_wbcache_io *io);
 void fuse_wbcache_passthrough_finish(struct fuse_wbcache_io *io);
+ssize_t fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
+						bool *lower_started);
 #else
 static inline int fuse_wbcache_passthrough_open(struct file *file,
 						int backing_id)
@@ -1825,6 +1842,14 @@ fuse_wbcache_passthrough_execute(struct fuse_req *req,
 static inline void
 fuse_wbcache_passthrough_finish(struct fuse_wbcache_io *io)
 {
+}
+
+static inline ssize_t
+fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
+					bool *lower_started)
+{
+	*lower_started = false;
+	return -EOPNOTSUPP;
 }
 #endif
 
