@@ -134,6 +134,7 @@ static void fuse_request_init(struct fuse_mount *fm, struct fuse_req *req)
 {
 	INIT_LIST_HEAD(&req->list);
 	INIT_LIST_HEAD(&req->intr_entry);
+	INIT_LIST_HEAD(&req->extfuse_wbcache_stream_entry);
 	init_waitqueue_head(&req->waitq);
 	refcount_set(&req->count, 1);
 	__set_bit(FR_PENDING, &req->flags);
@@ -153,6 +154,8 @@ static struct fuse_req *fuse_request_alloc(struct fuse_mount *fm, gfp_t flags)
 static void fuse_request_free(struct fuse_req *req)
 {
 	WARN_ON(!list_empty(&req->intr_entry));
+	WARN_ON(!list_empty(&req->extfuse_wbcache_stream_entry));
+	WARN_ON(test_bit(FR_WBCACHE_STREAM, &req->flags));
 	extfuse_request_free(req);
 	kmem_cache_free(fuse_req_cachep, req);
 }
@@ -449,6 +452,181 @@ static void fuse_send_one(struct fuse_iqueue *fiq, struct fuse_req *req)
 	fiq->ops->send_req(fiq, req);
 }
 
+#define FUSE_WBCACHE_STREAM_BATCH_MAX 32
+
+#ifdef CONFIG_FUSE_PASSTHROUGH
+struct fuse_wbcache_stream_key {
+	struct fuse_file *ff;
+	loff_t start;
+	loff_t end;
+	u32 sync_class;
+	bool full_size;
+};
+
+static bool fuse_wbcache_stream_key(struct fuse_req *req,
+				    struct fuse_wbcache_stream_key *key)
+{
+	struct fuse_args *args = req->args;
+	struct fuse_conn *fc = req->fm->fc;
+	const struct fuse_write_in *in;
+	struct fuse_file *ff;
+
+	if (!READ_ONCE(fc->extfuse_wbcache_write_stream) ||
+	    READ_ONCE(fc->extfuse_coherence_epochs) ||
+	    args->opcode != FUSE_WRITE || args->in_numargs != 2 ||
+	    !args->in_pages || args->out_pages || !args->in_args[0].value ||
+	    args->in_args[0].size != sizeof(*in))
+		return false;
+
+	ff = args->extfuse_file;
+	in = args->in_args[0].value;
+	if (!ff || ff->fm != req->fm ||
+	    !(ff->open_flags & FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH) ||
+	    (ff->open_flags & (FOPEN_PASSTHROUGH | FOPEN_DIRECT_IO |
+			       FOPEN_PARALLEL_DIRECT_WRITES |
+			       FOPEN_IO_URING_ZERO_COPY |
+			       FOPEN_IO_URING_ZERO_COPY_WRITE)) ||
+	    !ff->extfuse_wbcache_file || !ff->extfuse_wbcache_fb ||
+	    args->nodeid != ff->nodeid || in->padding || in->fh != ff->fh ||
+	    !(in->write_flags & FUSE_WRITE_CACHE) || !in->size ||
+	    in->size > fc->max_write || args->in_args[1].size != in->size ||
+	    in->offset > LLONG_MAX ||
+	    in->size > (u64)LLONG_MAX - in->offset)
+		return false;
+
+	key->ff = ff;
+	key->start = in->offset;
+	key->end = in->offset + in->size;
+	key->sync_class = in->flags & (O_DSYNC | O_SYNC);
+	key->full_size = in->size == fc->max_write;
+	return true;
+}
+
+/* Called under fc->bg_lock; take the per-open stream lock second. */
+static bool fuse_wbcache_stream_queue(struct fuse_req *req)
+{
+	struct fuse_wbcache_stream_key key;
+	struct fuse_file *ff;
+	bool handled = false;
+
+	lockdep_assert_held(&req->fm->fc->bg_lock);
+	if (!fuse_wbcache_stream_key(req, &key))
+		return false;
+
+	ff = key.ff;
+	spin_lock(&ff->extfuse_wbcache_stream_lock);
+	if (!ff->extfuse_wbcache_stream_running) {
+		/*
+		 * A partial write is independent unless it terminates an active
+		 * full-size run.
+		 */
+		if (!key.full_size)
+			goto unlock;
+		WARN_ON_ONCE(!list_empty(&ff->extfuse_wbcache_stream_pending));
+		ff->extfuse_wbcache_stream_running = true;
+		ff->extfuse_wbcache_stream_accepting = true;
+		ff->extfuse_wbcache_stream_tail = key.end;
+		ff->extfuse_wbcache_stream_sync_class = key.sync_class;
+		set_bit(FR_WBCACHE_STREAM, &req->flags);
+		handled = queue_work(req->fm->fc->extfuse_wbcache_wq,
+				     &req->extfuse_wbcache_work);
+		if (WARN_ON_ONCE(!handled)) {
+			clear_bit(FR_WBCACHE_STREAM, &req->flags);
+			ff->extfuse_wbcache_stream_running = false;
+			ff->extfuse_wbcache_stream_accepting = false;
+			ff->extfuse_wbcache_stream_tail = 0;
+			ff->extfuse_wbcache_stream_sync_class = 0;
+		}
+	} else if (ff->extfuse_wbcache_stream_accepting &&
+		   ff->extfuse_wbcache_stream_tail == key.start &&
+		   ff->extfuse_wbcache_stream_sync_class == key.sync_class) {
+		WARN_ON_ONCE(!list_empty(&req->extfuse_wbcache_stream_entry));
+		list_add_tail(&req->extfuse_wbcache_stream_entry,
+			      &ff->extfuse_wbcache_stream_pending);
+		ff->extfuse_wbcache_stream_tail = key.end;
+		/* Exactly one contiguous partial write may terminate the run. */
+		if (!key.full_size)
+			ff->extfuse_wbcache_stream_accepting = false;
+		set_bit(FR_WBCACHE_STREAM, &req->flags);
+		handled = true;
+	} else {
+		/* A discontinuity closes this run; keep the request independent. */
+		ff->extfuse_wbcache_stream_accepting = false;
+	}
+unlock:
+	spin_unlock(&ff->extfuse_wbcache_stream_lock);
+
+	return handled;
+}
+
+static struct fuse_req *fuse_wbcache_stream_next(struct fuse_req *req,
+						 bool keep_accepting)
+{
+	struct fuse_file *ff;
+	struct fuse_req *next = NULL;
+
+	if (!test_and_clear_bit(FR_WBCACHE_STREAM, &req->flags))
+		return NULL;
+	ff = req->args->extfuse_file;
+	if (WARN_ON_ONCE(!ff))
+		return NULL;
+
+	spin_lock(&ff->extfuse_wbcache_stream_lock);
+	WARN_ON_ONCE(!ff->extfuse_wbcache_stream_running);
+	if (!keep_accepting)
+		ff->extfuse_wbcache_stream_accepting = false;
+	if (!list_empty(&ff->extfuse_wbcache_stream_pending)) {
+		next = list_first_entry(&ff->extfuse_wbcache_stream_pending,
+					struct fuse_req,
+					extfuse_wbcache_stream_entry);
+		list_del_init(&next->extfuse_wbcache_stream_entry);
+	} else {
+		ff->extfuse_wbcache_stream_running = false;
+		ff->extfuse_wbcache_stream_accepting = false;
+		ff->extfuse_wbcache_stream_tail = 0;
+		ff->extfuse_wbcache_stream_sync_class = 0;
+	}
+	spin_unlock(&ff->extfuse_wbcache_stream_lock);
+
+	return next;
+}
+
+static void fuse_wbcache_stream_close(struct fuse_req *req)
+{
+	struct fuse_file *ff;
+
+	if (!test_bit(FR_WBCACHE_STREAM, &req->flags))
+		return;
+	ff = req->args->extfuse_file;
+	if (WARN_ON_ONCE(!ff))
+		return;
+
+	spin_lock(&ff->extfuse_wbcache_stream_lock);
+	WARN_ON_ONCE(!ff->extfuse_wbcache_stream_running);
+	ff->extfuse_wbcache_stream_accepting = false;
+	spin_unlock(&ff->extfuse_wbcache_stream_lock);
+}
+#else
+static bool fuse_wbcache_stream_queue(struct fuse_req *req)
+{
+	(void)req;
+	return false;
+}
+
+static struct fuse_req *fuse_wbcache_stream_next(struct fuse_req *req,
+						 bool keep_accepting)
+{
+	(void)req;
+	(void)keep_accepting;
+	return NULL;
+}
+
+static void fuse_wbcache_stream_close(struct fuse_req *req)
+{
+	(void)req;
+}
+#endif
+
 void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
 		       u64 nodeid, u64 nlookup)
 {
@@ -476,6 +654,8 @@ void fuse_flush_bg_queue(struct fuse_conn *fc)
 		if (test_bit(FR_WBCACHE, &req->flags)) {
 			bool queued;
 
+			if (fuse_wbcache_stream_queue(req))
+				continue;
 			queued = queue_work(fc->extfuse_wbcache_wq,
 					    &req->extfuse_wbcache_work);
 			WARN_ON_ONCE(!queued);
@@ -522,11 +702,14 @@ void fuse_request_end(struct fuse_req *req)
 	struct fuse_mount *fm = req->fm;
 	struct fuse_conn *fc = fm->fc;
 	struct fuse_iqueue *fiq = &fc->iq;
+	struct fuse_req *stream_next = NULL;
 	FUSE_CPU_SCOPE(fc);
 
 	if (test_and_set_bit(FR_FINISHED, &req->flags))
 		goto put_request;
 
+	/* A daemon fallback releases its ordered stream only after this reply. */
+	stream_next = fuse_wbcache_stream_next(req, false);
 	extfuse_request_complete(req);
 	trace_fuse_request_end(req);
 	/*
@@ -553,6 +736,9 @@ void fuse_request_end(struct fuse_req *req)
 
 	if (test_bit(FR_ASYNC, &req->flags))
 		req->args->end(fm, req->args, req->out.h.error);
+	if (stream_next)
+		WARN_ON_ONCE(!queue_work(fc->extfuse_wbcache_wq,
+					 &stream_next->extfuse_wbcache_work));
 put_request:
 	fuse_put_request(req);
 }
@@ -888,23 +1074,25 @@ static int fuse_request_queue_background(struct fuse_req *req)
 
 static void fuse_request_end_unqueued(struct fuse_req *req, int error)
 {
+	struct fuse_req *stream_next;
+
+	stream_next = fuse_wbcache_stream_next(req, false);
 	clear_bit(FR_PENDING, &req->flags);
 	req->out.h.error = error;
 	extfuse_request_cancel(req, error);
 	if (test_bit(FR_ASYNC, &req->flags))
 		req->args->end(req->fm, req->args, error);
+	if (stream_next)
+		WARN_ON_ONCE(!queue_work(req->fm->fc->extfuse_wbcache_wq,
+					 &stream_next->extfuse_wbcache_work));
 	fuse_put_request(req);
 }
 
-static void fuse_wbcache_background_work(struct work_struct *work)
+static void fuse_wbcache_background_complete(struct fuse_req *req, ssize_t ret,
+					     bool lower_started)
 {
-	struct fuse_req *req = container_of(work, struct fuse_req,
-					    extfuse_wbcache_work);
 	struct fuse_conn *fc = req->fm->fc;
-	bool lower_started;
-	ssize_t ret;
 
-	ret = fuse_wbcache_request_execute(req, GFP_KERNEL, &lower_started);
 	if (!lower_started) {
 		ret = extfuse_request_prepare_daemon(req, GFP_KERNEL);
 		if (ret) {
@@ -932,6 +1120,44 @@ static void fuse_wbcache_background_work(struct work_struct *work)
 	req->out.h.error = ret < 0 ? ret : 0;
 	clear_bit(FR_PENDING, &req->flags);
 	fuse_request_end(req);
+}
+
+static void fuse_wbcache_background_work(struct work_struct *work)
+{
+	struct fuse_req *req = container_of(work, struct fuse_req,
+					    extfuse_wbcache_work);
+	unsigned int processed = 0;
+
+	for (;;) {
+		struct fuse_req *next;
+		bool lower_started;
+		ssize_t ret;
+
+		ret = fuse_wbcache_request_execute(req, GFP_KERNEL,
+						    &lower_started);
+		if (!lower_started) {
+			/* Preserve this run across its ordered daemon fallback. */
+			fuse_wbcache_stream_close(req);
+			fuse_wbcache_background_complete(req, ret, false);
+			return;
+		}
+		/* Select a successor while this request still pins its fuse_file. */
+		next = fuse_wbcache_stream_next(req, true);
+		fuse_wbcache_background_complete(req, ret, true);
+		processed++;
+		if (!next)
+			return;
+		if (processed == FUSE_WBCACHE_STREAM_BATCH_MAX) {
+			bool queued;
+
+			queued = queue_work(next->fm->fc->extfuse_wbcache_wq,
+					    &next->extfuse_wbcache_work);
+			WARN_ON_ONCE(!queued);
+			/* false means that this work is already pending. */
+			return;
+		}
+		req = next;
+	}
 }
 
 static int fuse_request_queue_wbcache(struct fuse_req *req)
@@ -986,11 +1212,11 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 
 	fuse_args_to_req(req, args);
 	/*
-	 * Paper-like C1/C2 WRITE still needs the ordinary ExtFUSE hook before
-	 * its daemon data path: the hook stales cached attributes and removes a
-	 * positive security.capability entry.  A forced request cannot be
-	 * completed by BPF, so it continues to the daemon after those side
-	 * effects.  Keep C0 on the original path by requiring a loaded program.
+	 * Paper-like C1/C2 WRITE still needs the ordinary ExtFUSE hook before its
+	 * daemon data path: the hook stales cached attributes and removes a positive
+	 * security.capability entry.  A forced request cannot be completed by BPF,
+	 * so it continues to the daemon after those side effects.  Keep C0 and
+	 * background READ on the original path by requiring a loaded program.
 	 */
 	if (READ_ONCE(fm->fc->extfuse_wbcache_passthrough) ||
 	    (args->opcode == FUSE_WRITE &&

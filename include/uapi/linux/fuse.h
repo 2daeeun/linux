@@ -252,6 +252,9 @@
  *  - add FUSE_HAS_IO_URING_BUFPOOL
  *  - add FUSE_IO_URING_CMD_ADD_QUEUE and FUSE_IO_URING_CMD_ADD_BUFPOOL
  *  - add io-uring registered buffer pools and zero-copy request payloads
+ *  - add FUSE_EXTFUSE_READ_UPCALL_ONLY
+ *  - add FUSE_EXTFUSE_WBCACHE_WRITE_STREAM
+ *  - add FOPEN_IO_URING_ZERO_COPY_WRITE
  */
 
 #ifndef _LINUX_FUSE_H
@@ -400,6 +403,9 @@ struct fuse_file_lock {
  *			 registered lower file
  * FOPEN_IO_URING_ZERO_COPY: use io-uring registered request pages for this
  *			 open file; valid only with negotiated io-uring buffer pools
+ * FOPEN_IO_URING_ZERO_COPY_WRITE: use io-uring registered request pages for
+ *			 WRITE only; mutually exclusive with
+ *			 FOPEN_IO_URING_ZERO_COPY
  */
 #define FOPEN_DIRECT_IO		(1 << 0)
 #define FOPEN_KEEP_CACHE	(1 << 1)
@@ -411,6 +417,7 @@ struct fuse_file_lock {
 #define FOPEN_PASSTHROUGH	(1 << 7)
 #define FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH	(1 << 8)
 #define FOPEN_IO_URING_ZERO_COPY	(1 << 9)
+#define FOPEN_IO_URING_ZERO_COPY_WRITE	(1 << 10)
 
 /**
  * INIT request/reply flags
@@ -498,6 +505,16 @@ struct fuse_file_lock {
  *			 policy rather than being a forwarding prerequisite
  * FUSE_HAS_IO_URING_BUFPOOL: kernel supports io-uring buffer pools and
  *			 per-request registered page payloads
+ * FUSE_EXTFUSE_READ_UPCALL_ONLY: synchronous FUSE_READ has no BPF completion
+ *			 or forwarding policy and may go directly to the daemon;
+ *			 background readahead keeps the ordinary ExtFUSE path; requires
+ *			 FS_EXTFUSE and is incompatible with ExtFUSE WBCache
+ *			 passthrough and coherence epochs
+ * FUSE_EXTFUSE_WBCACHE_WRITE_STREAM: execute a per-open contiguous max_write
+ *			 FUSE_WRITE_CACHE run in bounded batches, permitting one
+ *			 terminal contiguous partial write; requires FS_EXTFUSE,
+ *			 writeback cache and ExtFUSE WBCache passthrough, and is
+ *			 incompatible with coherence epochs
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -555,6 +572,8 @@ struct fuse_file_lock {
 #define FUSE_HAS_NOTIFY_INVAL_XATTR (1ULL << 50)
 #define FUSE_EXTFUSE_WBCACHE_PASSTHROUGH (1ULL << 51)
 #define FUSE_HAS_IO_URING_BUFPOOL (1ULL << 52)
+#define FUSE_EXTFUSE_READ_UPCALL_ONLY (1ULL << 53)
+#define FUSE_EXTFUSE_WBCACHE_WRITE_STREAM (1ULL << 54)
 
 /**
  * CUSE INIT request/reply flags

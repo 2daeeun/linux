@@ -73,6 +73,10 @@ struct fuse_file *fuse_file_alloc(struct fuse_mount *fm, bool release)
 	}
 
 	INIT_LIST_HEAD(&ff->write_entry);
+#ifdef CONFIG_FUSE_PASSTHROUGH
+	spin_lock_init(&ff->extfuse_wbcache_stream_lock);
+	INIT_LIST_HEAD(&ff->extfuse_wbcache_stream_pending);
+#endif
 	refcount_set(&ff->count, 1);
 	RB_CLEAR_NODE(&ff->polled_node);
 	init_waitqueue_head(&ff->poll_wait);
@@ -82,8 +86,19 @@ struct fuse_file *fuse_file_alloc(struct fuse_mount *fm, bool release)
 	return ff;
 }
 
+static void fuse_file_wbcache_stream_assert_empty(struct fuse_file *ff)
+{
+#ifdef CONFIG_FUSE_PASSTHROUGH
+	WARN_ON_ONCE(ff->extfuse_wbcache_stream_running);
+	WARN_ON_ONCE(!list_empty(&ff->extfuse_wbcache_stream_pending));
+#else
+	(void)ff;
+#endif
+}
+
 void fuse_file_free(struct fuse_file *ff)
 {
+	fuse_file_wbcache_stream_assert_empty(ff);
 	kfree(ff->args);
 	kfree(ff);
 }
@@ -131,6 +146,7 @@ static void fuse_file_put(struct fuse_file *ff, bool sync)
 						   GFP_KERNEL | __GFP_NOFAIL))
 				fuse_release_end(ff->fm, args, -ENOTCONN);
 		}
+		fuse_file_wbcache_stream_assert_empty(ff);
 		kfree(ff);
 	}
 }
@@ -1198,7 +1214,8 @@ static void fuse_write_args_fill(struct fuse_io_args *ia, struct fuse_file *ff,
 	args->out_args[0].value = &ia->write.out;
 	args->zero_copy =
 		READ_ONCE(ff->fm->fc->io_uring_bufpool) &&
-		(ff->open_flags & FOPEN_IO_URING_ZERO_COPY);
+		(ff->open_flags & (FOPEN_IO_URING_ZERO_COPY |
+				   FOPEN_IO_URING_ZERO_COPY_WRITE));
 }
 
 static unsigned int fuse_write_flags(struct kiocb *iocb)

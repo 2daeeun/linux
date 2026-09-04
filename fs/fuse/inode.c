@@ -70,7 +70,7 @@ MODULE_PARM_DESC(max_user_congthresh,
  * two locally rebuilt fuse.ko instances with the same EXTRAVERSION.
  */
 #define FUSE_EXTFUSE_RUNTIME_CONTRACT \
-	"extfuse-paper-bg-admission-stream-uring-20260903"
+	"extfuse-paper-read-upcall-fixed-write-stream-20260904"
 static char extfuse_runtime_contract[] = FUSE_EXTFUSE_RUNTIME_CONTRACT;
 module_param_string(extfuse_runtime_contract, extfuse_runtime_contract,
 		    sizeof(extfuse_runtime_contract), 0444);
@@ -1650,6 +1650,31 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 					}
 				}
 			}
+			if (flags & FUSE_EXTFUSE_READ_UPCALL_ONLY) {
+				if (arg->minor < 48 ||
+				    !IS_ENABLED(CONFIG_EXTFUSE) ||
+				    !(flags & FUSE_FS_EXTFUSE) ||
+				    (flags & (FUSE_EXTFUSE_WBCACHE_PASSTHROUGH |
+					      FUSE_EXTFUSE_COHERENCE_EPOCHS)))
+					ok = false;
+				else
+					fc->extfuse_read_upcall_only = 1;
+			}
+			if (flags & FUSE_EXTFUSE_WBCACHE_WRITE_STREAM) {
+				if (arg->minor < 48 ||
+				    !IS_ENABLED(CONFIG_EXTFUSE) ||
+				    !IS_ENABLED(CONFIG_FUSE_PASSTHROUGH) ||
+				    !(flags & FUSE_FS_EXTFUSE) ||
+				    !(flags & FUSE_WRITEBACK_CACHE) ||
+				    !fc->writeback_cache ||
+				    !(flags & FUSE_EXTFUSE_WBCACHE_PASSTHROUGH) ||
+				    !fc->extfuse_wbcache_passthrough ||
+				    (flags & FUSE_EXTFUSE_COHERENCE_EPOCHS) ||
+				    fc->extfuse_coherence_epochs)
+					ok = false;
+				else
+					fc->extfuse_wbcache_write_stream = 1;
+			}
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1675,6 +1700,8 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 			fc->extfuse_wbcache_wq = NULL;
 		}
 		fc->extfuse_wbcache_passthrough = 0;
+		fc->extfuse_read_upcall_only = 0;
+		fc->extfuse_wbcache_write_stream = 0;
 		fc->io_uring = 0;
 		fc->io_uring_bufpool = 0;
 		fc->conn_init = 0;
@@ -1715,10 +1742,12 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		if (IS_ENABLED(CONFIG_EXTFUSE))
 			flags |= FUSE_EXTFUSE_COHERENCE_EPOCHS |
 				 FUSE_MUTATION_METADATA |
-				 FUSE_HAS_NOTIFY_INVAL_XATTR;
+				 FUSE_HAS_NOTIFY_INVAL_XATTR |
+				 FUSE_EXTFUSE_READ_UPCALL_ONLY;
 		if (IS_ENABLED(CONFIG_EXTFUSE) &&
 		    IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
-			flags |= FUSE_EXTFUSE_WBCACHE_PASSTHROUGH;
+			flags |= FUSE_EXTFUSE_WBCACHE_PASSTHROUGH |
+				 FUSE_EXTFUSE_WBCACHE_WRITE_STREAM;
 		if (IS_ENABLED(CONFIG_EXTFUSE) &&
 		    IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 			flags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE |

@@ -353,6 +353,14 @@ struct fuse_file {
 	/** Per-open lower file used by cached ExtFUSE passthrough */
 	struct file *extfuse_wbcache_file;
 	struct fuse_backing *extfuse_wbcache_fb;
+
+	/** Serialize admission to the current max_write-sized lower-WRITE run */
+	spinlock_t extfuse_wbcache_stream_lock;
+	struct list_head extfuse_wbcache_stream_pending;
+	loff_t extfuse_wbcache_stream_tail;
+	u32 extfuse_wbcache_stream_sync_class;
+	bool extfuse_wbcache_stream_running:1;
+	bool extfuse_wbcache_stream_accepting:1;
 #endif
 
 	/** Has flock been performed on this file? */
@@ -483,6 +491,7 @@ struct fuse_io_priv {
  * FR_ASYNC:		request is asynchronous
  * FR_URING:		request is handled through fuse-io-uring
  * FR_WBCACHE:		request is handled by ExtFUSE lower cached-I/O forwarding
+ * FR_WBCACHE_STREAM:	request belongs to a per-open full-size WBCache WRITE run
  */
 enum fuse_req_flag {
 	FR_ISREPLY,
@@ -499,6 +508,7 @@ enum fuse_req_flag {
 	FR_ASYNC,
 	FR_URING,
 	FR_WBCACHE,
+	FR_WBCACHE_STREAM,
 };
 
 /**
@@ -528,6 +538,8 @@ struct fuse_req {
 
 	/** Executes a page-backed ExtFUSE request outside inode spinlocks. */
 	struct work_struct extfuse_wbcache_work;
+	/** Entry in a per-open full-size WBCache WRITE run. */
+	struct list_head extfuse_wbcache_stream_entry;
 
 	/** refcount */
 	refcount_t count;
@@ -996,6 +1008,12 @@ struct fuse_conn {
 
 	/** ExtFUSE forwarding below the ordinary FUSE writeback cache */
 	unsigned int extfuse_wbcache_passthrough;
+
+	/** FUSE_READ bypasses the BPF program and uses the daemon transport */
+	unsigned int extfuse_read_upcall_only;
+
+	/** Per-open max_write runs with at most one terminal partial write */
+	unsigned int extfuse_wbcache_write_stream;
 
 	/** Native passthrough ExtFUSE coherence protocol version (0, 1, or 2) */
 	unsigned int extfuse_passthrough_coherence;

@@ -594,7 +594,8 @@ static bool extfuse_is_wbcache_data_forward(const struct fuse_req *req,
 	     (FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH | FOPEN_PASSTHROUGH)) !=
 		    FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH ||
 	    (ff->open_flags & (FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES |
-			       FOPEN_IO_URING_ZERO_COPY)) ||
+			       FOPEN_IO_URING_ZERO_COPY |
+			       FOPEN_IO_URING_ZERO_COPY_WRITE)) ||
 	    ff->nodeid != args->nodeid || !args->extfuse_inode ||
 	    get_fuse_conn(args->extfuse_inode) != fc || args->is_ext ||
 	    !state->mutation || state->begun || state->optional_out ||
@@ -653,7 +654,8 @@ static bool extfuse_is_paper_wbcache_request(const struct fuse_req *req)
 	     (FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH | FOPEN_PASSTHROUGH)) !=
 		    FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH ||
 	    (ff->open_flags & (FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES |
-			       FOPEN_IO_URING_ZERO_COPY)) ||
+			       FOPEN_IO_URING_ZERO_COPY |
+			       FOPEN_IO_URING_ZERO_COPY_WRITE)) ||
 	    ff->nodeid != args->nodeid || !args->extfuse_inode ||
 	    get_fuse_conn(args->extfuse_inode) != fc || args->is_ext)
 		return false;
@@ -1532,12 +1534,17 @@ static ssize_t extfuse_request_pre_result(struct fuse_req *req, gfp_t gfp,
 }
 
 static __always_inline u32
-extfuse_request_count_action(enum extfuse_pre_route route)
+extfuse_request_count_action(const struct fuse_req *req,
+			     enum extfuse_pre_route route)
 {
 	switch (route) {
 	case EXTFUSE_PRE_COMPLETE:
 		return FUSE_REQUEST_COUNT_ACTION_EXTFUSE_COMPLETE;
 	case EXTFUSE_PRE_DAEMON:
+		if (req->args->opcode == FUSE_READ &&
+		    !test_bit(FR_BACKGROUND, &req->flags) &&
+		    READ_ONCE(req->fm->fc->extfuse_read_upcall_only))
+			return FUSE_REQUEST_COUNT_ACTION_EXTFUSE_POLICY_DAEMON;
 		return FUSE_REQUEST_COUNT_ACTION_EXTFUSE_DAEMON;
 	case EXTFUSE_PRE_WBCACHE_FORWARD:
 		return FUSE_REQUEST_COUNT_ACTION_EXTFUSE_WBCACHE;
@@ -1552,7 +1559,7 @@ static __always_inline void
 extfuse_trace_count_decision(const struct fuse_req *req,
 			     enum extfuse_pre_route route, ssize_t result)
 {
-	u32 action = extfuse_request_count_action(route);
+	u32 action = extfuse_request_count_action(req, route);
 
 	if (!action)
 		return;
@@ -1570,7 +1577,7 @@ static void extfuse_trace_request_detail(const struct fuse_req *req,
 	const char *name = "";
 	s64 payload_size = -1;
 	u64 request_size = 0;
-	u32 action = extfuse_request_count_action(route);
+	u32 action = extfuse_request_count_action(req, route);
 	u32 name_len = 0;
 
 	if (!action)
@@ -1617,7 +1624,12 @@ enum extfuse_pre_route extfuse_request_pre(struct fuse_req *req, gfp_t gfp,
 	enum extfuse_pre_route route;
 	bool passthru = false;
 
-	*result = extfuse_request_pre_result(req, gfp, &passthru);
+	if (READ_ONCE(req->fm->fc->extfuse_read_upcall_only) &&
+	    req->args->opcode == FUSE_READ &&
+	    !test_bit(FR_BACKGROUND, &req->flags))
+		*result = -ENOSYS;
+	else
+		*result = extfuse_request_pre_result(req, gfp, &passthru);
 	if (passthru)
 		route = EXTFUSE_PRE_WBCACHE_FORWARD;
 	else if (*result == -ENOSYS)

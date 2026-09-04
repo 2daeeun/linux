@@ -402,6 +402,8 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
 	struct fuse_file *ff = file->private_data;
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	u32 zero_copy_flags = ff->open_flags &
+		(FOPEN_IO_URING_ZERO_COPY | FOPEN_IO_URING_ZERO_COPY_WRITE);
 	int err = -EINVAL;
 
 	/*
@@ -417,11 +419,13 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
 	if ((ff->open_flags & FOPEN_PASSTHROUGH) &&
 	    (ff->open_flags & FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH))
 		goto fail;
-	if (ff->open_flags & FOPEN_IO_URING_ZERO_COPY) {
+	if (zero_copy_flags) {
 		/* Zero-copy is a C2 transport, never a passthrough file mode. */
 		if (!S_ISREG(inode->i_mode) || !READ_ONCE(fc->io_uring) ||
 		    !READ_ONCE(fc->io_uring_bufpool) ||
 		    !fuse_uring_zero_copy_ready(fc) ||
+		    zero_copy_flags == (FOPEN_IO_URING_ZERO_COPY |
+					FOPEN_IO_URING_ZERO_COPY_WRITE) ||
 		    (ff->open_flags & (FOPEN_PASSTHROUGH |
 				       FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH)))
 			goto fail;
