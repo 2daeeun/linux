@@ -1531,19 +1531,108 @@ static ssize_t extfuse_request_pre_result(struct fuse_req *req, gfp_t gfp,
 	return ret;
 }
 
+static __always_inline u32
+extfuse_request_count_action(enum extfuse_pre_route route)
+{
+	switch (route) {
+	case EXTFUSE_PRE_COMPLETE:
+		return FUSE_REQUEST_COUNT_ACTION_EXTFUSE_COMPLETE;
+	case EXTFUSE_PRE_DAEMON:
+		return FUSE_REQUEST_COUNT_ACTION_EXTFUSE_DAEMON;
+	case EXTFUSE_PRE_WBCACHE_FORWARD:
+		return FUSE_REQUEST_COUNT_ACTION_EXTFUSE_WBCACHE;
+	case EXTFUSE_PRE_ERROR:
+		return FUSE_REQUEST_COUNT_ACTION_EXTFUSE_ERROR;
+	default:
+		return 0;
+	}
+}
+
+static __always_inline void
+extfuse_trace_count_decision(const struct fuse_req *req,
+			     enum extfuse_pre_route route, ssize_t result)
+{
+	u32 action = extfuse_request_count_action(route);
+
+	if (!action)
+		return;
+	trace_fuse_request_count(req->fm->fc->dev, req->in.h.opcode,
+				 FUSE_REQUEST_COUNT_STAGE_EXTFUSE_DECISION,
+				 action, fuse_request_count_result_class(result));
+}
+
+static void extfuse_trace_request_detail(const struct fuse_req *req,
+					 enum extfuse_pre_route route,
+					 ssize_t result)
+{
+	const struct fuse_args *args = req->args;
+	const struct fuse_getxattr_in *in;
+	const char *name = "";
+	s64 payload_size = -1;
+	u64 request_size = 0;
+	u32 action = extfuse_request_count_action(route);
+	u32 name_len = 0;
+
+	if (!action)
+		return;
+
+	if (args->opcode == FUSE_GETXATTR && args->in_numargs == 2 &&
+	    args->in_args[0].value &&
+	    args->in_args[0].size == sizeof(*in) &&
+	    args->in_args[1].value && args->in_args[1].size) {
+		in = args->in_args[0].value;
+		request_size = in->size;
+		name = args->in_args[1].value;
+		name_len = strnlen(name, args->in_args[1].size);
+		if (name_len == args->in_args[1].size) {
+			name = "";
+			name_len = 0;
+		}
+
+		if (result > 0) {
+			payload_size = result;
+		} else if (!result) {
+			payload_size = 0;
+			if (!request_size && args->out_numargs &&
+			    args->out_args[0].value &&
+			    args->out_args[0].size >=
+				    sizeof(struct fuse_getxattr_out))
+				payload_size = ((const struct fuse_getxattr_out *)
+					args->out_args[0].value)->size;
+		} else if (result == -ENODATA) {
+			payload_size = 0;
+		}
+	}
+
+	trace_fuse_request_detail(req->fm->fc->dev, req->in.h.unique,
+				  req->in.h.opcode, req->in.h.nodeid,
+				  FUSE_REQUEST_COUNT_STAGE_EXTFUSE_DECISION,
+				  action, fuse_request_count_result_class(result),
+				  result, request_size, payload_size, name, name_len);
+}
+
 enum extfuse_pre_route extfuse_request_pre(struct fuse_req *req, gfp_t gfp,
 					   ssize_t *result)
 {
+	enum extfuse_pre_route route;
 	bool passthru = false;
 
 	*result = extfuse_request_pre_result(req, gfp, &passthru);
 	if (passthru)
-		return EXTFUSE_PRE_WBCACHE_FORWARD;
-	if (*result == -ENOSYS)
-		return EXTFUSE_PRE_DAEMON;
-	if (*result < 0)
-		return EXTFUSE_PRE_ERROR;
-	return EXTFUSE_PRE_COMPLETE;
+		route = EXTFUSE_PRE_WBCACHE_FORWARD;
+	else if (*result == -ENOSYS)
+		route = EXTFUSE_PRE_DAEMON;
+	else if (*result < 0)
+		route = EXTFUSE_PRE_ERROR;
+	else
+		route = EXTFUSE_PRE_COMPLETE;
+	if (trace_fuse_request_count_enabled()) {
+		extfuse_trace_count_decision(req, route, *result);
+		if (req->args->opcode == FUSE_GETXATTR &&
+		    trace_fuse_request_detail_enabled())
+			extfuse_trace_request_detail(req, route, *result);
+	}
+	return route;
 }
 EXPORT_SYMBOL_GPL(extfuse_request_pre);
 
@@ -2392,6 +2481,32 @@ int extfuse_passthrough_attr_commit(struct fuse_conn *fc, u64 nodeid,
 }
 EXPORT_SYMBOL_GPL(extfuse_passthrough_attr_commit);
 
+static __always_inline void
+extfuse_trace_passthrough_count(struct fuse_conn *fc, u32 opcode, u32 action,
+				ssize_t result)
+{
+	u32 count_action;
+
+	switch (action) {
+	case EXTFUSE_TRACE_ACTION_HIT:
+		count_action = FUSE_REQUEST_COUNT_ACTION_EXTFUSE_COMPLETE;
+		break;
+	case EXTFUSE_TRACE_ACTION_FALLBACK:
+		count_action = FUSE_REQUEST_COUNT_ACTION_LOCAL_FALLBACK;
+		break;
+	case EXTFUSE_TRACE_ACTION_ERROR:
+		count_action = FUSE_REQUEST_COUNT_ACTION_EXTFUSE_ERROR;
+		break;
+	default:
+		return;
+	}
+
+	trace_fuse_request_count(fc->dev, opcode,
+				 FUSE_REQUEST_COUNT_STAGE_EXTFUSE_DECISION,
+				 count_action,
+				 fuse_request_count_result_class(result));
+}
+
 /* Run only the generation-map policy hook; kernel epoch ownership stays local. */
 static int extfuse_passthrough_bpf_notify(struct fuse_conn *fc,
 					  struct inode *inode, u64 nodeid,
@@ -2457,11 +2572,17 @@ static int extfuse_passthrough_bpf_notify(struct fuse_conn *fc,
 	 * session-lifetime BEGIN only, and a failed BEGIN must remain observable.
 	 */
 	if (phase == EXTFUSE_PASSTHROUGH_PHASE_END || ret < 0 ||
-	    opcode == EXTFUSE_PASSTHROUGH_MMAP)
+	    opcode == EXTFUSE_PASSTHROUGH_MMAP) {
+		ssize_t trace_result = ret < 0 ? ret : 0;
+
+		if (trace_fuse_request_count_enabled())
+			extfuse_trace_passthrough_count(fc, opcode, action,
+						  trace_result);
 		extfuse_trace_fc(fc, 0, opcode, nodeid,
 				 EXTFUSE_TRACE_PHASE_PRE, action, reason,
-				 ret < 0 ? ret : 0,
+				 trace_result,
 				 dependencies);
+	}
 	if (ret >= 0)
 		return ret;
 

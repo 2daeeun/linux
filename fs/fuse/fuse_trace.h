@@ -72,6 +72,80 @@
 
 OPCODES
 
+/*
+ * Stable request-count trace ABI.  Keep these numeric values append-only:
+ * experiment consumers use this event instead of FUSE implementation
+ * functions or private request state.  EXTFUSE_DECISION is emitted once after
+ * routing; a WBCACHE action is followed by exactly one WBCACHE_TERMINAL.
+ * WBCACHE_COMPLETE means that the lower path owns the result and the request
+ * must not be replayed through the daemon, even when that result is an error.
+ * DAEMON_DELIVERY is emitted only after a classic copy or io_uring userspace
+ * publication succeeds; it does not claim that a userspace handler ran.
+ * REQUEST_QUEUE records the pre-delivery queue boundary so cancellations and
+ * delivery gaps remain diagnostic; DAEMON_DELIVERY is the canonical userspace
+ * request count.  Both use this event's single histogram gate.
+ * semantic_key packs version/stage/action/result_class into successive bytes
+ * from most to least significant.  Keep the high-rate count event limited to
+ * the four fields needed by an aggregate consumer.  Optional request detail,
+ * including request identity, exact results and GETXATTR names, uses a
+ * separately gated event.
+ */
+#ifndef FUSE_REQUEST_COUNT_ABI_VERSION
+#define FUSE_REQUEST_COUNT_ABI_VERSION			2
+
+#define FUSE_REQUEST_COUNT_STAGE_EXTFUSE_DECISION	1
+#define FUSE_REQUEST_COUNT_STAGE_WBCACHE_TERMINAL	2
+/* Stage 3 stays unused: per-command transport counting is intentionally off. */
+#define FUSE_REQUEST_COUNT_STAGE_DAEMON_DELIVERY	4
+#define FUSE_REQUEST_COUNT_STAGE_REQUEST_QUEUE		5
+
+#define FUSE_REQUEST_COUNT_ACTION_EXTFUSE_COMPLETE	1
+#define FUSE_REQUEST_COUNT_ACTION_EXTFUSE_DAEMON		2
+#define FUSE_REQUEST_COUNT_ACTION_EXTFUSE_WBCACHE	3
+#define FUSE_REQUEST_COUNT_ACTION_EXTFUSE_ERROR		4
+#define FUSE_REQUEST_COUNT_ACTION_WBCACHE_COMPLETE	5
+#define FUSE_REQUEST_COUNT_ACTION_WBCACHE_FALLBACK	6
+#define FUSE_REQUEST_COUNT_ACTION_WBCACHE_CANCEL		7
+/* Action 8 is reserved with the unused per-command transport stage. */
+#define FUSE_REQUEST_COUNT_ACTION_LOCAL_FALLBACK	9
+#define FUSE_REQUEST_COUNT_ACTION_DAEMON_CLASSIC	10
+#define FUSE_REQUEST_COUNT_ACTION_DAEMON_URING		11
+#define FUSE_REQUEST_COUNT_ACTION_REQUEST_QUEUE		12
+
+#define FUSE_REQUEST_COUNT_RESULT_NONE		0
+#define FUSE_REQUEST_COUNT_RESULT_ZERO		1
+#define FUSE_REQUEST_COUNT_RESULT_POSITIVE	2
+#define FUSE_REQUEST_COUNT_RESULT_ENOSYS		3
+#define FUSE_REQUEST_COUNT_RESULT_ENODATA	4
+#define FUSE_REQUEST_COUNT_RESULT_ERANGE		5
+#define FUSE_REQUEST_COUNT_RESULT_OTHER_ERROR	6
+
+/*
+ * tracefs histograms accept at most TRACING_MAP_KEYS_MAX fields (currently
+ * three).  Pack the versioned event semantics into one append-only key so a
+ * consumer can aggregate on (opcode, semantic_key) without losing validation
+ * information.  Each component is an unsigned byte; zero remains reserved.
+ */
+#define FUSE_REQUEST_COUNT_SEMANTIC_KEY(stage, action, result_class) \
+	(((u32)FUSE_REQUEST_COUNT_ABI_VERSION << 24) | \
+	 ((u32)(stage) << 16) | ((u32)(action) << 8) | (u32)(result_class))
+
+static __always_inline u32 fuse_request_count_result_class(s64 result)
+{
+	if (!result)
+		return FUSE_REQUEST_COUNT_RESULT_ZERO;
+	if (result > 0)
+		return FUSE_REQUEST_COUNT_RESULT_POSITIVE;
+	if (result == -ENOSYS)
+		return FUSE_REQUEST_COUNT_RESULT_ENOSYS;
+	if (result == -ENODATA)
+		return FUSE_REQUEST_COUNT_RESULT_ENODATA;
+	if (result == -ERANGE)
+		return FUSE_REQUEST_COUNT_RESULT_ERANGE;
+	return FUSE_REQUEST_COUNT_RESULT_OTHER_ERROR;
+}
+#endif
+
 /* Now we redfine it with the table that __print_symbolic needs. */
 #undef EM
 #undef EMe
@@ -88,6 +162,8 @@ TRACE_EVENT(fuse_request_send,
 		__field(uint64_t,		unique)
 		__field(enum fuse_opcode,	opcode)
 		__field(uint32_t,		len)
+		__field(uint64_t,		nodeid)
+		__field(uint32_t,		header_pid)
 	),
 
 	TP_fast_assign(
@@ -95,11 +171,14 @@ TRACE_EVENT(fuse_request_send,
 		__entry->unique		=	req->in.h.unique;
 		__entry->opcode		=	req->in.h.opcode;
 		__entry->len		=	req->in.h.len;
+		__entry->nodeid		=	req->in.h.nodeid;
+		__entry->header_pid	=	req->in.h.pid;
 	),
 
-	TP_printk("connection %u req %llu opcode %u (%s) len %u ",
+	TP_printk("connection %u req %llu opcode %u (%s) len %u nodeid %llu header_pid %u",
 		  __entry->connection, __entry->unique, __entry->opcode,
-		  __print_symbolic(__entry->opcode, OPCODES), __entry->len)
+		  __print_symbolic(__entry->opcode, OPCODES), __entry->len,
+		  __entry->nodeid, __entry->header_pid)
 );
 
 TRACE_EVENT(fuse_request_end,
@@ -161,6 +240,83 @@ TRACE_EVENT(fuse_extfuse_coherence,
 		  __entry->connection, __entry->unique, __entry->opcode,
 		  __entry->nodeid, __entry->phase, __entry->action,
 		  __entry->reason, __entry->error, __entry->dependencies)
+);
+
+TRACE_EVENT(fuse_request_count,
+	TP_PROTO(dev_t connection, u32 opcode, u32 stage, u32 action,
+		 u32 result_class),
+
+	TP_ARGS(connection, opcode, stage, action, result_class),
+
+	TP_STRUCT__entry(
+		__field(u32,	version)
+		__field(u32,	semantic_key)
+		__field(dev_t,	connection)
+		__field(u32,	opcode)
+	),
+
+	TP_fast_assign(
+		__entry->version = FUSE_REQUEST_COUNT_ABI_VERSION;
+		__entry->semantic_key = FUSE_REQUEST_COUNT_SEMANTIC_KEY(
+			stage, action, result_class);
+		__entry->connection = connection;
+		__entry->opcode = opcode;
+	),
+
+	TP_printk("version %u semantic_key %#x connection %u opcode %u",
+		  __entry->version, __entry->semantic_key,
+		  __entry->connection, __entry->opcode)
+);
+
+TRACE_EVENT(fuse_request_detail,
+	TP_PROTO(dev_t connection, u64 unique, u32 opcode, u64 nodeid,
+		 u32 stage, u32 action, u32 result_class, s64 result,
+		 u64 request_size, s64 payload_size, const char *name,
+		 u32 name_len),
+
+	TP_ARGS(connection, unique, opcode, nodeid, stage, action, result_class,
+		result, request_size, payload_size, name, name_len),
+
+	TP_STRUCT__entry(
+		__field(u32,	version)
+		__field(u32,	semantic_key)
+		__field(dev_t,	connection)
+		__field(u64,	unique)
+		__field(u32,	opcode)
+		__field(u64,	nodeid)
+		__field(u32,	stage)
+		__field(u32,	action)
+		__field(u32,	result_class)
+		__field(s64,	result)
+		__field(u64,	request_size)
+		__field(s64,	payload_size)
+		__string_len(name, name, name_len)
+	),
+
+	TP_fast_assign(
+		__entry->version = FUSE_REQUEST_COUNT_ABI_VERSION;
+		__entry->semantic_key = FUSE_REQUEST_COUNT_SEMANTIC_KEY(
+			stage, action, result_class);
+		__entry->connection = connection;
+		__entry->unique = unique;
+		__entry->opcode = opcode;
+		__entry->nodeid = nodeid;
+		__entry->stage = stage;
+		__entry->action = action;
+		__entry->result_class = result_class;
+		__entry->result = result;
+		__entry->request_size = request_size;
+		__entry->payload_size = payload_size;
+		__assign_str(name);
+	),
+
+	TP_printk("version %u semantic_key %#x connection %u unique %llu opcode %u nodeid %llu stage %u action %u result_class %u result %lld request_size %llu payload_size %lld name \"%s\"",
+		  __entry->version, __entry->semantic_key,
+		  __entry->connection, __entry->unique,
+		  __entry->opcode, __entry->nodeid, __entry->stage,
+		  __entry->action, __entry->result_class, __entry->result,
+		  __entry->request_size, __entry->payload_size,
+		  __get_str(name))
 );
 
 /*

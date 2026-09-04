@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "fuse_trace.h"
 #include "fuse_cpu_scope.h"
 #include "fuse_dev_i.h"
 #include "extfuse_i.h"
@@ -75,6 +76,11 @@ module_param_string(extfuse_runtime_contract, extfuse_runtime_contract,
 		    sizeof(extfuse_runtime_contract), 0444);
 MODULE_PARM_DESC(extfuse_runtime_contract,
 		 "Read-only identity of the ExtFUSE runtime semantics");
+
+static unsigned int request_trace_abi = FUSE_REQUEST_COUNT_ABI_VERSION;
+module_param(request_trace_abi, uint, 0444);
+MODULE_PARM_DESC(request_trace_abi,
+		 "Read-only FUSE request-count trace ABI version");
 
 #define FUSE_DEFAULT_BLKSIZE 512
 

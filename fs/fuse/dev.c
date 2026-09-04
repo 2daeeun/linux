@@ -376,6 +376,15 @@ void fuse_dev_queue_interrupt(struct fuse_iqueue *fiq, struct fuse_req *req)
 	}
 }
 
+static __always_inline void fuse_trace_request_queue(dev_t connection,
+					     u32 opcode)
+{
+	trace_fuse_request_count(connection, opcode,
+			FUSE_REQUEST_COUNT_STAGE_REQUEST_QUEUE,
+			FUSE_REQUEST_COUNT_ACTION_REQUEST_QUEUE,
+			FUSE_REQUEST_COUNT_RESULT_NONE);
+}
+
 static inline void fuse_request_assign_unique_locked(struct fuse_iqueue *fiq,
 						     struct fuse_req *req)
 {
@@ -394,16 +403,29 @@ inline void fuse_request_assign_unique(struct fuse_iqueue *fiq,
 
 	/* tracepoint captures in.h.unique and in.h.len */
 	trace_fuse_request_send(req);
+	fuse_trace_request_queue(req->fm->fc->dev, req->in.h.opcode);
 }
 EXPORT_SYMBOL_GPL(fuse_request_assign_unique);
 
 static void fuse_dev_queue_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 {
+	dev_t trace_connection;
+	u32 trace_opcode;
+	bool trace_queue;
+
 	spin_lock(&fiq->lock);
 	if (fiq->connected) {
 		fuse_request_assign_unique_locked(fiq, req);
 		list_add_tail(&req->list, &fiq->pending);
+		trace_queue = trace_fuse_request_count_enabled();
+		if (trace_queue) {
+			trace_connection = req->fm->fc->dev;
+			trace_opcode = req->in.h.opcode;
+		}
 		fuse_dev_wake_and_unlock(fiq);
+		/* Keep active histogram aggregation out of the queue lock. */
+		if (trace_queue)
+			fuse_trace_request_queue(trace_connection, trace_opcode);
 	} else {
 		spin_unlock(&fiq->lock);
 		req->out.h.error = -ENOTCONN;
@@ -687,8 +709,8 @@ static void fuse_args_to_req(struct fuse_req *req, struct fuse_args *args)
 		__set_bit(FR_ASYNC, &req->flags);
 }
 
-static ssize_t fuse_wbcache_request_execute(struct fuse_req *req, gfp_t gfp,
-					    bool *lower_started)
+static ssize_t __fuse_wbcache_request_execute(struct fuse_req *req, gfp_t gfp,
+					      bool *lower_started)
 {
 	struct fuse_wbcache_io *io;
 	ssize_t ret;
@@ -717,6 +739,32 @@ static ssize_t fuse_wbcache_request_execute(struct fuse_req *req, gfp_t gfp,
 		ret = fuse_wbcache_passthrough_execute(req, io);
 	extfuse_request_complete_wbcache(req, ret < 0 ? ret : 0);
 	fuse_wbcache_passthrough_finish(io);
+	return ret;
+}
+
+static __always_inline void
+fuse_trace_wbcache_terminal(const struct fuse_req *req, u32 action,
+				    ssize_t result)
+{
+	trace_fuse_request_count(req->fm->fc->dev, req->in.h.opcode,
+				 FUSE_REQUEST_COUNT_STAGE_WBCACHE_TERMINAL,
+				 action, fuse_request_count_result_class(result));
+}
+
+static __always_inline ssize_t
+fuse_wbcache_request_execute(struct fuse_req *req, gfp_t gfp,
+			     bool *lower_started)
+{
+	ssize_t ret;
+
+	ret = __fuse_wbcache_request_execute(req, gfp, lower_started);
+	if (trace_fuse_request_count_enabled()) {
+		u32 action = *lower_started ?
+			FUSE_REQUEST_COUNT_ACTION_WBCACHE_COMPLETE :
+			FUSE_REQUEST_COUNT_ACTION_WBCACHE_FALLBACK;
+
+		fuse_trace_wbcache_terminal(req, action, ret);
+	}
 	return ret;
 }
 
@@ -960,6 +1008,9 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 		if (route == EXTFUSE_PRE_WBCACHE_FORWARD) {
 			if (fuse_request_queue_wbcache(req))
 				return 0;
+			fuse_trace_wbcache_terminal(
+				req, FUSE_REQUEST_COUNT_ACTION_WBCACHE_CANCEL,
+				-ENOTCONN);
 			extfuse_request_cancel(req, -ENOTCONN);
 			fuse_put_request(req);
 			return -ENOTCONN;
@@ -1458,7 +1509,7 @@ static int request_pending(struct fuse_iqueue *fiq)
  *
  * Called with fiq->lock held, releases it
  */
-static int fuse_read_interrupt(struct fuse_iqueue *fiq,
+static int fuse_read_interrupt(struct fuse_conn *fc, struct fuse_iqueue *fiq,
 			       struct fuse_copy_state *cs,
 			       size_t nbytes, struct fuse_req *req)
 __releases(fiq->lock)
@@ -1485,7 +1536,13 @@ __releases(fiq->lock)
 		err = fuse_copy_one(cs, &arg, sizeof(arg));
 	fuse_copy_finish(cs);
 
-	return err ? err : reqsize;
+	if (err)
+		return err;
+	trace_fuse_request_count(fc->dev, ih.opcode,
+				 FUSE_REQUEST_COUNT_STAGE_DAEMON_DELIVERY,
+				 FUSE_REQUEST_COUNT_ACTION_DAEMON_CLASSIC,
+				 FUSE_REQUEST_COUNT_RESULT_NONE);
+	return reqsize;
 }
 
 static struct fuse_forget_link *fuse_dequeue_forget(struct fuse_iqueue *fiq,
@@ -1510,7 +1567,8 @@ static struct fuse_forget_link *fuse_dequeue_forget(struct fuse_iqueue *fiq,
 	return head;
 }
 
-static int fuse_read_single_forget(struct fuse_iqueue *fiq,
+static int fuse_read_single_forget(struct fuse_conn *fc,
+				   struct fuse_iqueue *fiq,
 				   struct fuse_copy_state *cs,
 				   size_t nbytes)
 __releases(fiq->lock)
@@ -1540,11 +1598,16 @@ __releases(fiq->lock)
 	if (err)
 		return err;
 
+	trace_fuse_request_count(fc->dev, ih.opcode,
+				 FUSE_REQUEST_COUNT_STAGE_DAEMON_DELIVERY,
+				 FUSE_REQUEST_COUNT_ACTION_DAEMON_CLASSIC,
+				 FUSE_REQUEST_COUNT_RESULT_NONE);
 	return ih.len;
 }
 
-static int fuse_read_batch_forget(struct fuse_iqueue *fiq,
-				   struct fuse_copy_state *cs, size_t nbytes)
+static int fuse_read_batch_forget(struct fuse_conn *fc,
+				  struct fuse_iqueue *fiq,
+				  struct fuse_copy_state *cs, size_t nbytes)
 __releases(fiq->lock)
 {
 	int err;
@@ -1589,6 +1652,10 @@ __releases(fiq->lock)
 	if (err)
 		return err;
 
+	trace_fuse_request_count(fc->dev, ih.opcode,
+				 FUSE_REQUEST_COUNT_STAGE_DAEMON_DELIVERY,
+				 FUSE_REQUEST_COUNT_ACTION_DAEMON_CLASSIC,
+				 FUSE_REQUEST_COUNT_RESULT_NONE);
 	return ih.len;
 }
 
@@ -1598,9 +1665,9 @@ static int fuse_read_forget(struct fuse_conn *fc, struct fuse_iqueue *fiq,
 __releases(fiq->lock)
 {
 	if (fc->minor < 16 || fiq->forget_list_head.next->next == NULL)
-		return fuse_read_single_forget(fiq, cs, nbytes);
+		return fuse_read_single_forget(fc, fiq, cs, nbytes);
 	else
-		return fuse_read_batch_forget(fiq, cs, nbytes);
+		return fuse_read_batch_forget(fc, fiq, cs, nbytes);
 }
 
 /*
@@ -1665,7 +1732,7 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 	if (!list_empty(&fiq->interrupts)) {
 		req = list_entry(fiq->interrupts.next, struct fuse_req,
 				 intr_entry);
-		return fuse_read_interrupt(fiq, cs, nbytes, req);
+		return fuse_read_interrupt(fc, fiq, cs, nbytes, req);
 	}
 
 	if (forget_pending(fiq)) {
@@ -1730,6 +1797,10 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 	__fuse_get_request(req);
 	set_bit(FR_SENT, &req->flags);
 	spin_unlock(&fpq->lock);
+	trace_fuse_request_count(fc->dev, req->in.h.opcode,
+				 FUSE_REQUEST_COUNT_STAGE_DAEMON_DELIVERY,
+				 FUSE_REQUEST_COUNT_ACTION_DAEMON_CLASSIC,
+				 FUSE_REQUEST_COUNT_RESULT_NONE);
 	/* matches barrier in request_wait_answer() */
 	smp_mb__after_atomic();
 	if (test_bit(FR_INTERRUPTED, &req->flags))
@@ -1742,6 +1813,12 @@ out_end:
 	if (!test_bit(FR_PRIVATE, &req->flags))
 		list_del_init(&req->list);
 	spin_unlock(&fpq->lock);
+	if (err > 0)
+		trace_fuse_request_count(
+			fc->dev, req->in.h.opcode,
+			FUSE_REQUEST_COUNT_STAGE_DAEMON_DELIVERY,
+			FUSE_REQUEST_COUNT_ACTION_DAEMON_CLASSIC,
+			FUSE_REQUEST_COUNT_RESULT_NONE);
 	fuse_request_end(req);
 	return err;
 

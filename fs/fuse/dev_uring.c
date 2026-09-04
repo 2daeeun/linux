@@ -1187,6 +1187,15 @@ static void fuse_uring_add_to_pq(struct fuse_ring_ent *ent)
 	list_move_tail(&req->list, &fpq->processing[hash]);
 }
 
+static __always_inline void
+fuse_uring_trace_daemon_delivery(dev_t connection, u32 opcode)
+{
+	trace_fuse_request_count(connection, opcode,
+				 FUSE_REQUEST_COUNT_STAGE_DAEMON_DELIVERY,
+				 FUSE_REQUEST_COUNT_ACTION_DAEMON_URING,
+				 FUSE_REQUEST_COUNT_RESULT_NONE);
+}
+
 /*
  * Write data to the ring buffer and send the request to userspace,
  * userspace will read it
@@ -1197,6 +1206,9 @@ static int fuse_uring_send_next_to_ring(struct fuse_ring_ent *ent,
 					unsigned int issue_flags)
 {
 	struct fuse_ring_queue *queue = ent->queue;
+	dev_t trace_connection;
+	u32 trace_opcode;
+	bool trace_delivery;
 	int err;
 	struct io_uring_cmd *cmd;
 
@@ -1210,8 +1222,16 @@ static int fuse_uring_send_next_to_ring(struct fuse_ring_ent *ent,
 	ent->state = FRRS_USERSPACE;
 	list_move_tail(&ent->list, &queue->ent_in_userspace);
 	fuse_uring_add_to_pq(ent);
+	trace_delivery = trace_fuse_request_count_enabled();
+	if (trace_delivery) {
+		trace_connection = req->fm->fc->dev;
+		trace_opcode = req->in.h.opcode;
+	}
 	spin_unlock(&queue->lock);
 
+	/* Count the committed ring delivery before CQE notification can drain it. */
+	if (trace_delivery)
+		fuse_uring_trace_daemon_delivery(trace_connection, trace_opcode);
 	io_uring_cmd_done(cmd, 0, issue_flags);
 	return 0;
 }
@@ -1885,14 +1905,27 @@ static void fuse_uring_send(struct fuse_ring_ent *ent, struct io_uring_cmd *cmd,
 			    ssize_t ret, unsigned int issue_flags)
 {
 	struct fuse_ring_queue *queue = ent->queue;
+	dev_t trace_connection;
+	u32 trace_opcode;
+	bool trace_delivery;
 
 	spin_lock(&queue->lock);
 	ent->state = FRRS_USERSPACE;
 	list_move_tail(&ent->list, &queue->ent_in_userspace);
 	ent->cmd = NULL;
 	fuse_uring_add_to_pq(ent);
+	trace_delivery = trace_fuse_request_count_enabled();
+	if (trace_delivery) {
+		struct fuse_req *req = ent->fuse_req;
+
+		trace_connection = req->fm->fc->dev;
+		trace_opcode = req->in.h.opcode;
+	}
 	spin_unlock(&queue->lock);
 
+	/* Count the committed ring delivery before CQE notification can drain it. */
+	if (trace_delivery)
+		fuse_uring_trace_daemon_delivery(trace_connection, trace_opcode);
 	io_uring_cmd_done(cmd, ret, issue_flags);
 }
 
