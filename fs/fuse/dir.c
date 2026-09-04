@@ -1511,6 +1511,8 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
 	struct fuse_mount *fm = get_fuse_mount(inode);
 	FUSE_ARGS(args);
 	u64 attr_version;
+	u64 wbcache_sequence = 0;
+	bool retire_wbcache = false;
 
 	attr_version = fuse_get_attr_version(fm->fc);
 
@@ -1535,6 +1537,9 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
 	if (S_ISREG(inode->i_mode)) {
 		args.extfuse_getattr_inode = inode;
 		args.extfuse_getattr_refresh = fuse_passthrough_attr_refresh;
+		if (READ_ONCE(fm->fc->extfuse_wbcache_passthrough))
+			retire_wbcache = fuse_file_io_getattr_begin(
+				inode, &wbcache_sequence);
 	}
 	fuse_passthrough_attr_refresh(inode);
 	err = fuse_simple_request(fm, &args);
@@ -1549,6 +1554,8 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
 					       attr_version);
 			if (stat)
 				fuse_fillattr(idmap, inode, &outarg.attr, stat);
+			if (retire_wbcache)
+				fuse_file_io_getattr_end(inode, wbcache_sequence);
 		}
 	}
 	return err;

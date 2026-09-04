@@ -21,6 +21,24 @@ static inline bool fuse_is_io_cache_wait(struct fuse_inode *fi)
 	return READ_ONCE(fi->iocachectr) < 0 && !fuse_inode_backing(fi);
 }
 
+static void fuse_wbcache_generation_advance_locked(struct fuse_inode *fi)
+{
+	fi->extfuse_wbcache_release_pending = 0;
+	fi->extfuse_wbcache_may_modify = false;
+	fi->extfuse_wbcache_retire_after_release = false;
+	fi->extfuse_wbcache_backing_sequence++;
+}
+
+static struct fuse_backing *
+fuse_wbcache_backing_detach_locked(struct fuse_inode *fi)
+{
+	struct fuse_backing *fb = fi->extfuse_wbcache_fb;
+
+	fi->extfuse_wbcache_fb = NULL;
+	fuse_wbcache_generation_advance_locked(fi);
+	return fb;
+}
+
 /*
  * Called on cached file open() and on first mmap() of direct_io file.
  * Takes cached_io inode mode reference to be dropped on file release.
@@ -33,6 +51,8 @@ static int fuse_file_cached_io_start(struct inode *inode, struct fuse_file *ff,
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_backing *inode_fb;
+	struct fuse_backing *retiring_fb = NULL;
+	int err = 0;
 
 	/* There are no io modes if server does not implement open */
 	if (!ff->args && !wbcache_fb)
@@ -61,22 +81,40 @@ static int fuse_file_cached_io_start(struct inode *inode, struct fuse_file *ff,
 	}
 
 	inode_fb = fi->extfuse_wbcache_fb;
-	if ((!wbcache_fb && inode_fb) ||
-	    (wbcache_fb && inode_fb && inode_fb != wbcache_fb) ||
+	if ((!wbcache_fb && inode_fb && fi->extfuse_wbcache_open_count) ||
+	    (wbcache_fb && inode_fb && inode_fb != wbcache_fb &&
+	     fi->extfuse_wbcache_open_count) ||
 	    (wbcache_fb && !inode_fb && fi->iocachectr > 0)) {
-		spin_unlock(&fi->lock);
-		return -EBUSY;
+		err = -EBUSY;
+		goto out_unlock;
+	}
+	/*
+	 * A completed open may race the daemon reply for an earlier last close.
+	 * Replace that retirement-only backing without letting the old RELEASE
+	 * completion detach the new object.
+	 */
+	if (inode_fb && !fi->extfuse_wbcache_open_count &&
+	    inode_fb != wbcache_fb) {
+		retiring_fb = inode_fb;
+		fi->extfuse_wbcache_fb = NULL;
+		inode_fb = NULL;
 	}
 	if (wbcache_fb) {
+		/* A 0 -> 1 transition always starts a new backing generation. */
+		if (!fi->extfuse_wbcache_open_count)
+			fuse_wbcache_generation_advance_locked(fi);
 		if (!inode_fb) {
 			inode_fb = fuse_backing_get(wbcache_fb);
 			if (WARN_ON_ONCE(!inode_fb)) {
-				spin_unlock(&fi->lock);
-				return -ESTALE;
+				err = -ESTALE;
+				goto out_unlock;
 			}
 			fi->extfuse_wbcache_fb = inode_fb;
 		}
 		fi->extfuse_wbcache_open_count++;
+	} else if (retiring_fb) {
+		/* A classic cached open invalidates the retired WBCache generation. */
+		fuse_wbcache_generation_advance_locked(fi);
 	}
 
 	WARN_ON(ff->iomode == IOM_UNCACHED);
@@ -86,8 +124,11 @@ static int fuse_file_cached_io_start(struct inode *inode, struct fuse_file *ff,
 			set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
 		fi->iocachectr++;
 	}
+out_unlock:
 	spin_unlock(&fi->lock);
-	return 0;
+	if (retiring_fb)
+		fuse_backing_put(retiring_fb);
+	return err;
 }
 
 int fuse_file_cached_io_open(struct inode *inode, struct fuse_file *ff)
@@ -96,21 +137,41 @@ int fuse_file_cached_io_open(struct inode *inode, struct fuse_file *ff)
 }
 
 static void fuse_file_cached_io_release(struct fuse_file *ff,
-					struct fuse_inode *fi)
+					struct fuse_inode *fi,
+					struct fuse_release_args *ra)
 {
 	struct fuse_backing *inode_fb = NULL;
 	bool wbcache = !!fuse_file_wbcache_backing(ff);
+	bool last_wbcache = false;
+	bool may_modify = ra &&
+		(ra->inarg.flags & O_ACCMODE) != O_RDONLY;
 
 	spin_lock(&fi->lock);
 	WARN_ON(fi->iocachectr <= 0);
 	WARN_ON(ff->iomode != IOM_CACHED);
 	if (wbcache) {
 		WARN_ON(!fi->extfuse_wbcache_open_count);
-		if (fi->extfuse_wbcache_open_count)
+		if (fi->extfuse_wbcache_open_count) {
+			fi->extfuse_wbcache_may_modify |= may_modify;
 			fi->extfuse_wbcache_open_count--;
-		if (!fi->extfuse_wbcache_open_count) {
-			inode_fb = fi->extfuse_wbcache_fb;
-			fi->extfuse_wbcache_fb = NULL;
+			last_wbcache = !fi->extfuse_wbcache_open_count;
+		}
+		/*
+		 * Keep a writable generation until its first post-close GETATTR.  The
+		 * request can then use the existing lazy refresh without adding a
+		 * lower getattr to every close.  Read-only generations retire here.
+		 */
+		if (last_wbcache && fi->extfuse_wbcache_may_modify && ra &&
+		    fi->extfuse_wbcache_fb &&
+		    !WARN_ON_ONCE(fi->extfuse_wbcache_release_pending == UINT_MAX)) {
+			fi->extfuse_wbcache_release_pending++;
+			ra->extfuse_wbcache_backing_sequence =
+				fi->extfuse_wbcache_backing_sequence;
+			ra->extfuse_wbcache_release_armed = true;
+		}
+		if (last_wbcache &&
+		    (!ra || !ra->extfuse_wbcache_release_armed)) {
+			inode_fb = fuse_wbcache_backing_detach_locked(fi);
 		}
 	}
 	ff->iomode = IOM_NONE;
@@ -123,6 +184,76 @@ static void fuse_file_cached_io_release(struct fuse_file *ff,
 		fuse_backing_put(inode_fb);
 	if (wbcache)
 		fuse_wbcache_passthrough_release(ff);
+}
+
+/* Complete RELEASE without retiring a still-needed lazy attr-refresh seed. */
+void fuse_file_io_release_end(struct inode *inode,
+			      struct fuse_release_args *ra)
+{
+	struct fuse_backing *inode_fb = NULL;
+	struct fuse_inode *fi;
+
+	if (!ra->extfuse_wbcache_release_armed)
+		return;
+
+	fi = get_fuse_inode(inode);
+	spin_lock(&fi->lock);
+	if (fi->extfuse_wbcache_backing_sequence ==
+		    ra->extfuse_wbcache_backing_sequence) {
+		if (!WARN_ON_ONCE(!fi->extfuse_wbcache_release_pending))
+			fi->extfuse_wbcache_release_pending--;
+		if (!fi->extfuse_wbcache_release_pending &&
+		    !fi->extfuse_wbcache_open_count &&
+		    (!fi->extfuse_wbcache_may_modify ||
+		     fi->extfuse_wbcache_retire_after_release))
+			inode_fb = fuse_wbcache_backing_detach_locked(fi);
+	}
+	spin_unlock(&fi->lock);
+
+	ra->extfuse_wbcache_release_armed = false;
+	if (inode_fb)
+		fuse_backing_put(inode_fb);
+}
+
+/* Capture a retired writable generation before its lazy GETATTR refresh. */
+bool fuse_file_io_getattr_begin(struct inode *inode, u64 *sequence)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool retire = false;
+
+	spin_lock(&fi->lock);
+	if (fi->extfuse_wbcache_fb &&
+	    !fi->extfuse_wbcache_open_count &&
+	    fi->extfuse_wbcache_may_modify) {
+		*sequence = fi->extfuse_wbcache_backing_sequence;
+		retire = true;
+	}
+	spin_unlock(&fi->lock);
+
+	return retire;
+}
+
+/* Retire only the generation that supplied a successful GETATTR. */
+void fuse_file_io_getattr_end(struct inode *inode, u64 sequence)
+{
+	struct fuse_backing *inode_fb = NULL;
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	spin_lock(&fi->lock);
+	if (fi->extfuse_wbcache_backing_sequence == sequence &&
+	    fi->extfuse_wbcache_fb &&
+	    !fi->extfuse_wbcache_open_count &&
+	    fi->extfuse_wbcache_may_modify) {
+		fi->extfuse_wbcache_may_modify = false;
+		if (fi->extfuse_wbcache_release_pending)
+			fi->extfuse_wbcache_retire_after_release = true;
+		else
+			inode_fb = fuse_wbcache_backing_detach_locked(fi);
+	}
+	spin_unlock(&fi->lock);
+
+	if (inode_fb)
+		fuse_backing_put(inode_fb);
 }
 
 /* Start strictly uncached io mode where cache access is not allowed */
@@ -307,6 +438,8 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
 	if (fuse_inode_backing(fi) && !(ff->open_flags & FOPEN_PASSTHROUGH))
 		goto fail;
 	if (fuse_inode_wbcache_backing(fi) &&
+	    (READ_ONCE(fi->extfuse_wbcache_open_count) ||
+	     (ff->open_flags & FOPEN_PASSTHROUGH)) &&
 	    !(ff->open_flags & FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH))
 		goto fail;
 
@@ -352,7 +485,8 @@ fail:
 }
 
 /* No more pending io and no new io possible to inode via open/mmapped file */
-void fuse_file_io_release(struct fuse_file *ff, struct inode *inode)
+void fuse_file_io_release(struct fuse_file *ff, struct inode *inode,
+			  struct fuse_release_args *ra)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
@@ -368,7 +502,7 @@ void fuse_file_io_release(struct fuse_file *ff, struct inode *inode)
 		fuse_file_uncached_io_release(ff, fi);
 		break;
 	case IOM_CACHED:
-		fuse_file_cached_io_release(ff, fi);
+		fuse_file_cached_io_release(ff, fi, ra);
 		break;
 	}
 }

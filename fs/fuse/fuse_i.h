@@ -233,11 +233,23 @@ struct fuse_inode {
 	/** Submount specific lookup tracking */
 	struct fuse_submount_lookup *submount_lookup;
 
-	/** Canonical lower file registration for cached ExtFUSE passthrough */
+	/** Canonical lower file, including the last-close attr-refresh grace */
 	struct fuse_backing *extfuse_wbcache_fb;
 
 	/** Number of cached ExtFUSE passthrough opens on this inode */
 	unsigned int extfuse_wbcache_open_count;
+
+	/** Last-close RELEASE requests retaining the WBCache backing */
+	unsigned int extfuse_wbcache_release_pending;
+
+	/** This WBCache open generation may have changed lower attributes */
+	bool extfuse_wbcache_may_modify;
+
+	/** A post-close GETATTR completed before the last RELEASE */
+	bool extfuse_wbcache_retire_after_release;
+
+	/** Changes whenever a canonical WBCache generation starts or retires */
+	u64 extfuse_wbcache_backing_sequence;
 
 #ifdef CONFIG_FUSE_PASSTHROUGH
 	/** Reference to backing file in passthrough mode */
@@ -416,6 +428,8 @@ struct fuse_release_args {
 	struct fuse_args args;
 	struct fuse_release_in inarg;
 	struct inode *inode;
+	u64 extfuse_wbcache_backing_sequence;
+	bool extfuse_wbcache_release_armed;
 	bool extfuse_attr_release_barrier_armed;
 };
 
@@ -1769,7 +1783,12 @@ int fuse_inode_uncached_io_start(struct fuse_inode *fi,
 void fuse_inode_uncached_io_end(struct fuse_inode *fi);
 
 int fuse_file_io_open(struct file *file, struct inode *inode);
-void fuse_file_io_release(struct fuse_file *ff, struct inode *inode);
+void fuse_file_io_release(struct fuse_file *ff, struct inode *inode,
+			  struct fuse_release_args *ra);
+void fuse_file_io_release_end(struct inode *inode,
+			      struct fuse_release_args *ra);
+bool fuse_file_io_getattr_begin(struct inode *inode, u64 *sequence);
+void fuse_file_io_getattr_end(struct inode *inode, u64 sequence);
 
 /* file.c */
 struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,

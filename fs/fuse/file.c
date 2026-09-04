@@ -99,6 +99,8 @@ static void fuse_release_end(struct fuse_mount *fm, struct fuse_args *args,
 {
 	struct fuse_release_args *ra = container_of(args, typeof(*ra), args);
 
+	if (ra->extfuse_wbcache_release_armed)
+		fuse_file_io_release_end(ra->inode, ra);
 	if (ra->extfuse_attr_release_barrier_armed) {
 		ra->extfuse_attr_release_barrier_armed = false;
 		fuse_attr_release_barrier_complete(fm->fc, ra->inode);
@@ -114,7 +116,7 @@ static void fuse_file_put(struct fuse_file *ff, bool sync)
 		struct fuse_args *args = (ra ? &ra->args : NULL);
 
 		if (ra && ra->inode)
-			fuse_file_io_release(ff, ra->inode);
+			fuse_file_io_release(ff, ra->inode, ra);
 
 		if (!args) {
 			/* Do nothing when server does not implement 'opendir' */
