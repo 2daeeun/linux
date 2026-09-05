@@ -279,12 +279,15 @@ static ssize_t __extfuse_request_send_ctx(
 	 * Forced control requests may be observed but must reach the daemon.
 	 * The current BPF ABI also hides request extensions, so a program may
 	 * perform conservative cache side effects but cannot complete them.
+	 * Explicit SYNCFS is a persistence promise, not a metadata-cache hit.
+	 * Run BPF below first, then require the daemon's lower-sync completion.
 	 */
 	force_upcall = (args->force && args->opcode != FUSE_FLUSH &&
 			!((args->opcode == FUSE_READ ||
 			   args->opcode == FUSE_WRITE) && args->extfuse_file &&
 			  READ_ONCE(fc->extfuse_wbcache_passthrough))) ||
-		args->is_ext;
+		args->is_ext ||
+		(args->opcode == FUSE_SYNCFS && fc->sync_fs_explicit);
 
 	if (!fuse_args_to_extfuse_req(args, inh, coherence, post_daemon, &ctx)) {
 		if (reason)
@@ -1049,6 +1052,10 @@ static int extfuse_build_state(struct fuse_req *req, gfp_t gfp)
 
 	if (req->extfuse_state)
 		return 0;
+	/* Persistence of completed mutations does not create a new global one. */
+	if (args->opcode == FUSE_SYNCFS &&
+	    READ_ONCE(req->fm->fc->extfuse_syncfs_pure))
+		return 0;
 	if (args->opcode != FUSE_GETATTR && args->opcode != FUSE_GETXATTR &&
 	    args->opcode != FUSE_LISTXATTR && args->opcode != FUSE_LOOKUP &&
 	    !extfuse_opcode_is_mutation(args->opcode))
@@ -1379,8 +1386,8 @@ static ssize_t extfuse_request_pre_result(struct fuse_req *req, gfp_t gfp,
 	/*
 	 * Preserve the original ExtFUSE path for ordinary requests.  WBCache
 	 * passthrough additionally consumes the standard READ/WRITE PASSTHRU result
-	 * without allocating strict-coherence request state or invoking private
-	 * BEGIN/END programs.
+	 * without allocating strict-coherence request state.  The optional narrow
+	 * READ bracket runs only after lower request-shape validation.
 	 */
 	if (!READ_ONCE(fc->extfuse_coherence_epochs) &&
 	    extfuse_is_paper_wbcache_request(req))
@@ -1849,7 +1856,7 @@ int extfuse_request_prepare_wbcache(struct fuse_req *req, gfp_t gfp)
 	    (req->args->opcode != FUSE_READ &&
 	     req->args->opcode != FUSE_WRITE))
 		return -EOPNOTSUPP;
-	/* The paper path has no private hook, request state, or epoch bracket. */
+	/* The paper executor owns its optional READ hook, without epoch state. */
 	if (!READ_ONCE(fc->extfuse_coherence_epochs))
 		return 0;
 
@@ -2493,6 +2500,31 @@ int extfuse_passthrough_attr_commit(struct fuse_conn *fc, u64 nodeid,
 }
 EXPORT_SYMBOL_GPL(extfuse_passthrough_attr_commit);
 
+/* A READ may refresh atime, never import lower size/mtime over dirty upper I/O. */
+int extfuse_passthrough_attr_commit_atime(
+	struct fuse_conn *fc, u64 nodeid,
+	const struct extfuse_passthrough_attr_cookie *cookie,
+	const struct fuse_attr *attr)
+{
+	u32 mask = FATTR_ATIME;
+	struct fuse_args args = {
+		.nodeid = nodeid,
+		.opcode = EXTFUSE_PASSTHROUGH_ATTR_COMMIT,
+		.in_numargs = 3,
+		.in_args[0] = { .size = sizeof(*cookie), .value = cookie },
+		.in_args[1] = { .size = sizeof(*attr), .value = attr },
+		.in_args[2] = { .size = sizeof(mask), .value = &mask },
+	};
+
+	if (!cookie || !attr)
+		return -EINVAL;
+	if (!READ_ONCE(fc->extfuse_paper_read_guard) ||
+	    !READ_ONCE(fc->extfuse_passthrough_attr_refresh))
+		return -EOPNOTSUPP;
+	return __extfuse_request_send(fc, &args);
+}
+EXPORT_SYMBOL_GPL(extfuse_passthrough_attr_commit_atime);
+
 static __always_inline void
 extfuse_trace_passthrough_count(struct fuse_conn *fc, u32 opcode, u32 action,
 				ssize_t result)
@@ -2603,6 +2635,18 @@ static int extfuse_passthrough_bpf_notify(struct fuse_conn *fc,
 	return ret < 0 && ret != -ENOSYS ? (int)ret : -EIO;
 }
 
+/* Narrow paper-mode bracket: generation-map ATTR ownership, not full epochs. */
+int extfuse_paper_read_notify(struct fuse_conn *fc, struct inode *inode,
+			    u32 phase)
+{
+	if (!inode)
+		return -EINVAL;
+	return extfuse_passthrough_bpf_notify(
+		fc, inode, get_node_id(inode), EXTFUSE_PASSTHROUGH_READ,
+		phase, true, false);
+}
+EXPORT_SYMBOL_GPL(extfuse_paper_read_notify);
+
 /*
  * Native passthrough has no ordinary FUSE READ/WRITE request.  Bracket lower
  * I/O with both the kernel epoch and the generation-map policy.  A BEGIN
@@ -2706,6 +2750,8 @@ void extfuse_unload_prog(struct fuse_conn *fc)
 	struct extfuse_data *data;
 
 	WRITE_ONCE(fc->extfuse_passthrough_attr_release_barrier, 0);
+	WRITE_ONCE(fc->extfuse_paper_read_guard, 0);
+	WRITE_ONCE(fc->extfuse_syncfs_pure, 0);
 	WRITE_ONCE(fc->extfuse_passthrough_attr_refresh, 0);
 	WRITE_ONCE(fc->extfuse_passthrough_coherence, 0);
 	WRITE_ONCE(fc->extfuse_notify_inval_xattr, 0);

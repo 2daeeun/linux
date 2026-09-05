@@ -95,6 +95,12 @@ struct extfuse_passthrough_in {
 };
 
 /* Opaque state guarding a passthrough-backed attribute refresh. */
+/*
+ * ATTR_COMMIT normally takes this cookie and a full fuse_attr.  Negotiated
+ * PAPER_READ_GUARD may append a third u32 input, strictly FATTR_ATIME: merge
+ * only atime into an existing solely-atime-stale row with matching tokens.
+ * An absent/other-stale/racing seed is never made valid by that narrow commit.
+ */
 struct extfuse_passthrough_attr_cookie {
 	__u64 daemon_state;
 	__u64 native_state;

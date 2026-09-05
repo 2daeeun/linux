@@ -111,6 +111,56 @@ out:
 	fuse_backing_put(fb);
 }
 
+/*
+ * Complete a guarded READ's atime publication before exposing its payload.
+ * Upper writeback owns size/mtime.  Never copy those fields from the lower
+ * inode here, or make a stale/non-atime seed serviceable.  BPF additionally
+ * checks both generation tokens and merges only a solely-atime-stale row.
+ */
+void fuse_passthrough_read_atime_refresh(struct inode *inode)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct extfuse_passthrough_attr_cookie cookie;
+	struct fuse_backing *fb;
+	struct fuse_attr attr = { };
+	struct kstat stat;
+	const struct cred *old_cred;
+	u64 attr_version;
+	int err;
+
+	if (!S_ISREG(inode->i_mode) ||
+	    !READ_ONCE(fc->extfuse_paper_read_guard))
+		return;
+	fb = fuse_attr_refresh_backing_get(fc, fi);
+	if (!fb)
+		return;
+	spin_lock(&fi->lock);
+	attr_version = fi->attr_version;
+	spin_unlock(&fi->lock);
+	err = extfuse_passthrough_attr_prepare(fc, get_node_id(inode), &cookie);
+	if (err)
+		goto out;
+	old_cred = override_creds(fb->cred);
+	err = vfs_getattr(&fb->file->f_path, &stat, STATX_ATIME,
+			  AT_STATX_SYNC_AS_STAT);
+	revert_creds(old_cred);
+	if (err || !(stat.result_mask & STATX_ATIME))
+		goto out;
+	attr.atime = stat.atime.tv_sec;
+	attr.atimensec = stat.atime.tv_nsec;
+	spin_lock(&fi->lock);
+	if (fi->attr_version == attr_version && !fi->writectr &&
+	    list_empty(&fi->queued_writes) &&
+	    !mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) &&
+	    !mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK))
+		(void)extfuse_passthrough_attr_commit_atime(
+			fc, get_node_id(inode), &cookie, &attr);
+	spin_unlock(&fi->lock);
+out:
+	fuse_backing_put(fb);
+}
+
 static int fuse_passthrough_extfuse_notify(struct file *file, u32 opcode,
 					   u32 phase)
 {

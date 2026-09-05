@@ -70,7 +70,7 @@ MODULE_PARM_DESC(max_user_congthresh,
  * two locally rebuilt fuse.ko instances with the same EXTRAVERSION.
  */
 #define FUSE_EXTFUSE_RUNTIME_CONTRACT \
-	"extfuse-paper-read-upcall-fixed-write-stream-20260904"
+	"extfuse-fixed-writeback-balance-20260906"
 static char extfuse_runtime_contract[] = FUSE_EXTFUSE_RUNTIME_CONTRACT;
 module_param_string(extfuse_runtime_contract, extfuse_runtime_contract,
 		    sizeof(extfuse_runtime_contract), 0444);
@@ -809,7 +809,7 @@ static int fuse_sync_fs(struct super_block *sb, int wait)
 	args.out_numargs = 0;
 
 	err = fuse_simple_request(fm, &args);
-	if (err == -ENOSYS) {
+	if (err == -ENOSYS && !fc->sync_fs_explicit) {
 		fc->sync_fs = 0;
 		err = 0;
 	}
@@ -1660,6 +1660,35 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				else
 					fc->extfuse_read_upcall_only = 1;
 			}
+			if (flags & FUSE_SYNCFS_SUPPORT) {
+				if (arg->minor < 48) {
+					ok = false;
+				} else {
+					fc->sync_fs = 1;
+					fc->sync_fs_explicit = 1;
+				}
+			}
+			if (flags & FUSE_EXTFUSE_SYNCFS_PURE) {
+				if (!IS_ENABLED(CONFIG_EXTFUSE) ||
+				    !(flags & FUSE_FS_EXTFUSE) ||
+				    !(flags & FUSE_SYNCFS_SUPPORT) ||
+				    !fc->sync_fs_explicit)
+					ok = false;
+				else
+					fc->extfuse_syncfs_pure = 1;
+			}
+			if (flags & FUSE_EXTFUSE_PAPER_READ_GUARD) {
+				if (arg->minor < 48 ||
+				    !IS_ENABLED(CONFIG_EXTFUSE) ||
+				    !IS_ENABLED(CONFIG_FUSE_PASSTHROUGH) ||
+				    !(flags & FUSE_FS_EXTFUSE) ||
+				    !fc->extfuse_wbcache_passthrough ||
+				    !fc->extfuse_passthrough_attr_refresh ||
+				    (flags & FUSE_EXTFUSE_READ_UPCALL_ONLY))
+					ok = false;
+				else
+					fc->extfuse_paper_read_guard = 1;
+			}
 			if (flags & FUSE_EXTFUSE_WBCACHE_WRITE_STREAM) {
 				if (arg->minor < 48 ||
 				    !IS_ENABLED(CONFIG_EXTFUSE) ||
@@ -1702,6 +1731,9 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 		fc->extfuse_wbcache_passthrough = 0;
 		fc->extfuse_read_upcall_only = 0;
 		fc->extfuse_wbcache_write_stream = 0;
+		fc->extfuse_paper_read_guard = 0;
+		fc->extfuse_syncfs_pure = 0;
+		fc->sync_fs_explicit = 0;
 		fc->io_uring = 0;
 		fc->io_uring_bufpool = 0;
 		fc->conn_init = 0;
@@ -1736,18 +1768,20 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
-		FUSE_REQUEST_TIMEOUT;
+		FUSE_REQUEST_TIMEOUT | FUSE_SYNCFS_SUPPORT;
 	if (fm->fc->iq.ops == &fuse_dev_fiq_ops) {
 		flags |= EXTFUSE_FLAGS;
 		if (IS_ENABLED(CONFIG_EXTFUSE))
 			flags |= FUSE_EXTFUSE_COHERENCE_EPOCHS |
 				 FUSE_MUTATION_METADATA |
 				 FUSE_HAS_NOTIFY_INVAL_XATTR |
-				 FUSE_EXTFUSE_READ_UPCALL_ONLY;
+				 FUSE_EXTFUSE_READ_UPCALL_ONLY |
+				 FUSE_EXTFUSE_SYNCFS_PURE;
 		if (IS_ENABLED(CONFIG_EXTFUSE) &&
 		    IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 			flags |= FUSE_EXTFUSE_WBCACHE_PASSTHROUGH |
-				 FUSE_EXTFUSE_WBCACHE_WRITE_STREAM;
+				 FUSE_EXTFUSE_WBCACHE_WRITE_STREAM |
+				 FUSE_EXTFUSE_PAPER_READ_GUARD;
 		if (IS_ENABLED(CONFIG_EXTFUSE) &&
 		    IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 			flags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE |

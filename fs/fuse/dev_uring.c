@@ -1994,11 +1994,12 @@ fuse_uring_background_queue(struct fuse_ring *ring, struct fuse_req *req)
 
 	/*
 	 * Preserve each open file's readahead/writeback stream on one userspace
-	 * queue.  Per-request round-robin destroys sequential locality, while a
-	 * nodeid-only hash serializes independent opens of a shared inode.  The
-	 * daemon file handle is stable for the lifetime of READ/WRITE requests and
-	 * distributes those independent streams.  Other background operations use
-	 * their nodeid, with round-robin retained only for node-less requests.
+	 * home queue. Per-request round-robin destroys sequential locality. The
+	 * daemon file handle distributes independent READ streams, but buffered
+	 * writeback uses the inode's representative write_file, not each writer's
+	 * open. Saturated, discontinuous fixed writeback may spill below. Other
+	 * background operations use their nodeid, with round-robin retained only
+	 * for node-less requests.
 	 * Foreground requests continue to use fuse_uring_task_to_queue().
 	 */
 	if ((req->in.h.opcode == FUSE_READ ||
@@ -2014,6 +2015,68 @@ fuse_uring_background_queue(struct fuse_ring *ring, struct fuse_req *req)
 	}
 
 	return READ_ONCE(ring->queues[qid]);
+}
+
+/* Return with the selected queue locked; never hold two queue locks. */
+static struct fuse_ring_queue *
+fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
+			       struct fuse_ring_queue *home)
+{
+	struct fuse_args *args = req->args;
+	struct fuse_file *ff = args->extfuse_file;
+	const struct fuse_write_in *in;
+	struct fuse_ring_queue *queue;
+	unsigned int start, i, qid;
+	bool sequential;
+	u64 end;
+
+	spin_lock(&home->lock);
+	/* READ, copied I/O and direct writes keep the existing placement. */
+	if (home->stopped || !home->zero_copy || !args->zero_copy ||
+	    req->in.h.opcode != FUSE_WRITE || !ff || !args->in_pages ||
+	    args->out_pages || args->in_numargs < 1 ||
+	    args->in_args[0].size < sizeof(*in) || !args->in_args[0].value)
+		return home;
+	in = args->in_args[0].value;
+	if (!(in->write_flags & FUSE_WRITE_CACHE) || !in->size ||
+	    check_add_overflow(in->offset, (u64)in->size, &end))
+		return home;
+
+	/* Preserve contiguous runs, independent of request size or worker count. */
+	sequential = !ff->uring_writeback_seen ||
+		     in->offset == ff->uring_writeback_end;
+	ff->uring_writeback_seen = true;
+	ff->uring_writeback_end = end;
+	if (sequential || !list_empty(&home->ent_avail_queue) ||
+	    ring->nr_queues == 1)
+		return home;
+
+	/*
+	 * A shared inode can otherwise occupy only one queue's registered slots.
+	 * Use an idle fixed-I/O queue for a discontinuous request when the home
+	 * queue is full. Do not move requests already queued or in flight, bypass
+	 * older work on a candidate, or wait for a contended remote queue lock.
+	 */
+	spin_unlock(&home->lock);
+	start = (unsigned int)atomic_fetch_inc_relaxed(&ring->bg_queue_seq);
+	start %= ring->nr_queues;
+	for (i = 0; i < ring->nr_queues; i++) {
+		qid = (start + i) % ring->nr_queues;
+		queue = READ_ONCE(ring->queues[qid]);
+		if (!queue || queue == home || !spin_trylock(&queue->lock))
+			continue;
+		if (!queue->stopped && queue->zero_copy &&
+		    !queue->active_background &&
+		    !list_empty(&queue->ent_avail_queue) &&
+		    list_empty(&queue->fuse_req_queue) &&
+		    list_empty(&queue->fuse_req_bg_queue))
+			return queue;
+		spin_unlock(&queue->lock);
+	}
+
+	/* Saturation or teardown preserves the original queue/error path. */
+	spin_lock(&home->lock);
+	return home;
 }
 
 static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent)
@@ -2079,7 +2142,7 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
 	if (!queue)
 		return false;
 
-	spin_lock(&queue->lock);
+	queue = fuse_uring_lock_writeback_queue(ring, req, queue);
 	if (unlikely(queue->stopped)) {
 		spin_unlock(&queue->lock);
 		return false;

@@ -115,6 +115,12 @@ int extfuse_passthrough_attr_prepare(struct fuse_conn *fc, u64 nodeid,
 int extfuse_passthrough_attr_commit(struct fuse_conn *fc, u64 nodeid,
 				    const struct extfuse_passthrough_attr_cookie *cookie,
 				    const struct fuse_attr *attr);
+int extfuse_passthrough_attr_commit_atime(
+	struct fuse_conn *fc, u64 nodeid,
+	const struct extfuse_passthrough_attr_cookie *cookie,
+	const struct fuse_attr *attr);
+int extfuse_paper_read_notify(struct fuse_conn *fc, struct inode *inode,
+			    u32 phase);
 
 #else /* !CONFIG_EXTFUSE */
 
@@ -242,6 +248,20 @@ static inline int
 extfuse_passthrough_attr_commit(struct fuse_conn *fc, u64 nodeid,
 				const struct extfuse_passthrough_attr_cookie *cookie,
 				const struct fuse_attr *attr)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int extfuse_passthrough_attr_commit_atime(
+	struct fuse_conn *fc, u64 nodeid,
+	const struct extfuse_passthrough_attr_cookie *cookie,
+	const struct fuse_attr *attr)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int extfuse_paper_read_notify(struct fuse_conn *fc,
+					  struct inode *inode, u32 phase)
 {
 	return -EOPNOTSUPP;
 }

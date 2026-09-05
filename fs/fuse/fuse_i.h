@@ -345,6 +345,12 @@ struct fuse_file {
 	/** Does file hold a fi->iocachectr refcount? */
 	enum { IOM_NONE, IOM_CACHED, IOM_UNCACHED } iomode;
 
+#ifdef CONFIG_FUSE_IO_URING
+	/* Fixed writeback locality hint, protected by the home ring queue lock. */
+	u64 uring_writeback_end;
+	bool uring_writeback_seen;
+#endif
+
 #ifdef CONFIG_FUSE_PASSTHROUGH
 	/** Reference to backing file in passthrough mode */
 	struct file *passthrough;
@@ -985,6 +991,12 @@ struct fuse_conn {
 	/* Propagate syncfs() to server */
 	unsigned int sync_fs:1;
 
+	/* Explicit INIT contract: an unsupported SYNCFS is an error. */
+	unsigned int sync_fs_explicit:1;
+
+	/* SYNCFS is persistence only, not a new metadata mutation. */
+	unsigned int extfuse_syncfs_pure;
+
 	/* Initialize security xattrs when creating a new inode */
 	unsigned int init_security:1;
 
@@ -1014,6 +1026,9 @@ struct fuse_conn {
 
 	/** Per-open max_write runs with at most one terminal partial write */
 	unsigned int extfuse_wbcache_write_stream;
+
+	/** BPF ATTR-only guard for paper-mode WBCache lower READ. */
+	unsigned int extfuse_paper_read_guard;
 
 	/** Native passthrough ExtFUSE coherence protocol version (0, 1, or 2) */
 	unsigned int extfuse_passthrough_coherence;
@@ -1947,8 +1962,12 @@ ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
 				     size_t len, unsigned int flags);
 #ifdef CONFIG_FUSE_PASSTHROUGH
 void fuse_passthrough_attr_refresh(struct inode *inode);
+void fuse_passthrough_read_atime_refresh(struct inode *inode);
 #else
 static inline void fuse_passthrough_attr_refresh(struct inode *inode)
+{
+}
+static inline void fuse_passthrough_read_atime_refresh(struct inode *inode)
 {
 }
 #endif

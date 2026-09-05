@@ -924,6 +924,9 @@ static ssize_t __fuse_wbcache_request_execute(struct fuse_req *req, gfp_t gfp,
 	else
 		ret = fuse_wbcache_passthrough_execute(req, io);
 	extfuse_request_complete_wbcache(req, ret < 0 ? ret : 0);
+	if (req->args->opcode == FUSE_READ &&
+	    READ_ONCE(req->fm->fc->extfuse_paper_read_guard))
+		fuse_passthrough_read_atime_refresh(req->args->extfuse_inode);
 	fuse_wbcache_passthrough_finish(io);
 	return ret;
 }
@@ -1212,14 +1215,13 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 
 	fuse_args_to_req(req, args);
 	/*
-	 * Paper-like C1/C2 WRITE still needs the ordinary ExtFUSE hook before its
-	 * daemon data path: the hook stales cached attributes and removes a positive
-	 * security.capability entry.  A forced request cannot be completed by BPF,
-	 * so it continues to the daemon after those side effects.  Keep C0 and
-	 * background READ on the original path by requiring a loaded program.
+	 * Both READ (including readahead) and WRITE must observe the ordinary BPF
+	 * boundary before daemon dispatch.  A forced request still reaches the
+	 * daemon after policy side effects.  Connections without a program retain
+	 * their original path.
 	 */
 	if (READ_ONCE(fm->fc->extfuse_wbcache_passthrough) ||
-	    (args->opcode == FUSE_WRITE &&
+	    ((args->opcode == FUSE_READ || args->opcode == FUSE_WRITE) &&
 	     rcu_access_pointer(fm->fc->fc_priv))) {
 		route = extfuse_request_pre(req, gfp_flags, &result);
 		if (route == EXTFUSE_PRE_COMPLETE) {

@@ -255,6 +255,8 @@
  *  - add FUSE_EXTFUSE_READ_UPCALL_ONLY
  *  - add FUSE_EXTFUSE_WBCACHE_WRITE_STREAM
  *  - add FOPEN_IO_URING_ZERO_COPY_WRITE
+ *  - add FUSE_SYNCFS_SUPPORT and FUSE_EXTFUSE_SYNCFS_PURE
+ *  - add FUSE_EXTFUSE_PAPER_READ_GUARD
  */
 
 #ifndef _LINUX_FUSE_H
@@ -515,6 +517,14 @@ struct fuse_file_lock {
  *			 terminal contiguous partial write; requires FS_EXTFUSE,
  *			 writeback cache and ExtFUSE WBCache passthrough, and is
  *			 incompatible with coherence epochs
+ * FUSE_SYNCFS_SUPPORT: explicitly propagate syncfs to the daemon; an ENOSYS
+ *			 reply is an error, not permission to silently disable syncfs
+ * FUSE_EXTFUSE_SYNCFS_PURE: SYNCFS persists completed mutations without
+ *			 changing logical metadata; requires FS_EXTFUSE and
+ *			 SYNCFS_SUPPORT, and retains the BPF-first request boundary
+ * FUSE_EXTFUSE_PAPER_READ_GUARD: bracket WBCache lower READ with BPF ATTR
+ *			 BEGIN/END and refresh atime before completion; requires
+ *			 FS_EXTFUSE, WBCACHE_PASSTHROUGH and ATTR_REFRESH, not epochs
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -574,6 +584,9 @@ struct fuse_file_lock {
 #define FUSE_HAS_IO_URING_BUFPOOL (1ULL << 52)
 #define FUSE_EXTFUSE_READ_UPCALL_ONLY (1ULL << 53)
 #define FUSE_EXTFUSE_WBCACHE_WRITE_STREAM (1ULL << 54)
+#define FUSE_SYNCFS_SUPPORT	(1ULL << 55)
+#define FUSE_EXTFUSE_SYNCFS_PURE	(1ULL << 56)
+#define FUSE_EXTFUSE_PAPER_READ_GUARD (1ULL << 57)
 
 /**
  * CUSE INIT request/reply flags

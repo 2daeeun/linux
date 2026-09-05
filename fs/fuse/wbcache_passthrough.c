@@ -8,6 +8,7 @@
  */
 
 #include "fuse_i.h"
+#include "extfuse_i.h"
 
 #include <linux/backing-file.h>
 #include <linux/bvec.h>
@@ -370,6 +371,8 @@ ssize_t fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
 {
 	struct fuse_wbcache_paper_io paper_io;
 	struct fuse_wbcache_io *io = &paper_io.io;
+	struct fuse_conn *fc = req->fm->fc;
+	bool read_guard;
 	ssize_t ret;
 	int err;
 
@@ -379,6 +382,15 @@ ssize_t fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
 					    GFP_KERNEL);
 	if (err)
 		return err;
+	read_guard = !io->write && READ_ONCE(fc->extfuse_paper_read_guard);
+	if (read_guard) {
+		err = extfuse_paper_read_notify(fc, req->args->extfuse_inode,
+					       EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
+		if (err) {
+			fuse_wbcache_passthrough_cleanup(io);
+			return err;
+		}
+	}
 
 	/* Validation is complete.  From here onward the request is never replayed. */
 	*lower_started = true;
@@ -386,6 +398,12 @@ ssize_t fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
 		ret = -ENOTCONN;
 	else
 		ret = fuse_wbcache_passthrough_execute(req, io);
+	if (read_guard) {
+		err = extfuse_paper_read_notify(fc, req->args->extfuse_inode,
+					       EXTFUSE_PASSTHROUGH_PHASE_END);
+		if (!err)
+			fuse_passthrough_read_atime_refresh(req->args->extfuse_inode);
+	}
 	fuse_wbcache_passthrough_cleanup(io);
 	return ret;
 }
