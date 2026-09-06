@@ -272,6 +272,30 @@ static void fuse_truncate_update_attr(struct inode *inode, struct file *file)
 	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
 }
 
+/*
+ * Concurrent cache=auto opens can encounter dirty folios from an earlier
+ * writer.  Submit those folios through writepages before invalidation so that
+ * each opener does not have to submit and wait for them one folio at a time.
+ *
+ * This is only a best-effort batching step.  Keep pending writeback errors for
+ * the existing flush/fsync paths, and always invalidate afterwards: folios
+ * dirtied concurrently or left behind by an error still need normal laundering.
+ */
+static void fuse_open_invalidate_cache(struct inode *inode)
+{
+	struct address_space *mapping = inode->i_mapping;
+	struct fuse_conn *fc = get_fuse_conn(inode);
+
+	if (fc->writeback_cache &&
+	    mapping_tagged(mapping, PAGECACHE_TAG_DIRTY)) {
+		int err = filemap_fdatawrite(mapping);
+
+		if (err != -EIO)
+			filemap_fdatawait_keep_errors(mapping);
+	}
+	invalidate_inode_pages2(mapping);
+}
+
 static int fuse_open(struct inode *inode, struct file *file)
 {
 	struct fuse_mount *fm = get_fuse_mount(inode);
@@ -320,7 +344,7 @@ static int fuse_open(struct inode *inode, struct file *file)
 		if (is_truncate)
 			truncate_pagecache(inode, 0);
 		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
-			invalidate_inode_pages2(inode->i_mapping);
+			fuse_open_invalidate_cache(inode);
 	}
 	if (dax_truncate)
 		filemap_invalidate_unlock(inode->i_mapping);
