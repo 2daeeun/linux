@@ -512,11 +512,11 @@ struct fuse_file_lock {
  *			 background readahead keeps the ordinary ExtFUSE path; requires
  *			 FS_EXTFUSE and is incompatible with ExtFUSE WBCache
  *			 passthrough and coherence epochs
- * FUSE_EXTFUSE_WBCACHE_WRITE_STREAM: execute a per-open contiguous max_write
- *			 FUSE_WRITE_CACHE run in bounded batches, permitting one
- *			 terminal contiguous partial write; requires FS_EXTFUSE,
- *			 writeback cache and ExtFUSE WBCache passthrough, and is
- *			 incompatible with coherence epochs
+ * FUSE_EXTFUSE_WBCACHE_WRITE_STREAM: dispatch per-open FUSE_WRITE_CACHE
+ *			 requests in bounded batches, including small random writes;
+ *			 lower I/O and completion remain per request. Requires
+ *			 FS_EXTFUSE, writeback cache and ExtFUSE WBCache passthrough,
+ *			 and is incompatible with coherence epochs
  * FUSE_SYNCFS_SUPPORT: explicitly propagate syncfs to the daemon; an ENOSYS
  *			 reply is an error, not permission to silently disable syncfs
  * FUSE_EXTFUSE_SYNCFS_PURE: SYNCFS persists completed mutations without

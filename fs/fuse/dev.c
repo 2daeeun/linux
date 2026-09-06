@@ -457,10 +457,7 @@ static void fuse_send_one(struct fuse_iqueue *fiq, struct fuse_req *req)
 #ifdef CONFIG_FUSE_PASSTHROUGH
 struct fuse_wbcache_stream_key {
 	struct fuse_file *ff;
-	loff_t start;
-	loff_t end;
 	u32 sync_class;
-	bool full_size;
 };
 
 static bool fuse_wbcache_stream_key(struct fuse_req *req,
@@ -495,10 +492,7 @@ static bool fuse_wbcache_stream_key(struct fuse_req *req,
 		return false;
 
 	key->ff = ff;
-	key->start = in->offset;
-	key->end = in->offset + in->size;
 	key->sync_class = in->flags & (O_DSYNC | O_SYNC);
-	key->full_size = in->size == fc->max_write;
 	return true;
 }
 
@@ -517,15 +511,13 @@ static bool fuse_wbcache_stream_queue(struct fuse_req *req)
 	spin_lock(&ff->extfuse_wbcache_stream_lock);
 	if (!ff->extfuse_wbcache_stream_running) {
 		/*
-		 * A partial write is independent unless it terminates an active
-		 * full-size run.
+		 * Small random writes also benefit from reusing this worker.
+		 * Keep each lower write and completion separate; only dispatch
+		 * is batched, in admission order, with a bounded worker budget.
 		 */
-		if (!key.full_size)
-			goto unlock;
 		WARN_ON_ONCE(!list_empty(&ff->extfuse_wbcache_stream_pending));
 		ff->extfuse_wbcache_stream_running = true;
 		ff->extfuse_wbcache_stream_accepting = true;
-		ff->extfuse_wbcache_stream_tail = key.end;
 		ff->extfuse_wbcache_stream_sync_class = key.sync_class;
 		set_bit(FR_WBCACHE_STREAM, &req->flags);
 		handled = queue_work(req->fm->fc->extfuse_wbcache_wq,
@@ -534,26 +526,19 @@ static bool fuse_wbcache_stream_queue(struct fuse_req *req)
 			clear_bit(FR_WBCACHE_STREAM, &req->flags);
 			ff->extfuse_wbcache_stream_running = false;
 			ff->extfuse_wbcache_stream_accepting = false;
-			ff->extfuse_wbcache_stream_tail = 0;
 			ff->extfuse_wbcache_stream_sync_class = 0;
 		}
 	} else if (ff->extfuse_wbcache_stream_accepting &&
-		   ff->extfuse_wbcache_stream_tail == key.start &&
 		   ff->extfuse_wbcache_stream_sync_class == key.sync_class) {
 		WARN_ON_ONCE(!list_empty(&req->extfuse_wbcache_stream_entry));
 		list_add_tail(&req->extfuse_wbcache_stream_entry,
 			      &ff->extfuse_wbcache_stream_pending);
-		ff->extfuse_wbcache_stream_tail = key.end;
-		/* Exactly one contiguous partial write may terminate the run. */
-		if (!key.full_size)
-			ff->extfuse_wbcache_stream_accepting = false;
 		set_bit(FR_WBCACHE_STREAM, &req->flags);
 		handled = true;
 	} else {
-		/* A discontinuity closes this run; keep the request independent. */
+		/* Do not mix sync classes or extend a run awaiting fallback. */
 		ff->extfuse_wbcache_stream_accepting = false;
 	}
-unlock:
 	spin_unlock(&ff->extfuse_wbcache_stream_lock);
 
 	return handled;
@@ -583,7 +568,6 @@ static struct fuse_req *fuse_wbcache_stream_next(struct fuse_req *req,
 	} else {
 		ff->extfuse_wbcache_stream_running = false;
 		ff->extfuse_wbcache_stream_accepting = false;
-		ff->extfuse_wbcache_stream_tail = 0;
 		ff->extfuse_wbcache_stream_sync_class = 0;
 	}
 	spin_unlock(&ff->extfuse_wbcache_stream_lock);

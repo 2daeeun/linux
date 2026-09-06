@@ -360,10 +360,9 @@ struct fuse_file {
 	struct file *extfuse_wbcache_file;
 	struct fuse_backing *extfuse_wbcache_fb;
 
-	/** Serialize admission to the current max_write-sized lower-WRITE run */
+	/** Serialize admission to the current bounded lower-WRITE batch */
 	spinlock_t extfuse_wbcache_stream_lock;
 	struct list_head extfuse_wbcache_stream_pending;
-	loff_t extfuse_wbcache_stream_tail;
 	u32 extfuse_wbcache_stream_sync_class;
 	bool extfuse_wbcache_stream_running:1;
 	bool extfuse_wbcache_stream_accepting:1;
@@ -497,7 +496,7 @@ struct fuse_io_priv {
  * FR_ASYNC:		request is asynchronous
  * FR_URING:		request is handled through fuse-io-uring
  * FR_WBCACHE:		request is handled by ExtFUSE lower cached-I/O forwarding
- * FR_WBCACHE_STREAM:	request belongs to a per-open full-size WBCache WRITE run
+ * FR_WBCACHE_STREAM:	request belongs to a per-open WBCache WRITE batch
  */
 enum fuse_req_flag {
 	FR_ISREPLY,
@@ -1024,7 +1023,7 @@ struct fuse_conn {
 	/** FUSE_READ bypasses the BPF program and uses the daemon transport */
 	unsigned int extfuse_read_upcall_only;
 
-	/** Per-open max_write runs with at most one terminal partial write */
+	/** Batch per-open buffered WRITE dispatch, including small random I/O */
 	unsigned int extfuse_wbcache_write_stream;
 
 	/** BPF ATTR-only guard for paper-mode WBCache lower READ. */
