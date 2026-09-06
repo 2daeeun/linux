@@ -1997,7 +1997,7 @@ fuse_uring_background_queue(struct fuse_ring *ring, struct fuse_req *req)
 	 * home queue. Per-request round-robin destroys sequential locality. The
 	 * daemon file handle distributes independent READ streams, but buffered
 	 * writeback uses the inode's representative write_file, not each writer's
-	 * open. Discontinuous fixed writeback may use an idle queue below. Other
+	 * open. Busy fixed writeback may use an idle queue below. Other
 	 * background operations use their nodeid, with round-robin retained only
 	 * for node-less requests.
 	 * Foreground requests continue to use fuse_uring_task_to_queue().
@@ -2042,13 +2042,13 @@ fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
 	    check_add_overflow(in->offset, (u64)in->size, &end))
 		return home;
 
-	/* Preserve contiguous runs, independent of request size or worker count. */
+	/* Prefer locality while the home queue can accept the contiguous run. */
 	sequential = !ff->uring_writeback_seen ||
 		     in->offset == ff->uring_writeback_end;
 	ff->uring_writeback_seen = true;
 	ff->uring_writeback_end = end;
-	if (sequential || ring->nr_queues == 1 ||
-	    (!home->active_background &&
+	if (ring->nr_queues == 1 ||
+	    ((sequential || !home->active_background) &&
 	     !list_empty(&home->ent_avail_queue) &&
 	     list_empty(&home->fuse_req_queue) &&
 	     list_empty(&home->fuse_req_bg_queue)))
@@ -2058,8 +2058,9 @@ fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
 	 * Available registered slots do not imply an idle userspace worker:
 	 * fixed writes also await lower I/O and COMMIT_AND_FETCH. Waiting for
 	 * every home slot to fill can serialize a discontinuous writeback stream
-	 * while other workers have no work. Prefer an idle fixed-I/O queue as
-	 * soon as home has work. Do not move queued or in-flight requests, bypass
+	 * while other workers have no work. Contiguous requests also need an idle
+	 * queue when home has no slot or older pending work; locality must not
+	 * create an unbounded backlog there. Do not move in-flight requests, bypass
 	 * older work on a candidate, or wait for a contended remote queue lock.
 	 */
 	spin_unlock(&home->lock);

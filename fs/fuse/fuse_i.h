@@ -363,9 +363,10 @@ struct fuse_file {
 	struct file *extfuse_wbcache_file;
 	struct fuse_backing *extfuse_wbcache_fb;
 
-	/** Serialize admission to the current bounded lower-WRITE batch */
+	/** Serialize admission to the current contiguous lower-WRITE batch */
 	spinlock_t extfuse_wbcache_stream_lock;
 	struct list_head extfuse_wbcache_stream_pending;
+	loff_t extfuse_wbcache_stream_tail;
 	u32 extfuse_wbcache_stream_sync_class;
 	bool extfuse_wbcache_stream_running:1;
 	bool extfuse_wbcache_stream_accepting:1;
@@ -546,7 +547,7 @@ struct fuse_req {
 
 	/** Executes a page-backed ExtFUSE request outside inode spinlocks. */
 	struct work_struct extfuse_wbcache_work;
-	/** Entry in a per-open full-size WBCache WRITE run. */
+	/** Entry in a per-open contiguous WBCache WRITE run. */
 	struct list_head extfuse_wbcache_stream_entry;
 
 	/** refcount */

@@ -513,7 +513,8 @@ struct fuse_file_lock {
  *			 FS_EXTFUSE and is incompatible with ExtFUSE WBCache
  *			 passthrough and coherence epochs
  * FUSE_EXTFUSE_WBCACHE_WRITE_STREAM: dispatch per-open FUSE_WRITE_CACHE
- *			 requests in bounded batches, including small random writes;
+ *			 contiguous requests in bounded batches, including small writes;
+ *			 discontinuous writes retain independent worker dispatch;
  *			 lower I/O and completion remain per request. Requires
  *			 FS_EXTFUSE, writeback cache and ExtFUSE WBCache passthrough,
  *			 and is incompatible with coherence epochs

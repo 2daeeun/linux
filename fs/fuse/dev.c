@@ -457,6 +457,8 @@ static void fuse_send_one(struct fuse_iqueue *fiq, struct fuse_req *req)
 #ifdef CONFIG_FUSE_PASSTHROUGH
 struct fuse_wbcache_stream_key {
 	struct fuse_file *ff;
+	loff_t offset;
+	loff_t end;
 	u32 sync_class;
 };
 
@@ -492,6 +494,8 @@ static bool fuse_wbcache_stream_key(struct fuse_req *req,
 		return false;
 
 	key->ff = ff;
+	key->offset = in->offset;
+	key->end = in->offset + in->size;
 	key->sync_class = in->flags & (O_DSYNC | O_SYNC);
 	return true;
 }
@@ -511,13 +515,14 @@ static bool fuse_wbcache_stream_queue(struct fuse_req *req)
 	spin_lock(&ff->extfuse_wbcache_stream_lock);
 	if (!ff->extfuse_wbcache_stream_running) {
 		/*
-		 * Small random writes also benefit from reusing this worker.
-		 * Keep each lower write and completion separate; only dispatch
-		 * is batched, in admission order, with a bounded worker budget.
+		 * A small write may start a contiguous run. Writeback uses one
+		 * representative open for a shared inode, so batching unrelated
+		 * offsets here would serialize all writers behind one worker.
 		 */
 		WARN_ON_ONCE(!list_empty(&ff->extfuse_wbcache_stream_pending));
 		ff->extfuse_wbcache_stream_running = true;
 		ff->extfuse_wbcache_stream_accepting = true;
+		ff->extfuse_wbcache_stream_tail = key.end;
 		ff->extfuse_wbcache_stream_sync_class = key.sync_class;
 		set_bit(FR_WBCACHE_STREAM, &req->flags);
 		handled = queue_work(req->fm->fc->extfuse_wbcache_wq,
@@ -526,17 +531,20 @@ static bool fuse_wbcache_stream_queue(struct fuse_req *req)
 			clear_bit(FR_WBCACHE_STREAM, &req->flags);
 			ff->extfuse_wbcache_stream_running = false;
 			ff->extfuse_wbcache_stream_accepting = false;
+			ff->extfuse_wbcache_stream_tail = 0;
 			ff->extfuse_wbcache_stream_sync_class = 0;
 		}
 	} else if (ff->extfuse_wbcache_stream_accepting &&
+		   ff->extfuse_wbcache_stream_tail == key.offset &&
 		   ff->extfuse_wbcache_stream_sync_class == key.sync_class) {
 		WARN_ON_ONCE(!list_empty(&req->extfuse_wbcache_stream_entry));
 		list_add_tail(&req->extfuse_wbcache_stream_entry,
 			      &ff->extfuse_wbcache_stream_pending);
 		set_bit(FR_WBCACHE_STREAM, &req->flags);
+		ff->extfuse_wbcache_stream_tail = key.end;
 		handled = true;
 	} else {
-		/* Do not mix sync classes or extend a run awaiting fallback. */
+		/* A gap or overlap ends batching; use ordinary parallel dispatch. */
 		ff->extfuse_wbcache_stream_accepting = false;
 	}
 	spin_unlock(&ff->extfuse_wbcache_stream_lock);
@@ -568,6 +576,7 @@ static struct fuse_req *fuse_wbcache_stream_next(struct fuse_req *req,
 	} else {
 		ff->extfuse_wbcache_stream_running = false;
 		ff->extfuse_wbcache_stream_accepting = false;
+		ff->extfuse_wbcache_stream_tail = 0;
 		ff->extfuse_wbcache_stream_sync_class = 0;
 	}
 	spin_unlock(&ff->extfuse_wbcache_stream_lock);
