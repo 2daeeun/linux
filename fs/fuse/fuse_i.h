@@ -1963,6 +1963,8 @@ ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
 #ifdef CONFIG_FUSE_PASSTHROUGH
 void fuse_passthrough_attr_refresh(struct inode *inode);
 void fuse_passthrough_read_atime_refresh(struct inode *inode);
+void fuse_wbcache_read_atime_refresh(struct inode *inode, struct file *file,
+				    const struct cred *cred);
 #else
 static inline void fuse_passthrough_attr_refresh(struct inode *inode)
 {

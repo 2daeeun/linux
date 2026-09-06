@@ -2370,18 +2370,34 @@ static ssize_t extfuse_release_race_fallback(struct fuse_conn *fc)
 	return READ_ONCE(fc->connected) ? -ENOSYS : -ENOTCONN;
 }
 
+static ssize_t extfuse_request_cached_or_refresh(struct fuse_conn *fc,
+					       struct fuse_args *args,
+					       bool *refreshed)
+{
+	struct inode *inode = args->extfuse_getattr_inode;
+	ssize_t ret;
+
+	ret = __extfuse_request_send(fc, args);
+	if (ret != -ENOSYS || *refreshed || args->opcode != FUSE_GETATTR ||
+	    !inode || !args->extfuse_getattr_refresh || !S_ISREG(inode->i_mode) ||
+	    get_node_id(inode) != args->nodeid || get_fuse_conn(inode) != fc ||
+	    !READ_ONCE(fc->extfuse_passthrough_attr_refresh))
+		return ret;
+
+	/* One logical request may refresh once, including a RELEASE retry. */
+	*refreshed = true;
+	args->extfuse_getattr_refresh(inode);
+	return __extfuse_request_send(fc, args);
+}
+
 static ssize_t extfuse_getattr_after_release(struct fuse_conn *fc,
 					     struct fuse_args *args,
-					     struct inode *inode)
+					     struct inode *inode,
+					     bool *refreshed)
 {
 	struct fuse_attr_release_barrier_snapshot snapshot;
 	ssize_t ret;
 
-	if (!READ_ONCE(fc->connected) ||
-	    !fuse_attr_release_barrier_enabled(fc))
-		return extfuse_release_race_fallback(fc);
-
-	args->extfuse_getattr_refresh(inode);
 	if (!READ_ONCE(fc->connected) ||
 	    !fuse_attr_release_barrier_enabled(fc))
 		return extfuse_release_race_fallback(fc);
@@ -2391,7 +2407,7 @@ static ssize_t extfuse_getattr_after_release(struct fuse_conn *fc,
 	if (snapshot.pending)
 		return extfuse_release_race_fallback(fc);
 
-	ret = __extfuse_request_send(fc, args);
+	ret = extfuse_request_cached_or_refresh(fc, args, refreshed);
 	if (!READ_ONCE(fc->connected) ||
 	    !fuse_attr_release_barrier_enabled(fc) ||
 	    fuse_attr_release_barrier_changed(inode, &snapshot))
@@ -2407,6 +2423,7 @@ noinline ssize_t extfuse_request_send(struct fuse_conn *fc,
 	struct fuse_attr_release_barrier_snapshot snapshot;
 	struct inode *inode = args->extfuse_getattr_inode;
 	bool release_barrier;
+	bool refreshed = false;
 	ssize_t ret;
 
 	/*
@@ -2418,11 +2435,11 @@ noinline ssize_t extfuse_request_send(struct fuse_conn *fc,
 		get_node_id(inode) == args->nodeid &&
 		fuse_attr_release_barrier_enabled(fc);
 	if (!release_barrier)
-		return __extfuse_request_send(fc, args);
+		return extfuse_request_cached_or_refresh(fc, args, &refreshed);
 
 	snapshot = fuse_attr_release_barrier_snapshot(inode);
 	if (!snapshot.pending) {
-		ret = __extfuse_request_send(fc, args);
+		ret = extfuse_request_cached_or_refresh(fc, args, &refreshed);
 		if (!fuse_attr_release_barrier_changed(inode, &snapshot))
 			return ret;
 	}
@@ -2439,7 +2456,7 @@ noinline ssize_t extfuse_request_send(struct fuse_conn *fc,
 	    !fuse_attr_release_barrier_enabled(fc))
 		return extfuse_release_race_fallback(fc);
 
-	return extfuse_getattr_after_release(fc, args, inode);
+	return extfuse_getattr_after_release(fc, args, inode, &refreshed);
 }
 EXPORT_SYMBOL_GPL(extfuse_request_send);
 

@@ -402,7 +402,8 @@ ssize_t fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
 		err = extfuse_paper_read_notify(fc, req->args->extfuse_inode,
 					       EXTFUSE_PASSTHROUGH_PHASE_END);
 		if (!err)
-			fuse_passthrough_read_atime_refresh(req->args->extfuse_inode);
+			fuse_wbcache_read_atime_refresh(req->args->extfuse_inode,
+						 io->file, io->cred);
 	}
 	fuse_wbcache_passthrough_cleanup(io);
 	return ret;

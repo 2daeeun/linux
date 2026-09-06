@@ -1541,7 +1541,9 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
 			retire_wbcache = fuse_file_io_getattr_begin(
 				inode, &wbcache_sequence);
 	}
-	fuse_passthrough_attr_refresh(inode);
+	/* Ordinary ExtFUSE GETATTR refreshes only after its cache lookup misses. */
+	if (READ_ONCE(fm->fc->extfuse_coherence_epochs))
+		fuse_passthrough_attr_refresh(inode);
 	err = fuse_simple_request(fm, &args);
 	if (!err) {
 		if (fuse_invalid_attr(&outarg.attr) ||
@@ -1584,6 +1586,9 @@ retry:
 	else if (flags & AT_STATX_FORCE_SYNC)
 		sync = true;
 	else if (flags & AT_STATX_DONT_SYNC)
+		sync = false;
+	else if (!(request_mask & ~cache_mask))
+		/* Writeback owns these fields and discards the server values. */
 		sync = false;
 	else if (request_mask & inval_mask & ~cache_mask)
 		sync = true;
