@@ -70,7 +70,7 @@ MODULE_PARM_DESC(max_user_congthresh,
  * two locally rebuilt fuse.ko instances with the same EXTRAVERSION.
  */
 #define FUSE_EXTFUSE_RUNTIME_CONTRACT \
-	"extfuse-fixed-writeback-balance-20260906"
+	"extfuse-fixed-writeback-idle-20260906"
 static char extfuse_runtime_contract[] = FUSE_EXTFUSE_RUNTIME_CONTRACT;
 module_param_string(extfuse_runtime_contract, extfuse_runtime_contract,
 		    sizeof(extfuse_runtime_contract), 0444);
