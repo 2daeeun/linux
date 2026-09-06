@@ -244,6 +244,28 @@ TRACE_EVENT(fuse_extfuse_coherence,
 		  __entry->reason, __entry->error, __entry->dependencies)
 );
 
+/* A READ completed under a shared native guard without its own BPF END. */
+TRACE_EVENT(fuse_wbcache_read_shared,
+	TP_PROTO(dev_t connection, u64 nodeid, s64 result),
+
+	TP_ARGS(connection, nodeid, result),
+
+	TP_STRUCT__entry(
+		__field(dev_t,	connection)
+		__field(u64,	nodeid)
+		__field(s64,	result)
+	),
+
+	TP_fast_assign(
+		__entry->connection = connection;
+		__entry->nodeid = nodeid;
+		__entry->result = result;
+	),
+
+	TP_printk("connection %u nodeid %llu result %lld",
+		  __entry->connection, __entry->nodeid, __entry->result)
+);
+
 TRACE_EVENT(fuse_request_count,
 	TP_PROTO(dev_t connection, u32 opcode, u32 stage, u32 action,
 		 u32 result_class),

@@ -523,8 +523,9 @@ struct fuse_file_lock {
  *			 changing logical metadata; requires FS_EXTFUSE and
  *			 SYNCFS_SUPPORT, and retains the BPF-first request boundary
  * FUSE_EXTFUSE_PAPER_READ_GUARD: bracket WBCache lower READ with BPF ATTR
- *			 BEGIN/END and refresh atime before completion; requires
- *			 FS_EXTFUSE, WBCACHE_PASSTHROUGH and ATTR_REFRESH, not epochs
+ *			 BEGIN/END; overlapping READs may share a guard and the last
+ *			 refreshes atime before completion. Requires FS_EXTFUSE,
+ *			 WBCACHE_PASSTHROUGH and ATTR_REFRESH, not epochs
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)

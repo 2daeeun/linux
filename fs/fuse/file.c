@@ -2144,6 +2144,9 @@ static void fuse_writepage_end(struct fuse_mount *fm, struct fuse_args *args,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	FUSE_CPU_SCOPE(fc);
 
+	/* A successful reply must cover every byte whose writeback we finish. */
+	if (!error && wpa->ia.write.out.size != wpa->ia.write.in.size)
+		error = -EIO;
 	mapping_set_error(inode->i_mapping, error);
 	/*
 	 * A writeback finished and this might have updated mtime/ctime on

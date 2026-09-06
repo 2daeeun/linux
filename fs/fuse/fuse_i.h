@@ -150,6 +150,9 @@ struct fuse_inode {
 	/** Serializes the ExtFUSE epoch and active-mutation state. */
 	spinlock_t extfuse_coherence_lock;
 
+	/** Paper READs sharing one native ATTR guard; private to inode lifetime. */
+	atomic64_t extfuse_wbcache_read_refs;
+
 	/** Distinguishes reuse of the same daemon-provided node ID. */
 	u64 extfuse_incarnation;
 

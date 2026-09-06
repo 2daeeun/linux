@@ -70,7 +70,7 @@ MODULE_PARM_DESC(max_user_congthresh,
  * two locally rebuilt fuse.ko instances with the same EXTRAVERSION.
  */
 #define FUSE_EXTFUSE_RUNTIME_CONTRACT \
-	"extfuse-batched-write-20260906"
+	"extfuse-read-cohort-20260906"
 static char extfuse_runtime_contract[] = FUSE_EXTFUSE_RUNTIME_CONTRACT;
 module_param_string(extfuse_runtime_contract, extfuse_runtime_contract,
 		    sizeof(extfuse_runtime_contract), 0444);
@@ -133,6 +133,7 @@ static struct inode *fuse_alloc_inode(struct super_block *sb)
 	mutex_init(&fi->mutex);
 	spin_lock_init(&fi->lock);
 	spin_lock_init(&fi->extfuse_coherence_lock);
+	atomic64_set(&fi->extfuse_wbcache_read_refs, 0);
 	fi->extfuse_incarnation = atomic64_inc_return(
 		&get_fuse_conn_super(sb)->extfuse_incarnation_ctr);
 	fi->extfuse_epoch[0] = 1;
@@ -173,6 +174,7 @@ static void fuse_free_inode(struct inode *inode)
 	kfree(fi->dax);
 #endif
 	if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH)) {
+		WARN_ON(atomic64_read(&fi->extfuse_wbcache_read_refs));
 		fb = fuse_inode_backing(fi);
 		wbcache_fb = fuse_inode_wbcache_backing(fi);
 		WARN_ON(fi->extfuse_wbcache_open_count);

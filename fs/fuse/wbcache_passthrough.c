@@ -9,6 +9,7 @@
 
 #include "fuse_i.h"
 #include "extfuse_i.h"
+#include "fuse_trace.h"
 
 #include <linux/backing-file.h>
 #include <linux/bvec.h>
@@ -366,6 +367,77 @@ void fuse_wbcache_passthrough_finish(struct fuse_wbcache_io *io)
 	kfree(alloc);
 }
 
+#define FUSE_WBCACHE_READ_BUSY S64_MAX
+#define FUSE_WBCACHE_READ_JOIN_ATTEMPTS 4
+
+static int fuse_wbcache_read_begin(struct fuse_conn *fc, struct inode *inode,
+				  bool *cohort)
+{
+	atomic64_t *counter = &get_fuse_inode(inode)->extfuse_wbcache_read_refs;
+	s64 refs = atomic64_read_acquire(counter);
+	unsigned int attempt;
+	int err;
+
+	*cohort = false;
+	for (attempt = 0; refs > 0 && refs < FUSE_WBCACHE_READ_BUSY - 1 &&
+	     attempt < FUSE_WBCACHE_READ_JOIN_ATTEMPTS; attempt++) {
+		if (atomic64_try_cmpxchg(counter, &refs, refs + 1)) {
+			*cohort = true;
+			return 0;
+		}
+	}
+	if (!refs && atomic64_try_cmpxchg(counter, &refs, FUSE_WBCACHE_READ_BUSY)) {
+		err = extfuse_paper_read_notify(fc, inode,
+					       EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
+		if (err) {
+			atomic64_set_release(counter, 0);
+			return err;
+		}
+		*cohort = true;
+		atomic64_set_release(counter, 1);
+		return 0;
+	}
+	/* Never wait behind a first BEGIN or last atime publication. */
+	return extfuse_paper_read_notify(fc, inode,
+					 EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
+}
+
+static void fuse_wbcache_read_end(struct fuse_req *req,
+				 struct fuse_wbcache_io *io, bool cohort,
+				 ssize_t result)
+{
+	struct fuse_conn *fc = req->fm->fc;
+	struct inode *inode = req->args->extfuse_inode;
+	atomic64_t *counter = &get_fuse_inode(inode)->extfuse_wbcache_read_refs;
+	s64 refs;
+	int err;
+
+	if (cohort) {
+		refs = atomic64_read_acquire(counter);
+		for (;;) {
+			s64 replacement;
+
+			if (WARN_ON_ONCE(refs <= 0 || refs == FUSE_WBCACHE_READ_BUSY)) {
+				fuse_abort_conn(fc);
+				return;
+			}
+			replacement = refs == 1 ? FUSE_WBCACHE_READ_BUSY : refs - 1;
+			if (atomic64_try_cmpxchg(counter, &refs, replacement))
+				break;
+		}
+		if (refs != 1) {
+			trace_fuse_wbcache_read_shared(fc->dev, get_node_id(inode),
+						       result);
+			return;
+		}
+	}
+	err = extfuse_paper_read_notify(fc, inode, EXTFUSE_PASSTHROUGH_PHASE_END);
+	if (!err)
+		fuse_wbcache_read_atime_refresh(inode, io->file, io->cred);
+	if (cohort)
+		atomic64_set_release(counter, 0);
+}
+
 ssize_t fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
 						bool *lower_started)
 {
@@ -373,6 +445,7 @@ ssize_t fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
 	struct fuse_wbcache_io *io = &paper_io.io;
 	struct fuse_conn *fc = req->fm->fc;
 	bool read_guard;
+	bool read_cohort = false;
 	ssize_t ret;
 	int err;
 
@@ -384,8 +457,8 @@ ssize_t fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
 		return err;
 	read_guard = !io->write && READ_ONCE(fc->extfuse_paper_read_guard);
 	if (read_guard) {
-		err = extfuse_paper_read_notify(fc, req->args->extfuse_inode,
-					       EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
+		err = fuse_wbcache_read_begin(fc, req->args->extfuse_inode,
+					      &read_cohort);
 		if (err) {
 			fuse_wbcache_passthrough_cleanup(io);
 			return err;
@@ -398,13 +471,8 @@ ssize_t fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
 		ret = -ENOTCONN;
 	else
 		ret = fuse_wbcache_passthrough_execute(req, io);
-	if (read_guard) {
-		err = extfuse_paper_read_notify(fc, req->args->extfuse_inode,
-					       EXTFUSE_PASSTHROUGH_PHASE_END);
-		if (!err)
-			fuse_wbcache_read_atime_refresh(req->args->extfuse_inode,
-						 io->file, io->cred);
-	}
+	if (read_guard)
+		fuse_wbcache_read_end(req, io, read_cohort, ret);
 	fuse_wbcache_passthrough_cleanup(io);
 	return ret;
 }
