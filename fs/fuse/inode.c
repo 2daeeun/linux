@@ -1599,6 +1599,14 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				else
 					fc->extfuse_passthrough_attr_release_barrier = 1;
 			}
+			if (flags & FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE) {
+				if (!fc->passthrough ||
+				    fc->extfuse_passthrough_coherence < 2 ||
+				    !fc->extfuse_passthrough_attr_refresh)
+					ok = false;
+				else
+					fc->extfuse_passthrough_mmap_release = 1;
+			}
 			if (flags & FUSE_EXTFUSE_COHERENCE_EPOCHS) {
 				if (arg->minor < 46 ||
 				    !(flags & FUSE_FS_EXTFUSE))
@@ -1789,7 +1797,8 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 			flags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE |
 				 FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2 |
 				 FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH |
-				 FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
+				 FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER |
+				 FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE;
 	}
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)

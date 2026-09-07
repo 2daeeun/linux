@@ -122,6 +122,15 @@ static void io_release_ubuf(void *priv)
 	}
 }
 
+static void io_release_bvec_folios(void *priv)
+{
+	struct io_mapped_ubuf *imu = priv;
+	unsigned int i;
+
+	for (i = 0; i < imu->nr_bvecs; i++)
+		folio_put(page_folio(imu->bvec[i].bv_page));
+}
+
 static struct io_mapped_ubuf *io_alloc_imu(struct io_ring_ctx *ctx,
 					   int nr_bvecs)
 {
@@ -829,6 +838,7 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 	imu->release = io_release_ubuf;
 	imu->priv = imu;
 	imu->is_kbuf = false;
+	imu->write_in_task = false;
 	imu->dir = IO_IMU_DEST | IO_IMU_SOURCE;
 	if (coalesced)
 		imu->folio_shift = data.folio_shift;
@@ -987,6 +997,7 @@ int io_buffer_register_bvec(struct io_uring_cmd *cmd, struct request *rq,
 	imu->priv = rq;
 	imu->is_kbuf = true;
 	imu->dir = 1 << rq_data_dir(rq);
+	imu->write_in_task = false;
 
 	rq_for_each_bvec(bv, rq, rq_iter)
 		imu->bvec[nr_bvecs++] = bv;
@@ -1005,6 +1016,12 @@ EXPORT_SYMBOL_GPL(io_buffer_register_bvec);
  * The array is copied before return.  On success @release owns @priv and is
  * called after the slot and all in-flight fixed-buffer users release it; on
  * failure ownership remains with the caller.
+ * With both @release and @priv NULL, take one folio reference per copied bvec
+ * and release those references through the retained array. The caller need
+ * only keep its input array and folios alive until this function returns.
+ * IO_BUF_WRITE_IN_TASK opts source buffers in to blocking buffered WRITE in
+ * the submitting task of a SINGLE_ISSUER/DEFER_TASKRUN ring. The property is
+ * retained when buffers are cloned; user buffers and ublk never opt in.
  *
  * Keep this separate from io_buffer_register_bvec(), whose request-based ABI
  * is used by ublk in this kernel series.
@@ -1029,8 +1046,12 @@ int io_buffer_register_bvec_array(struct io_uring_cmd *cmd,
 	BUILD_BUG_ON((unsigned int)IO_BUF_SOURCE !=
 		     (unsigned int)IO_IMU_SOURCE);
 
-	if (!bvs || !nr_bvecs || nr_bvecs > INT_MAX || !release ||
-	    !dir || (dir & ~(IO_BUF_DEST | IO_BUF_SOURCE)))
+	if (!bvs || !nr_bvecs || nr_bvecs > INT_MAX || (!release && priv) ||
+	    !(dir & (IO_BUF_DEST | IO_BUF_SOURCE)) ||
+	    (dir & ~(IO_BUF_DEST | IO_BUF_SOURCE | IO_BUF_WRITE_IN_TASK)))
+		return -EINVAL;
+	if ((dir & IO_BUF_WRITE_IN_TASK) &&
+	    (dir & (IO_BUF_DEST | IO_BUF_SOURCE)) != IO_BUF_SOURCE)
 		return -EINVAL;
 
 	for (i = 0; i < nr_bvecs; i++) {
@@ -1081,8 +1102,15 @@ int io_buffer_register_bvec_array(struct io_uring_cmd *cmd,
 	imu->release = release;
 	imu->priv = priv;
 	imu->is_kbuf = true;
-	imu->dir = dir;
+	imu->dir = dir & (IO_BUF_DEST | IO_BUF_SOURCE);
+	imu->write_in_task = dir & IO_BUF_WRITE_IN_TASK;
 	memcpy(imu->bvec, bvs, array_size(nr_bvecs, sizeof(*bvs)));
+	if (!release) {
+		for (i = 0; i < nr_bvecs; i++)
+			folio_get(page_folio(imu->bvec[i].bv_page));
+		imu->release = io_release_bvec_folios;
+		imu->priv = imu;
+	}
 
 	node->buf = imu;
 	data->nodes[index] = node;

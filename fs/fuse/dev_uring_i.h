@@ -129,6 +129,7 @@ struct fuse_ring_queue {
 
 	bool stopped;
 	bool zero_copy;
+	bool write_in_task;
 
 	enum fuse_queue_payload_mode payload_mode;
 	struct fuse_bufpool *bufpool;

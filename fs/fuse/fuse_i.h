@@ -358,6 +358,7 @@ struct fuse_file {
 	/** Reference to backing file in passthrough mode */
 	struct file *passthrough;
 	const struct cred *cred;
+	struct fuse_passthrough_mmap *passthrough_mmap;
 
 	/** Per-open lower file used by cached ExtFUSE passthrough */
 	struct file *extfuse_wbcache_file;
@@ -1041,6 +1042,9 @@ struct fuse_conn {
 
 	/** Serialize passthrough RELEASE with ExtFUSE GETATTR refresh */
 	unsigned int extfuse_passthrough_attr_release_barrier;
+
+	/** Retire native mmap guards at the final backing-file reference. */
+	unsigned int extfuse_passthrough_mmap_release;
 
 	/** Kernel-owned ExtFUSE inode coherence epochs */
 	unsigned int extfuse_coherence_epochs;

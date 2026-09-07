@@ -79,8 +79,10 @@ struct extfuse_req {
  * lower I/O.  Upper-file preparation such as privilege removal completes via
  * the filesystem's ordinary operations first.  BEGIN is then emitted before
  * direct backing-file I/O can mutate metadata; END is emitted after completion,
- * including asynchronous completion.  MMAP uses BEGIN alone as a persistent
- * marker when later page faults cannot be represented by a finite I/O bracket.
+ * including asynchronous completion. MMAP uses BEGIN for each mapping. With
+ * FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE, END retires mmap_count BEGINs only
+ * after their backing file's last reference and lower close. Otherwise MMAP
+ * markers remain persistent. Cached shared write faults remain persistent.
  */
 #define EXTFUSE_PASSTHROUGH_PHASE_BEGIN	1
 #define EXTFUSE_PASSTHROUGH_PHASE_END	2
@@ -91,7 +93,10 @@ struct extfuse_req {
 
 struct extfuse_passthrough_in {
 	__u32 phase;
-	__u32 reserved;
+	union {
+		__u32 reserved; /* zero except negotiated native MMAP END */
+		__u32 mmap_count;
+	};
 };
 
 /* Opaque state guarding a passthrough-backed attribute refresh. */

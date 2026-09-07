@@ -9,6 +9,7 @@
 #include <linux/string.h>
 #include <linux/slab.h>
 #include <linux/file.h>
+#include <linux/backing-file.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/fs.h>
@@ -46,6 +47,8 @@ static struct percpu_counter nr_files __cacheline_aligned_in_smp;
 /* Container for backing file with optional user path */
 struct backing_file {
 	struct file file;
+	void (*release)(struct file *file, void *data);
+	void *release_data;
 	union {
 		struct path user_path;
 		freeptr_t bf_freeptr;
@@ -66,6 +69,15 @@ void backing_file_set_user_path(struct file *f, const struct path *path)
 }
 EXPORT_SYMBOL_GPL(backing_file_set_user_path);
 
+/* Set once, before the backing file is exposed to concurrent users. */
+void backing_file_set_release(struct file *f,
+			      void (*release)(struct file *, void *), void *data)
+{
+	backing_file(f)->release_data = data;
+	backing_file(f)->release = release;
+}
+EXPORT_SYMBOL_GPL(backing_file_set_release);
+
 static inline void file_free(struct file *f)
 {
 	security_file_free(f);
@@ -73,6 +85,9 @@ static inline void file_free(struct file *f)
 		percpu_counter_dec(&nr_files);
 	put_cred(f->f_cred);
 	if (unlikely(f->f_mode & FMODE_BACKING)) {
+		/* Lower close is complete; the pinned upper path is still valid. */
+		if (backing_file(f)->release)
+			backing_file(f)->release(f, backing_file(f)->release_data);
 		path_put(backing_file_user_path(f));
 		kmem_cache_free(bfilp_cachep, backing_file(f));
 	} else {
@@ -306,6 +321,8 @@ struct file *alloc_empty_backing_file(int flags, const struct cred *cred)
 	}
 
 	ff->file.f_mode |= FMODE_BACKING | FMODE_NOACCOUNT;
+	ff->release = NULL;
+	ff->release_data = NULL;
 	return &ff->file;
 }
 

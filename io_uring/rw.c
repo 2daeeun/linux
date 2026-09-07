@@ -1122,12 +1122,45 @@ static bool io_kiocb_start_write(struct io_kiocb *req, struct kiocb *kiocb)
 	return ret;
 }
 
+static bool io_write_should_run_in_task(struct io_kiocb *req,
+					unsigned int issue_flags)
+{
+	struct io_ring_ctx *ctx = req->ctx;
+	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
+	unsigned int required = IO_URING_F_INLINE | IO_URING_F_NONBLOCK |
+				IO_URING_F_COMPLETE_DEFER;
+	unsigned int ring_flags = IORING_SETUP_SINGLE_ISSUER |
+				  IORING_SETUP_DEFER_TASKRUN;
+
+	/* A driver-owned source buffer explicitly permits blocking submission. */
+	if (req->opcode != IORING_OP_WRITE_FIXED ||
+	    !(req->flags & REQ_F_BUF_NODE) || !req->buf_node->buf->is_kbuf ||
+	    !req->buf_node->buf->write_in_task ||
+	    (issue_flags & required) != required ||
+	    (issue_flags & (IO_URING_F_UNLOCKED | IO_URING_F_IOWQ)) ||
+	    (ctx->flags & ring_flags) != ring_flags ||
+	    (ctx->flags & (IORING_SETUP_SQPOLL | IORING_SETUP_IOPOLL)) ||
+	    current != ctx->submitter_task)
+		return false;
+
+	/* Preserve explicit asynchronous/NOWAIT requests and native async I/O. */
+	return (req->flags & REQ_F_ISREG) &&
+		!(req->flags & (REQ_F_FORCE_ASYNC | REQ_F_NOWAIT |
+				REQ_F_LINK | REQ_F_HARDLINK | REQ_F_HAS_METADATA)) &&
+		rw->kiocb.ki_pos >= 0 &&
+		!(rw->kiocb.ki_flags & (IOCB_DIRECT | IOCB_NOWAIT | IOCB_HIPRI)) &&
+		!(req->file->f_flags & O_NONBLOCK) &&
+		req->file->f_op->write_iter &&
+		!(req->file->f_op->fop_flags & FOP_BUFFER_WASYNC);
+}
+
 int io_write(struct io_kiocb *req, unsigned int issue_flags)
 {
 	bool force_nonblock = issue_flags & IO_URING_F_NONBLOCK;
 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
 	struct io_async_rw *io = req->async_data;
 	struct kiocb *kiocb = &rw->kiocb;
+	bool write_in_task;
 	ssize_t ret, ret2;
 	loff_t *ppos;
 
@@ -1141,6 +1174,9 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 	if (unlikely(ret))
 		return ret;
 	req->cqe.res = iov_iter_count(&io->iter);
+	write_in_task = io_write_should_run_in_task(req, issue_flags);
+	if (write_in_task)
+		force_nonblock = false;
 
 	if (force_nonblock) {
 		/* If the file doesn't support async, just async punt */
@@ -1159,14 +1195,25 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 		kiocb->ki_flags &= ~IOCB_NOWAIT;
 	}
 
+	/*
+	 * The opted-in daemon already dedicates this task to its queue. Avoid
+	 * an io-wq round trip for synchronous buffered WRITE, but never hold the
+	 * ring mutex across inode locks, freeze waits or dirty-page throttling.
+	 * The request owns its file/buffer nodes. DEFER_TASKRUN keeps completion
+	 * and request-cache reuse in this same task until we reacquire the mutex.
+	 */
+	if (write_in_task)
+		mutex_unlock(&req->ctx->uring_lock);
 	ppos = io_kiocb_update_pos(req);
 
 	ret = rw_verify_area(WRITE, req->file, ppos, req->cqe.res);
 	if (unlikely(ret))
-		return ret;
+		goto out_relock;
 
-	if (unlikely(!io_kiocb_start_write(req, kiocb)))
-		return -EAGAIN;
+	if (unlikely(!io_kiocb_start_write(req, kiocb))) {
+		ret = -EAGAIN;
+		goto out_relock;
+	}
 	kiocb->ki_flags |= IOCB_WRITE;
 
 	if (likely(req->file->f_op->write_iter))
@@ -1175,6 +1222,10 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 		ret2 = loop_rw_iter(WRITE, rw, &io->iter);
 	else
 		ret2 = -EINVAL;
+	if (write_in_task) {
+		mutex_lock(&req->ctx->uring_lock);
+		trace_io_uring_write_in_task(req, ret2);
+	}
 
 	/*
 	 * Raw bdev writes will return -EOPNOTSUPP for IOCB_NOWAIT. Just
@@ -1216,6 +1267,10 @@ ret_eagain:
 			io_req_end_write(req);
 		return -EAGAIN;
 	}
+out_relock:
+	if (write_in_task)
+		mutex_lock(&req->ctx->uring_lock);
+	return ret;
 }
 
 int io_read_fixed(struct io_kiocb *req, unsigned int issue_flags)

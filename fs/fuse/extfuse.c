@@ -110,7 +110,7 @@ static int extfuse_passthrough_bpf_notify(struct fuse_conn *fc,
 					  struct inode *inode, u64 nodeid,
 					  u32 opcode, u32 phase,
 					  bool force_v2,
-					  bool allow_relaxed_read);
+					  bool allow_relaxed_read, u32 mmap_count);
 
 static_assert(sizeof(struct extfuse_passthrough_in) == 8);
 static_assert(sizeof(struct extfuse_passthrough_attr_cookie) == 16);
@@ -1873,7 +1873,7 @@ int extfuse_request_prepare_wbcache(struct fuse_req *req, gfp_t gfp)
 		EXTFUSE_PASSTHROUGH_READ : EXTFUSE_PASSTHROUGH_WRITE;
 	policy_result = extfuse_passthrough_bpf_notify(
 		fc, state->targets[0].inode, state->targets[0].pre.nodeid,
-		policy_opcode, EXTFUSE_PASSTHROUGH_PHASE_BEGIN, true, true);
+		policy_opcode, EXTFUSE_PASSTHROUGH_PHASE_BEGIN, true, true, 0);
 	if (policy_result < 0) {
 		/* No lower I/O or kernel epoch has started: rebuild before fallback. */
 		extfuse_optional_out_remove(req);
@@ -1935,7 +1935,7 @@ void extfuse_request_complete_wbcache(struct fuse_req *req, int error)
 						       state->targets[0].pre.nodeid,
 						       policy_opcode,
 						       EXTFUSE_PASSTHROUGH_PHASE_END,
-						       true, false);
+						       true, false, 0);
 	}
 	extfuse_request_end_mutation(req, error);
 	extfuse_optional_out_remove(req);
@@ -2573,10 +2573,11 @@ static int extfuse_passthrough_bpf_notify(struct fuse_conn *fc,
 					  struct inode *inode, u64 nodeid,
 					  u32 opcode, u32 phase,
 					  bool force_v2,
-					  bool allow_relaxed_read)
+					  bool allow_relaxed_read, u32 mmap_count)
 {
 	struct extfuse_passthrough_in in = {
 		.phase = phase,
+		.mmap_count = mmap_count,
 	};
 	struct fuse_args args = { };
 	u32 dependencies = opcode == EXTFUSE_PASSTHROUGH_READ ?
@@ -2629,11 +2630,13 @@ static int extfuse_passthrough_bpf_notify(struct fuse_conn *fc,
 		action = EXTFUSE_TRACE_ACTION_ERROR;
 	/*
 	 * BEGIN and END are one private policy bracket, not two logical I/O
-	 * requests.  Publish the completed bracket once at END.  MMAP has a
-	 * session-lifetime BEGIN only, and a failed BEGIN must remain observable.
+	 * requests. Publish the completed bracket once at END. MMAP is counted
+	 * at installation, including when a later backing-file END retires its
+	 * guard. Retirement must not count the mapping a second time.
 	 */
-	if (phase == EXTFUSE_PASSTHROUGH_PHASE_END || ret < 0 ||
-	    opcode == EXTFUSE_PASSTHROUGH_MMAP) {
+	if (opcode == EXTFUSE_PASSTHROUGH_MMAP ?
+	    phase == EXTFUSE_PASSTHROUGH_PHASE_BEGIN :
+	    phase == EXTFUSE_PASSTHROUGH_PHASE_END || ret < 0) {
 		ssize_t trace_result = ret < 0 ? ret : 0;
 
 		if (trace_fuse_request_count_enabled())
@@ -2660,17 +2663,40 @@ int extfuse_paper_read_notify(struct fuse_conn *fc, struct inode *inode,
 		return -EINVAL;
 	return extfuse_passthrough_bpf_notify(
 		fc, inode, get_node_id(inode), EXTFUSE_PASSTHROUGH_READ,
-		phase, true, false);
+		phase, true, false, 0);
 }
 EXPORT_SYMBOL_GPL(extfuse_paper_read_notify);
+
+int extfuse_passthrough_mmap_end(struct fuse_conn *fc, struct inode *inode,
+				u32 count)
+{
+	int ret;
+
+	if (!count || !READ_ONCE(fc->extfuse_passthrough_mmap_release))
+		return -EINVAL;
+	extfuse_coherence_invalidate_inode(fc, inode,
+		EXTFUSE_COHERENCE_DOMAIN_ATTR | EXTFUSE_COHERENCE_DOMAIN_DATA);
+	ret = extfuse_passthrough_bpf_notify(
+		fc, inode, get_node_id(inode), EXTFUSE_PASSTHROUGH_MMAP,
+		EXTFUSE_PASSTHROUGH_PHASE_END, false, false, count);
+	/* This is a lifetime event, not another logical mmap request. */
+	extfuse_trace_fc(fc, 0, EXTFUSE_PASSTHROUGH_MMAP, get_node_id(inode),
+		EXTFUSE_TRACE_PHASE_END,
+		ret ? EXTFUSE_TRACE_ACTION_ERROR : EXTFUSE_TRACE_ACTION_MUTATION,
+		ret ? EXTFUSE_TRACE_REASON_PROGRAM_ERROR : EXTFUSE_TRACE_REASON_NONE,
+		ret, EXTFUSE_COHERENCE_DOMAIN_ATTR | EXTFUSE_COHERENCE_DOMAIN_DATA);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(extfuse_passthrough_mmap_end);
 
 /*
  * Native passthrough has no ordinary FUSE READ/WRITE request.  Bracket lower
  * I/O with both the kernel epoch and the generation-map policy.  A BEGIN
  * failure prevents lower I/O; END always releases kernel ownership even when
  * the map remains deliberately active so later metadata requests fail closed.
- * MMAP is instead a session-lifetime marker shared by native/DAX mappings and
- * an actual cached shared-mmap write fault; it never owns a finite epoch span.
+ * MMAP guards unbracketed page faults. Native guards can be retired by the
+ * negotiated backing-file lifetime callback; cached shared write faults and
+ * older peers retain a persistent guard. MMAP never owns a finite epoch span.
  */
 static int __extfuse_passthrough_notify(struct fuse_conn *fc,
 					struct inode *inode, u64 nodeid,
@@ -2708,7 +2734,7 @@ static int __extfuse_passthrough_notify(struct fuse_conn *fc,
 	}
 
 	ret = extfuse_passthrough_bpf_notify(fc, inode, nodeid, opcode, phase,
-					     coherence_epochs, false);
+					     coherence_epochs, false, 0);
 	if (epoch_mutation && phase == EXTFUSE_PASSTHROUGH_PHASE_END) {
 		extfuse_inode_end(inode, dependencies);
 		extfuse_trace_fc(fc, 0, opcode, nodeid,
@@ -2767,6 +2793,7 @@ void extfuse_unload_prog(struct fuse_conn *fc)
 	struct extfuse_data *data;
 
 	WRITE_ONCE(fc->extfuse_passthrough_attr_release_barrier, 0);
+	WRITE_ONCE(fc->extfuse_passthrough_mmap_release, 0);
 	WRITE_ONCE(fc->extfuse_paper_read_guard, 0);
 	WRITE_ONCE(fc->extfuse_syncfs_pure, 0);
 	WRITE_ONCE(fc->extfuse_passthrough_attr_refresh, 0);

@@ -38,6 +38,7 @@ struct io_mapped_ubuf {
 	void		(*release)(void *);
 	void		*priv;
 	bool		is_kbuf;
+	bool		write_in_task;
 	u8		dir;
 	struct bio_vec	bvec[] __counted_by(nr_bvecs);
 };

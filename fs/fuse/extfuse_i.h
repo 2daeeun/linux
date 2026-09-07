@@ -66,6 +66,11 @@ struct fuse_conn;
 struct fuse_req;
 struct inode;
 
+/* Also used by callers of the !CONFIG_EXTFUSE notification stubs. */
+#define EXTFUSE_PASSTHROUGH_READ	65
+#define EXTFUSE_PASSTHROUGH_WRITE	66
+#define EXTFUSE_PASSTHROUGH_MMAP	67
+
 #if IS_ENABLED(CONFIG_EXTFUSE)
 
 #include <linux/bpf.h>
@@ -76,11 +81,6 @@ struct extfuse_data {
 };
 
 #define EXTFUSE_FLAGS		FUSE_FS_EXTFUSE
-
-/* Private BPF slots used by optional strict/native passthrough coherence. */
-#define EXTFUSE_PASSTHROUGH_READ	65
-#define EXTFUSE_PASSTHROUGH_WRITE	66
-#define EXTFUSE_PASSTHROUGH_MMAP	67
 
 int extfuse_load_prog(struct fuse_conn *fc, int fd);
 void extfuse_unload_prog(struct fuse_conn *fc);
@@ -110,6 +110,8 @@ int extfuse_passthrough_notify_inode(struct fuse_conn *fc,
 				     u32 phase);
 int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid, u32 opcode,
 			       u32 phase);
+int extfuse_passthrough_mmap_end(struct fuse_conn *fc, struct inode *inode,
+				u32 count);
 int extfuse_passthrough_attr_prepare(struct fuse_conn *fc, u64 nodeid,
 				     struct extfuse_passthrough_attr_cookie *cookie);
 int extfuse_passthrough_attr_commit(struct fuse_conn *fc, u64 nodeid,
@@ -233,6 +235,12 @@ extfuse_passthrough_notify_inode(struct fuse_conn *fc, struct inode *inode,
 
 static inline int extfuse_passthrough_notify(struct fuse_conn *fc, u64 nodeid,
 					     u32 opcode, u32 phase)
+{
+	return 0;
+}
+
+static inline int extfuse_passthrough_mmap_end(struct fuse_conn *fc,
+					     struct inode *inode, u32 count)
 {
 	return 0;
 }

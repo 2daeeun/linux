@@ -293,6 +293,25 @@ static int do_backing_file_write_iter(struct file *file, struct iov_iter *iter,
 	return ret;
 }
 
+static ssize_t backing_file_write_iter_prepared(struct file *file,
+					       struct iov_iter *iter,
+					       struct kiocb *iocb, int flags,
+					       struct backing_file_ctx *ctx)
+{
+	ssize_t ret;
+
+	if (iocb->ki_flags & IOCB_DIRECT &&
+	    !(file->f_mode & FMODE_CAN_ODIRECT))
+		return -EINVAL;
+
+	ret = backing_file_begin_io(ctx, iocb, true);
+	if (ret)
+		return ret;
+
+	scoped_with_creds(ctx->cred)
+		return do_backing_file_write_iter(file, iter, iocb, flags, ctx);
+}
+
 ssize_t backing_file_write_iter(struct file *file, struct iov_iter *iter,
 				struct kiocb *iocb, int flags,
 				struct backing_file_ctx *ctx)
@@ -316,18 +335,81 @@ ssize_t backing_file_write_iter(struct file *file, struct iov_iter *iter,
 	if (ret)
 		return ret;
 
-	if (iocb->ki_flags & IOCB_DIRECT &&
-	    !(file->f_mode & FMODE_CAN_ODIRECT))
-		return -EINVAL;
-
-	ret = backing_file_begin_io(ctx, iocb, true);
-	if (ret)
-		return ret;
-
-	scoped_with_creds(ctx->cred)
-		return do_backing_file_write_iter(file, iter, iocb, flags, ctx);
+	return backing_file_write_iter_prepared(file, iter, iocb, flags, ctx);
 }
 EXPORT_SYMBOL_GPL(backing_file_write_iter);
+
+static bool backing_file_write_is_overwrite(struct kiocb *iocb,
+					    struct iov_iter *iter, int flags)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	loff_t size = i_size_read(inode);
+	loff_t pos = iocb->ki_pos;
+
+	/* Shared locking must cover the complete lower I/O and its callbacks. */
+	if (!is_sync_kiocb(iocb) || !S_ISREG(inode->i_mode) ||
+	    ((iocb->ki_flags | flags) &
+	     (IOCB_DIRECT | IOCB_APPEND | IOCB_NOWAIT | IOCB_ATOMIC)) ||
+	    (iocb->ki_filp->f_flags & O_APPEND))
+		return false;
+	return pos >= 0 && pos <= size &&
+		iov_iter_count(iter) <= (u64)(size - pos);
+}
+
+/**
+ * backing_file_write_iter_locked - write while locking the upper inode
+ * @file: backing file
+ * @iter: write data
+ * @iocb: upper file I/O
+ * @flags: lower I/O flags
+ * @ctx: credentials and per-I/O callbacks
+ *
+ * Synchronous buffered overwrites that need no privilege removal can share
+ * the upper inode lock. Truncate, extending writes and privilege changes still
+ * require its exclusive side. Lower write serialization stays with the lower
+ * filesystem. Every admitted I/O retains its own BEGIN/END and attr callback.
+ * The caller must not already hold the upper inode lock.
+ */
+ssize_t backing_file_write_iter_locked(struct file *file, struct iov_iter *iter,
+				       struct kiocb *iocb, int flags,
+				       struct backing_file_ctx *ctx)
+{
+	struct file *upper = iocb->ki_filp;
+	struct inode *inode = file_inode(upper);
+	ssize_t ret;
+
+	if (WARN_ON_ONCE(!(file->f_mode & FMODE_BACKING)))
+		return -EIO;
+	if (!iov_iter_count(iter))
+		return 0;
+
+	if (backing_file_write_is_overwrite(iocb, iter, flags)) {
+		inode_lock_shared(inode);
+		/* Size may have changed before acquiring the shared lock. */
+		if (backing_file_write_is_overwrite(iocb, iter, flags)) {
+			ret = dentry_needs_remove_privs(file_mnt_idmap(upper),
+						       file_dentry(upper));
+			if (!ret) {
+				ret = backing_file_write_iter_prepared(
+					file, iter, iocb, flags, ctx);
+				inode_unlock_shared(inode);
+				return ret;
+			}
+			if (ret < 0) {
+				inode_unlock_shared(inode);
+				return ret;
+			}
+		}
+		inode_unlock_shared(inode);
+	}
+
+	/* Recheck privileges after a lock upgrade; no lower I/O has started. */
+	inode_lock(inode);
+	ret = backing_file_write_iter(file, iter, iocb, flags, ctx);
+	inode_unlock(inode);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(backing_file_write_iter_locked);
 
 ssize_t backing_file_splice_read(struct file *in, struct kiocb *iocb,
 				 struct pipe_inode_info *pipe, size_t len,

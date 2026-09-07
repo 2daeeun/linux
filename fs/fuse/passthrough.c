@@ -13,6 +13,25 @@
 #include <linux/backing-file.h>
 #include <linux/splice.h>
 
+struct fuse_passthrough_mmap {
+	atomic64_t mappings;
+};
+
+static void fuse_passthrough_backing_release(struct file *file, void *data)
+{
+	struct fuse_passthrough_mmap *state = data;
+	struct inode *inode = d_inode(backing_file_user_path(file)->dentry);
+	u64 count = atomic64_read(&state->mappings);
+
+	/* The backing file, including every forked VMA reference, is now dead. */
+	if (count && count <= U32_MAX) {
+		(void)extfuse_passthrough_mmap_end(get_fuse_conn(inode), inode,
+						 count);
+		fuse_invalidate_attr(inode);
+	}
+	kfree(state);
+}
+
 static struct fuse_backing *
 fuse_attr_refresh_backing_get(struct fuse_conn *fc, struct fuse_inode *fi)
 {
@@ -85,14 +104,18 @@ void fuse_passthrough_attr_refresh(struct inode *inode)
 	    !READ_ONCE(fc->extfuse_passthrough_attr_refresh))
 		return;
 
-	fb = fuse_attr_refresh_backing_get(fc, fi);
-	if (!fb)
+	/* Reject an ineligible token before taking a backing reference. */
+	if (!fuse_inode_backing(fi) && !fuse_inode_wbcache_backing(fi))
 		return;
 
 	err = extfuse_passthrough_attr_prepare(fc, get_node_id(inode),
 					       &cookie);
 	if (err)
-		goto out;
+		return;
+
+	fb = fuse_attr_refresh_backing_get(fc, fi);
+	if (!fb)
+		return;
 
 	old_cred = override_creds(fb->cred);
 	err = vfs_getattr(&fb->file->f_path, &stat, STATX_BASIC_STATS,
@@ -296,7 +319,6 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
 				    struct iov_iter *iter)
 {
 	struct file *file = iocb->ki_filp;
-	struct inode *inode = file_inode(file);
 	struct fuse_file *ff = file->private_data;
 	struct file *backing_file = fuse_file_passthrough(ff);
 	size_t count = iov_iter_count(iter);
@@ -313,10 +335,8 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
 
 	if (!count)
 		return 0;
-	inode_lock(inode);
-	ret = backing_file_write_iter(backing_file, iter, iocb, iocb->ki_flags,
-				      &ctx);
-	inode_unlock(inode);
+	ret = backing_file_write_iter_locked(backing_file, iter, iocb,
+					     iocb->ki_flags, &ctx);
 
 	return ret;
 }
@@ -396,17 +416,24 @@ ssize_t fuse_passthrough_mmap(struct file *file, struct vm_area_struct *vma)
 
 	/*
 	 * Page faults can update lower atime, and a writable shared mapping can
-	 * update size/times long after FUSE RELEASE. Install a session-lifetime
-	 * BPF marker before publishing every native mapping.
+	 * update size/times long after FUSE RELEASE. Guard every mapping before
+	 * publication. A negotiated backing-file release callback retires the
+	 * guards only after the last VMA/reference and lower close; older peers
+	 * retain their persistent markers.
 	 */
 	ret = fuse_passthrough_extfuse_notify(file, EXTFUSE_PASSTHROUGH_MMAP,
 					      EXTFUSE_PASSTHROUGH_PHASE_BEGIN);
 	if (ret)
 		goto out_end;
+	if (ff->passthrough_mmap)
+		atomic64_inc(&ff->passthrough_mmap->mappings);
 	/* Future page faults are not bracketed, so expire the VFS attr cache too. */
 	fuse_invalidate_attr(file_inode(file));
 
 	ret = backing_file_mmap(backing_file, vma, &ctx);
+	/* A stacking lower mmap may substitute a file with a different lifetime. */
+	if (!ret && vma->vm_file != backing_file && ff->passthrough_mmap)
+		atomic64_dec(&ff->passthrough_mmap->mappings);
 out_end:
 	(void)fuse_passthrough_extfuse_notify(file, EXTFUSE_PASSTHROUGH_READ,
 					     EXTFUSE_PASSTHROUGH_PHASE_END);
@@ -423,6 +450,7 @@ struct fuse_backing *fuse_passthrough_open(struct file *file, int backing_id)
 	struct fuse_file *ff = file->private_data;
 	struct fuse_conn *fc = ff->fm->fc;
 	struct fuse_backing *fb = NULL;
+	struct fuse_passthrough_mmap *mmap_state = NULL;
 	struct file *backing_file;
 	int err;
 
@@ -435,16 +463,29 @@ struct fuse_backing *fuse_passthrough_open(struct file *file, int backing_id)
 	if (!fb)
 		goto out;
 
+	if (READ_ONCE(fc->extfuse_passthrough_mmap_release)) {
+		mmap_state = kzalloc(sizeof(*mmap_state), GFP_KERNEL);
+		if (!mmap_state) {
+			fuse_backing_put(fb);
+			err = -ENOMEM;
+			goto out;
+		}
+	}
 	/* Allocate backing file per fuse file to store fuse path */
 	backing_file = backing_file_open(&file->f_path, file->f_flags,
 					 &fb->file->f_path, fb->cred);
 	err = PTR_ERR(backing_file);
 	if (IS_ERR(backing_file)) {
 		fuse_backing_put(fb);
+		kfree(mmap_state);
 		goto out;
 	}
 
 	err = 0;
+	if (mmap_state)
+		backing_file_set_release(backing_file,
+			fuse_passthrough_backing_release, mmap_state);
+	ff->passthrough_mmap = mmap_state;
 	ff->passthrough = backing_file;
 	ff->cred = get_cred(fb->cred);
 out:
@@ -461,6 +502,7 @@ void fuse_passthrough_release(struct fuse_file *ff, struct fuse_backing *fb)
 
 	fput(ff->passthrough);
 	ff->passthrough = NULL;
+	ff->passthrough_mmap = NULL;
 	put_cred(ff->cred);
 	ff->cred = NULL;
 }

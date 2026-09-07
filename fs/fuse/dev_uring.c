@@ -26,7 +26,8 @@ MODULE_PARM_DESC(enable_uring,
 #define FUSE_URING_IOV_HEADERS 0
 #define FUSE_URING_IOV_PAYLOAD 1
 
-#define FUSE_URING_ADD_QUEUE_FLAGS	FUSE_URING_ZERO_COPY
+#define FUSE_URING_ADD_QUEUE_FLAGS	(FUSE_URING_ZERO_COPY | \
+					 FUSE_URING_WRITE_IN_TASK)
 
 static_assert(sizeof(struct fuse_uring_ent_in_out) == 32);
 static_assert(sizeof(struct fuse_uring_cmd_req) == 40);
@@ -68,10 +69,8 @@ struct fuse_uring_pdu {
 	struct fuse_ring_ent *ent;
 };
 
-struct fuse_zero_copy_bvs {
-	unsigned int nr_bvs;
-	struct bio_vec bvs[];
-};
+/* Cover a 128 KiB request of base pages without a temporary allocation. */
+#define FUSE_URING_INLINE_BVECS 32
 
 static const struct fuse_iqueue_ops fuse_io_uring_ops;
 static void fuse_uring_recycle_buffer(struct fuse_ring_ent *ent);
@@ -404,7 +403,7 @@ out_err:
 }
 
 static struct fuse_ring_queue *
-fuse_uring_create_queue(struct fuse_ring *ring, int qid, bool zero_copy,
+fuse_uring_create_queue(struct fuse_ring *ring, int qid, u64 flags,
 			bool fail_if_exists, void *uring_ctx)
 {
 	struct fuse_conn *fc = ring->fc;
@@ -424,7 +423,8 @@ fuse_uring_create_queue(struct fuse_ring *ring, int qid, bool zero_copy,
 	queue->ring = ring;
 	queue->uring_ctx = uring_ctx;
 	spin_lock_init(&queue->lock);
-	queue->zero_copy = zero_copy;
+	queue->zero_copy = flags & FUSE_URING_ZERO_COPY;
+	queue->write_in_task = flags & FUSE_URING_WRITE_IN_TASK;
 
 	INIT_LIST_HEAD(&queue->ent_avail_queue);
 	INIT_LIST_HEAD(&queue->ent_commit_queue);
@@ -838,24 +838,14 @@ static int fuse_uring_copy_from_ring(struct fuse_req *req,
 	return err;
 }
 
-static void fuse_zero_copy_release(void *priv)
-{
-	struct fuse_zero_copy_bvs *zc_bvs = priv;
-	unsigned int i;
-
-	for (i = 0; i < zc_bvs->nr_bvs; i++)
-		folio_put(page_folio(zc_bvs->bvs[i].bv_page));
-
-	kvfree(zc_bvs);
-}
-
 static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
 				       struct fuse_req *req,
 				       unsigned int issue_flags)
 {
 	struct fuse_args_pages *ap;
-	struct fuse_zero_copy_bvs *zc_bvs;
-	struct bio_vec *bvs;
+	struct bio_vec inline_bvs[FUSE_URING_INLINE_BVECS];
+	struct bio_vec *bvs = inline_bvs;
+	unsigned int nr_bvs = 0;
 	unsigned int i;
 	size_t page_bytes = 0;
 	size_t expected_bytes;
@@ -874,11 +864,17 @@ static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
 		expected_bytes = req->args->out_args[0].size;
 		ddir |= IO_BUF_DEST;
 	} else if (req->args->opcode == FUSE_WRITE) {
+		const struct fuse_write_in *in = req->args->in_args[0].value;
+
 		if (req->args->in_numargs != 2 ||
 		    req->args->out_numargs != 1 || req->args->out_argvar)
 			return -EINVAL;
 		expected_bytes = req->args->in_args[1].size;
 		ddir |= IO_BUF_SOURCE;
+		if (ent->queue->write_in_task && in &&
+		    req->args->in_args[0].size >= sizeof(*in) &&
+		    (in->write_flags & FUSE_WRITE_CACHE))
+			ddir |= IO_BUF_WRITE_IN_TASK;
 	} else {
 		return -EINVAL;
 	}
@@ -890,13 +886,12 @@ static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
 	    ap->num_folios > ent->queue->ring->fc->max_pages)
 		return -EINVAL;
 
-	zc_bvs = kvmalloc(struct_size(zc_bvs, bvs, ap->num_folios),
-			     GFP_KERNEL_ACCOUNT);
-	if (!zc_bvs)
-		return -ENOMEM;
-
-	zc_bvs->nr_bvs = 0;
-	bvs = zc_bvs->bvs;
+	if (ap->num_folios > ARRAY_SIZE(inline_bvs)) {
+		bvs = kvmalloc_array(ap->num_folios, sizeof(*bvs),
+				     GFP_KERNEL_ACCOUNT);
+		if (!bvs)
+			return -ENOMEM;
+	}
 	/*
 	 * Writeback may crop the logical request at i_size while retaining the
 	 * covering folio descriptors.  Validate every descriptor, but expose only
@@ -929,10 +924,9 @@ static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
 			continue;
 
 		length = min_t(size_t, remaining_bytes, ap->descs[i].length);
-		bvec_set_folio(&bvs[zc_bvs->nr_bvs], folio, length,
+		bvec_set_folio(&bvs[nr_bvs], folio, length,
 			       ap->descs[i].offset);
-		folio_get(folio);
-		zc_bvs->nr_bvs++;
+		nr_bvs++;
 		remaining_bytes -= length;
 	}
 	if (remaining_bytes) {
@@ -940,18 +934,17 @@ static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
 		goto err_release;
 	}
 
-	err = io_buffer_register_bvec_array(ent->cmd, bvs, zc_bvs->nr_bvs,
-					    fuse_zero_copy_release, zc_bvs,
+	/* The registered copy owns its folio references, including late users. */
+	err = io_buffer_register_bvec_array(ent->cmd, bvs, nr_bvs,
+					    NULL, NULL,
 					    ddir, ent->zero_copy_index,
 					    issue_flags);
-	if (err)
-		goto err_release;
-
-	ent->zero_copied = true;
-	return 0;
+	if (!err)
+		ent->zero_copied = true;
 
 err_release:
-	fuse_zero_copy_release(zc_bvs);
+	if (bvs != inline_bvs)
+		kvfree(bvs);
 	return err;
 }
 
@@ -1669,7 +1662,7 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
 	/* Pairs with smp_store_release() in fuse_uring_create_queue(). */
 	queue = smp_load_acquire(&ring->queues[qid]);
 	if (!queue) {
-		queue = fuse_uring_create_queue(ring, qid, false, false,
+		queue = fuse_uring_create_queue(ring, qid, 0, false,
 						io_uring_cmd_ctx_handle(cmd));
 		if (IS_ERR(queue))
 			return PTR_ERR(queue);
@@ -1700,6 +1693,13 @@ static int fuse_uring_add_queue(struct io_uring_cmd *cmd,
 	struct fuse_ring_queue *queue;
 	bool zero_copy = flags & FUSE_URING_ZERO_COPY;
 
+	if (flags & ~FUSE_URING_ADD_QUEUE_FLAGS)
+		return -EINVAL;
+	if ((flags & FUSE_URING_WRITE_IN_TASK) && !zero_copy)
+		return -EINVAL;
+	if (zero_copy && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
 	/* Pairs with smp_store_release() in fuse_uring_create(). */
 	ring = smp_load_acquire(&fc->ring);
 	if (!READ_ONCE(fc->io_uring_bufpool))
@@ -1714,12 +1714,7 @@ static int fuse_uring_add_queue(struct io_uring_cmd *cmd,
 		pr_info_ratelimited("fuse: Invalid ring qid %u\n", qid);
 		return -EINVAL;
 	}
-	if (flags & ~FUSE_URING_ADD_QUEUE_FLAGS)
-		return -EINVAL;
-	if (zero_copy && !capable(CAP_SYS_ADMIN))
-		return -EPERM;
-
-	queue = fuse_uring_create_queue(ring, qid, zero_copy, true,
+	queue = fuse_uring_create_queue(ring, qid, flags, true,
 					io_uring_cmd_ctx_handle(cmd));
 	return IS_ERR(queue) ? PTR_ERR(queue) : 0;
 }

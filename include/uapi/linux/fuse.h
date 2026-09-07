@@ -527,6 +527,9 @@ struct fuse_file_lock {
  *			 BEGIN/END; overlapping READs may share a guard and the last
  *			 refreshes atime before completion. Requires FS_EXTFUSE,
  *			 WBCACHE_PASSTHROUGH and ATTR_REFRESH, not epochs
+ * FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE: retire native mmap markers after
+ *			 the last backing-file reference; requires native passthrough
+ *			 with ExtFUSE coherence V2 and attribute refresh
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -589,6 +592,7 @@ struct fuse_file_lock {
 #define FUSE_SYNCFS_SUPPORT	(1ULL << 55)
 #define FUSE_EXTFUSE_SYNCFS_PURE	(1ULL << 56)
 #define FUSE_EXTFUSE_PAPER_READ_GUARD (1ULL << 57)
+#define FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE (1ULL << 58)
 
 /**
  * CUSE INIT request/reply flags
@@ -1435,6 +1439,11 @@ enum fuse_uring_cmd {
 
 /* Supported fuse_uring_cmd_req flags for FUSE_IO_URING_CMD_ADD_QUEUE. */
 #define FUSE_URING_ZERO_COPY		(1 << 0)
+/*
+ * With ZERO_COPY, allow writeback source buffers to block buffered WRITE_FIXED
+ * in their SINGLE_ISSUER | DEFER_TASKRUN submission task.
+ */
+#define FUSE_URING_WRITE_IN_TASK		(1 << 1)
 
 /**
  * In the 80B command area of the SQE.

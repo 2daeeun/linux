@@ -617,6 +617,36 @@ TRACE_EVENT(io_uring_task_work_run,
 	TP_printk("tctx %p, count %u", __entry->tctx, __entry->count)
 );
 
+/* A driver-opted-in buffered WRITE issued directly by its submitter. */
+TRACE_EVENT(io_uring_write_in_task,
+
+	TP_PROTO(struct io_kiocb *req, long result),
+
+	TP_ARGS(req, result),
+
+	TP_STRUCT__entry(
+		__field(void *, ctx)
+		__field(void *, req)
+		__field(u64, user_data)
+		__field(unsigned int, buf_index)
+		__field(int, wanted)
+		__field(long, result)
+	),
+
+	TP_fast_assign(
+		__entry->ctx = req->ctx;
+		__entry->req = req;
+		__entry->user_data = req->cqe.user_data;
+		__entry->buf_index = req->buf_index;
+		__entry->wanted = req->cqe.res;
+		__entry->result = result;
+	),
+
+	TP_printk("ring %p, req %p, user_data 0x%llx, buf %u, wanted %d, result %ld",
+		  __entry->ctx, __entry->req, __entry->user_data,
+		  __entry->buf_index, __entry->wanted, __entry->result)
+);
+
 TRACE_EVENT(io_uring_short_write,
 
 	TP_PROTO(void *ctx, u64 fpos, u64 wanted, u64 got),

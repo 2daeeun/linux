@@ -186,11 +186,14 @@ static inline void io_uring_cmd_done32(struct io_uring_cmd *ioucmd, s32 ret,
 enum io_uring_buf_direction {
 	IO_BUF_DEST	= 1 << ITER_DEST,
 	IO_BUF_SOURCE	= 1 << ITER_SOURCE,
+	/* Kernel source buffers may opt in to blocking fixed WRITE submission. */
+	IO_BUF_WRITE_IN_TASK = 1 << 2,
 };
 
 int io_buffer_register_bvec(struct io_uring_cmd *cmd, struct request *rq,
 			    void (*release)(void *), unsigned int index,
 			    unsigned int issue_flags);
+/* NULL release/priv retains folio references until the last fixed-I/O user. */
 int io_buffer_register_bvec_array(struct io_uring_cmd *cmd,
 				  const struct bio_vec *bvs,
 				  unsigned int nr_bvecs,
