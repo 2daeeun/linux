@@ -202,23 +202,24 @@ static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
 	struct fuse_ring_queue *queue = ent->queue;
 	struct fuse_ring *ring = queue->ring;
 	struct fuse_conn *fc = ring->fc;
-	bool background = false;
+	bool flush_bg = false;
 
 	lockdep_assert_not_held(&queue->lock);
 	spin_lock(&queue->lock);
 	ent->fuse_req = NULL;
 	list_del_init(&req->list);
 	if (test_bit(FR_BACKGROUND, &req->flags)) {
-		background = true;
 		queue->active_background--;
 		spin_lock(&fc->bg_lock);
 		fuse_request_bg_finish(fc, req);
 		fuse_uring_flush_bg(queue);
+		/* New legacy enqueues perform their own flush under bg_lock. */
+		flush_bg = !list_empty(&fc->bg_queue);
 		spin_unlock(&fc->bg_lock);
 	}
 
 	spin_unlock(&queue->lock);
-	if (background) {
+	if (flush_bg) {
 		spin_lock(&fc->bg_lock);
 		fuse_flush_bg_queue(fc);
 		spin_unlock(&fc->bg_lock);
@@ -988,6 +989,14 @@ static int fuse_uring_args_to_ring(struct fuse_req *req,
 		num_args--;
 	}
 
+	/* No copied input remains after the per-op header and fixed pages. */
+	if (!num_args)
+		goto out;
+	if (ent->zero_copied && args->in_pages && num_args == 1) {
+		ent_in_out.payload_sz = in_args[0].size;
+		goto out;
+	}
+
 	err = setup_fuse_copy_state(&cs, req, ent, ITER_DEST, &iter,
 				    issue_flags);
 	if (err)
@@ -1012,6 +1021,7 @@ static int fuse_uring_args_to_ring(struct fuse_req *req,
 		ent_in_out.payload_sz +=
 			args->in_args[args->in_numargs - 1].size;
 
+out:
 	if (bufpool_enabled(ent->queue) && ent->payload.iov_base)
 		ent_in_out.offset =
 			(uintptr_t)ent->payload.iov_base -
@@ -1992,7 +2002,7 @@ fuse_uring_background_queue(struct fuse_ring *ring, struct fuse_req *req)
 	 * home queue. Per-request round-robin destroys sequential locality. The
 	 * daemon file handle distributes independent READ streams, but buffered
 	 * writeback uses the inode's representative write_file, not each writer's
-	 * open. Busy fixed writeback may use an idle queue below. Other
+	 * open. Busy writeback may use an idle queue below. Other
 	 * background operations use their nodeid, with round-robin retained only
 	 * for node-less requests.
 	 * Foreground requests continue to use fuse_uring_task_to_queue().
@@ -2026,8 +2036,8 @@ fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
 	u64 end;
 
 	spin_lock(&home->lock);
-	/* READ, copied I/O and direct writes keep the existing placement. */
-	if (home->stopped || !home->zero_copy || !args->zero_copy ||
+	/* READ and direct writes keep the existing placement. */
+	if (home->stopped || home->zero_copy != args->zero_copy ||
 	    req->in.h.opcode != FUSE_WRITE || !ff || !args->in_pages ||
 	    args->out_pages || args->in_numargs < 1 ||
 	    args->in_args[0].size < sizeof(*in) || !args->in_args[0].value)
@@ -2042,7 +2052,8 @@ fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
 		     in->offset == ff->uring_writeback_end;
 	ff->uring_writeback_seen = true;
 	ff->uring_writeback_end = end;
-	if (ring->nr_queues == 1 ||
+	/* Copied sequential writeback retains its existing home queue. */
+	if (ring->nr_queues == 1 || (sequential && !args->zero_copy) ||
 	    ((sequential || !home->active_background) &&
 	     !list_empty(&home->ent_avail_queue) &&
 	     list_empty(&home->fuse_req_queue) &&
@@ -2051,12 +2062,13 @@ fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
 
 	/*
 	 * Available registered slots do not imply an idle userspace worker:
-	 * fixed writes also await lower I/O and COMMIT_AND_FETCH. Waiting for
-	 * every home slot to fill can serialize a discontinuous writeback stream
-	 * while other workers have no work. Contiguous requests also need an idle
-	 * queue when home has no slot or older pending work; locality must not
-	 * create an unbounded backlog there. Do not move in-flight requests, bypass
-	 * older work on a candidate, or wait for a contended remote queue lock.
+	 * copied writes block the worker, while fixed writes also await lower
+	 * I/O and COMMIT_AND_FETCH. Waiting for every home slot to fill can serialize
+	 * a discontinuous writeback stream while other workers have no work. Fixed
+	 * contiguous requests also need an idle queue when home has no slot or older
+	 * pending work; locality must not create an unbounded backlog there. Do not
+	 * move in-flight requests, bypass older work on a candidate, or wait for a
+	 * contended remote queue lock.
 	 */
 	spin_unlock(&home->lock);
 	start = (unsigned int)atomic_fetch_inc_relaxed(&ring->bg_queue_seq);
@@ -2066,7 +2078,7 @@ fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
 		queue = READ_ONCE(ring->queues[qid]);
 		if (!queue || queue == home || !spin_trylock(&queue->lock))
 			continue;
-		if (!queue->stopped && queue->zero_copy &&
+		if (!queue->stopped && queue->zero_copy == home->zero_copy &&
 		    !queue->active_background &&
 		    !list_empty(&queue->ent_avail_queue) &&
 		    list_empty(&queue->fuse_req_queue) &&
