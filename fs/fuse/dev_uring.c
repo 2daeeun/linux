@@ -16,11 +16,22 @@
 #include <linux/hash.h>
 #include <linux/io_uring/cmd.h>
 #include <linux/overflow.h>
+#include <linux/topology.h>
 
 static bool __read_mostly enable_uring;
 module_param(enable_uring, bool, 0644);
 MODULE_PARM_DESC(enable_uring,
 		 "Enable userspace communication through io-uring");
+
+static bool __read_mostly uring_writeback_stream_affinity = true;
+module_param(uring_writeback_stream_affinity, bool, 0644);
+MODULE_PARM_DESC(uring_writeback_stream_affinity,
+		 "Limit synchronous fixed writeback to stream queues (new connections)");
+
+static unsigned int __read_mostly uring_writeback_stream_queues = 4;
+module_param(uring_writeback_stream_queues, uint, 0644);
+MODULE_PARM_DESC(uring_writeback_stream_queues,
+		 "Queues per writeback stream when affinity is enabled (new connections)");
 
 #define FUSE_URING_IOV_SEGS 2 /* header and payload */
 #define FUSE_URING_IOV_HEADERS 0
@@ -352,6 +363,30 @@ void fuse_uring_destruct(struct fuse_conn *fc)
 	fc->ring = NULL;
 }
 
+/* Resolve topology once; overflow placement only follows this immutable table. */
+static void fuse_uring_init_stream_queues(struct fuse_ring *ring)
+{
+	unsigned int qid;
+
+	for (qid = 0; qid < ring->nr_queues; qid++) {
+		const struct cpumask *cpus;
+		unsigned int next;
+		int node = cpu_to_node(qid);
+
+		ring->writeback_next_queue[qid] = qid;
+		if (node == NUMA_NO_NODE)
+			continue;
+		cpus = cpumask_of_node(node);
+		if (!cpumask_test_cpu(qid, cpus))
+			continue;
+		next = cpumask_next(qid, cpus);
+		if (next >= ring->nr_queues)
+			next = cpumask_first(cpus);
+		if (next < ring->nr_queues)
+			ring->writeback_next_queue[qid] = next;
+	}
+}
+
 /*
  * Basic ring setup for this connection based on the provided configuration
  */
@@ -362,7 +397,8 @@ static struct fuse_ring *fuse_uring_create(struct fuse_conn *fc)
 	struct fuse_ring *res = NULL;
 	size_t max_payload_size;
 
-	ring = kzalloc(sizeof(*fc->ring), GFP_KERNEL_ACCOUNT);
+	ring = kzalloc(struct_size(ring, writeback_next_queue, nr_queues),
+		       GFP_KERNEL_ACCOUNT);
 	if (!ring)
 		return NULL;
 
@@ -390,8 +426,13 @@ static struct fuse_ring *fuse_uring_create(struct fuse_conn *fc)
 	atomic_set(&ring->bg_queue_seq, 0);
 
 	ring->nr_queues = nr_queues;
+	fuse_uring_init_stream_queues(ring);
 	ring->fc = fc;
 	ring->max_payload_sz = max_payload_size;
+	ring->writeback_stream_affinity =
+		READ_ONCE(uring_writeback_stream_affinity);
+	ring->writeback_stream_queues = clamp_t(unsigned int,
+		READ_ONCE(uring_writeback_stream_queues), 1, nr_queues);
 	smp_store_release(&fc->ring, ring);
 
 	spin_unlock(&fc->lock);
@@ -2031,7 +2072,8 @@ fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
 	struct fuse_file *ff = args->extfuse_file;
 	const struct fuse_write_in *in;
 	struct fuse_ring_queue *queue;
-	unsigned int start, i, qid;
+	unsigned int start, i, qid, scan_queues;
+	bool batch_fixed, stream_affinity;
 	bool sequential;
 	u64 end;
 
@@ -2052,9 +2094,28 @@ fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
 		     in->offset == ff->uring_writeback_end;
 	ff->uring_writeback_seen = true;
 	ff->uring_writeback_end = end;
+	batch_fixed = args->zero_copy && home->write_in_task;
+	/*
+	 * A WRITE_IN_TASK worker executes buffered lower writes synchronously.
+	 * Free registered slots do not require spreading a stream over all
+	 * workers. Bound its overflow scan by default. A single worker also limits
+	 * overlap across lower writes and metadata completion, so allow a small
+	 * group on the home's NUMA node. Consecutive CPU numbers can straddle
+	 * nodes and make one stream's metadata and lower inode bounce between
+	 * sockets. Independent streams retain their hashed homes; READ, copied
+	 * and asynchronous fixed I/O keep the full
+	 * scan. No in-flight request is moved. Normal background admission and
+	 * completion drain pending work through the existing per-queue FIFO.
+	 */
+	scan_queues = ring->nr_queues;
+	stream_affinity = batch_fixed && ring->writeback_stream_affinity;
+	if (stream_affinity)
+		scan_queues = ring->writeback_stream_queues;
+	if (scan_queues == 1)
+		return home;
 	/* Copied sequential writeback retains its existing home queue. */
 	if (ring->nr_queues == 1 || (sequential && !args->zero_copy) ||
-	    ((sequential || !home->active_background) &&
+	    ((batch_fixed || sequential || !home->active_background) &&
 	     !list_empty(&home->ent_avail_queue) &&
 	     list_empty(&home->fuse_req_queue) &&
 	     list_empty(&home->fuse_req_bg_queue)))
@@ -2062,24 +2123,33 @@ fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
 
 	/*
 	 * Available registered slots do not imply an idle userspace worker:
-	 * copied writes block the worker, while fixed writes also await lower
-	 * I/O and COMMIT_AND_FETCH. Waiting for every home slot to fill can serialize
-	 * a discontinuous writeback stream while other workers have no work. Fixed
-	 * contiguous requests also need an idle queue when home has no slot or older
-	 * pending work; locality must not create an unbounded backlog there. Do not
-	 * move in-flight requests, bypass older work on a candidate, or wait for a
-	 * contended remote queue lock.
+	 * copied writes block the worker, while asynchronous fixed writes await
+	 * lower I/O and COMMIT_AND_FETCH. These paths prefer an idle worker.
+	 * WRITE_IN_TASK permits buffered writes in the queue's submitter.
+	 * Fill existing slots before waking more submitters that compete for the
+	 * same lower inode lock. A stable overflow scan packs the other queues
+	 * too, retaining all registered capacity when a stream needs more slots.
+	 * Never move in-flight requests, bypass older work on a candidate, or wait
+	 * for a contended remote queue lock.
 	 */
 	spin_unlock(&home->lock);
-	start = (unsigned int)atomic_fetch_inc_relaxed(&ring->bg_queue_seq);
+	if (batch_fixed)
+		start = home->qid;
+	else
+		start = (unsigned int)atomic_fetch_inc_relaxed(&ring->bg_queue_seq);
 	start %= ring->nr_queues;
-	for (i = 0; i < ring->nr_queues; i++) {
-		qid = (start + i) % ring->nr_queues;
+	for (i = 0, qid = start; i < scan_queues; i++) {
+		if (i) {
+			qid = stream_affinity ? ring->writeback_next_queue[qid] :
+				(qid + 1) % ring->nr_queues;
+			if (qid == start)
+				break;
+		}
 		queue = READ_ONCE(ring->queues[qid]);
 		if (!queue || queue == home || !spin_trylock(&queue->lock))
 			continue;
 		if (!queue->stopped && queue->zero_copy == home->zero_copy &&
-		    !queue->active_background &&
+		    (batch_fixed ? queue->write_in_task : !queue->active_background) &&
 		    !list_empty(&queue->ent_avail_queue) &&
 		    list_empty(&queue->fuse_req_queue) &&
 		    list_empty(&queue->fuse_req_bg_queue))
@@ -2087,7 +2157,33 @@ fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
 		spin_unlock(&queue->lock);
 	}
 
-	/* Saturation or teardown preserves the original queue/error path. */
+	/*
+	 * A copied worker completes its lower WRITE synchronously. If every
+	 * worker is busy, returning all new requests to home builds a backlog
+	 * that other queues cannot drain later. Spread discontinuous copied
+	 * writeback over live queues even when their slots are full. The caller
+	 * appends to the selected background FIFO; never move older requests or
+	 * bypass them. Fixed requests retain the home fallback below.
+	 * Cancellation can remove every entry before stopped is set.
+	 */
+	if (!args->zero_copy) {
+		for (i = 0; i < ring->nr_queues; i++) {
+			qid = (start + i) % ring->nr_queues;
+			queue = READ_ONCE(ring->queues[qid]);
+			if (!queue || !spin_trylock(&queue->lock))
+				continue;
+			if (!queue->stopped &&
+			    queue->zero_copy == home->zero_copy &&
+			    (!list_empty(&queue->ent_avail_queue) ||
+			     !list_empty(&queue->ent_in_userspace) ||
+			     !list_empty(&queue->ent_w_req_queue) ||
+			     !list_empty(&queue->ent_commit_queue)))
+				return queue;
+			spin_unlock(&queue->lock);
+		}
+	}
+
+	/* Teardown or contention preserves the original queue/error path. */
 	spin_lock(&home->lock);
 	return home;
 }

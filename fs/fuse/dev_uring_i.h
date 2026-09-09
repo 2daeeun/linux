@@ -170,6 +170,11 @@ struct fuse_ring {
 	atomic_t queue_refs;
 
 	bool ready;
+	/* Immutable snapshot of the module policy at connection creation. */
+	bool writeback_stream_affinity;
+	unsigned int writeback_stream_queues;
+	/* Immutable, cyclic queue order within each NUMA node. */
+	unsigned int writeback_next_queue[] __counted_by(nr_queues);
 };
 
 bool fuse_uring_enabled(void);

@@ -300,7 +300,8 @@ ssize_t fuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 		.cred = ff->cred,
 		.begin_io = fuse_passthrough_begin_io,
 		.end_io = fuse_passthrough_end_io,
-		.accessed = fuse_file_accessed,
+		/* end_io invalidates atime before a synchronous READ returns. */
+		.accessed = is_sync_kiocb(iocb) ? NULL : fuse_file_accessed,
 	};
 
 
@@ -351,7 +352,6 @@ ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
 		.cred = ff->cred,
 		.begin_io = fuse_passthrough_begin_io,
 		.end_io = fuse_passthrough_end_io,
-		.accessed = fuse_file_accessed,
 	};
 	struct kiocb iocb;
 	ssize_t ret;

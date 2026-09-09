@@ -1772,6 +1772,33 @@ free_key:
 
 #define BPF_MAP_UPDATE_ELEM_LAST_FIELD flags
 
+#define BPF_MAP_UPDATE_STACK_SIZE 256
+
+/*
+ * Only ordinary, software HASH values without special BTF fields use this
+ * scratch space. The hash implementation copies both inputs into its own
+ * element before returning. Keep the fixed-size buffer out of other paths.
+ */
+static noinline int map_update_elem_small(struct bpf_map *map,
+					struct file *map_file, bpfptr_t ukey,
+					bpfptr_t uvalue, u64 flags)
+{
+	u8 scratch[BPF_MAP_UPDATE_STACK_SIZE] __aligned(8);
+	void *key = scratch;
+	void *value = scratch + ALIGN(map->key_size, 8);
+	int err;
+
+	if (copy_from_bpfptr(key, ukey, map->key_size))
+		return -EFAULT;
+	if (copy_from_bpfptr(value, uvalue, map->value_size))
+		return -EFAULT;
+
+	err = bpf_map_update_value(map, map_file, key, value, flags);
+	if (!err)
+		maybe_wait_bpf_programs(map);
+	return err;
+}
+
 static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
 {
 	bpfptr_t ukey = make_bpfptr(attr->key, uattr.is_kernel);
@@ -1797,6 +1824,16 @@ static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
 	err = bpf_map_check_op_flags(map, attr->flags, ~0);
 	if (err)
 		goto err_put;
+
+	if (map->map_type == BPF_MAP_TYPE_HASH &&
+	    !bpf_map_is_offloaded(map) && !map->record &&
+	    map->key_size && map->value_size &&
+	    ALIGN((u64)map->key_size, 8) + map->value_size <=
+						BPF_MAP_UPDATE_STACK_SIZE) {
+		err = map_update_elem_small(map, fd_file(f), ukey, uvalue,
+					    attr->flags);
+		goto err_put;
+	}
 
 	key = ___bpf_copy_key(ukey, map->key_size);
 	if (IS_ERR(key)) {
