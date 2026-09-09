@@ -2158,6 +2158,44 @@ fuse_uring_lock_writeback_queue(struct fuse_ring *ring, struct fuse_req *req,
 	}
 
 	/*
+	 * Registered slots and background admission have different limits. Once
+	 * this fixed stream's slots are full, returning every request to home
+	 * strands its backlog there after the other workers drain their queues.
+	 * Rotate new pending work within the same bounded NUMA group. The caller
+	 * appends to that queue's FIFO; no existing request or buffer is moved.
+	 * i is the actual group size, which may be smaller than the policy width.
+	 */
+	if (stream_affinity && i > 1) {
+		unsigned int width = i;
+		unsigned int slot;
+
+		slot = (unsigned int)atomic_fetch_inc_relaxed(&ring->bg_queue_seq) %
+			width;
+		qid = home->qid;
+		for (i = 0; i < slot; i++)
+			qid = ring->writeback_next_queue[qid];
+		for (i = 0; i < width; i++) {
+			queue = READ_ONCE(ring->queues[qid]);
+			if (queue && spin_trylock(&queue->lock)) {
+				if (!queue->stopped && queue->zero_copy &&
+				    queue->write_in_task &&
+				    (!list_empty(&queue->ent_avail_queue) ||
+				     !list_empty(&queue->ent_in_userspace) ||
+				     !list_empty(&queue->ent_w_req_queue) ||
+				     !list_empty(&queue->ent_commit_queue)))
+					return queue;
+				spin_unlock(&queue->lock);
+			}
+			if (++slot == width) {
+				slot = 0;
+				qid = home->qid;
+			} else {
+				qid = ring->writeback_next_queue[qid];
+			}
+		}
+	}
+
+	/*
 	 * A copied worker completes its lower WRITE synchronously. If every
 	 * worker is busy, returning all new requests to home builds a backlog
 	 * that other queues cannot drain later. Spread discontinuous copied
