@@ -17,7 +17,7 @@ obj-$(CONFIG_EXTFUSE) += extfuse.o
 
 fuse-y := trace.o	# put trace.o first so we see ftrace errors sooner
 fuse-y += dev.o dir.o file.o inode.o control.o xattr.o acl.o readdir.o ioctl.o
-fuse-y += iomode.o
+fuse-y += iomode.o workload.o
 fuse-$(CONFIG_FUSE_DAX) += dax.o
 fuse-$(CONFIG_FUSE_PASSTHROUGH) += passthrough.o backing.o \
 				    wbcache_passthrough.o

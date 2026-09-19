@@ -36,6 +36,9 @@ enum fuse_ring_req_state {
 
 	/* The ring entry is released, but not freed yet */
 	FRRS_RELEASED,
+
+	/* Runtime entry metadata retained without a pending command. */
+	FRRS_PARKED,
 };
 
 enum fuse_queue_payload_mode {
@@ -81,6 +84,10 @@ struct fuse_ring_ent {
 	enum fuse_ring_req_state state;
 
 	struct fuse_req *fuse_req;
+
+	/* Stable for runtime queues, including while the payload is reclaimed. */
+	u32 id;
+	u64 generation;
 };
 
 struct fuse_ring_queue {
@@ -116,6 +123,7 @@ struct fuse_ring_queue {
 
 	/* entries that are released */
 	struct list_head ent_released;
+	struct list_head ent_parked;
 
 	/* fuse requests waiting for an entry slot */
 	struct list_head fuse_req_queue;
@@ -133,6 +141,15 @@ struct fuse_ring_queue {
 
 	enum fuse_queue_payload_mode payload_mode;
 	struct fuse_bufpool *bufpool;
+
+	/* Runtime configuration is serialized by lock; metadata never moves. */
+	bool runtime;
+	struct mutex runtime_mutex;
+	u32 runtime_state;
+	u32 max_depth;
+	u32 target_depth;
+	u64 generation;
+	struct fuse_ring_ent *entries;
 };
 
 /**

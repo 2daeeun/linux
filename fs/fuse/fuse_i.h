@@ -156,6 +156,11 @@ struct fuse_inode {
 	/** Distinguishes reuse of the same daemon-provided node ID. */
 	u64 extfuse_incarnation;
 
+	/* Optional workload monitor: inode-local, per-window READ/WRITE sequence. */
+	spinlock_t workload_lock;
+	u64 workload_epoch[2];
+	loff_t workload_end[2];
+
 	/** ATTR, XATTR, DATA and NAMESPACE epochs, in that order. */
 	u64 extfuse_epoch[4];
 
@@ -1069,6 +1074,14 @@ struct fuse_conn {
 
 	/* Connection negotiated io-uring buffer-pool/zero-copy protocol. */
 	unsigned int io_uring_bufpool;
+
+	/* Opt-in runtime queue reconfiguration and requested-I/O telemetry. */
+	unsigned int io_uring_runtime;
+	unsigned int workload_monitor;
+	struct mutex workload_mutex;
+	struct fuse_workload __rcu *workload;
+	u64 workload_epoch_ctr;
+	u64 workload_generation;
 
 	/** Maximum stack depth for passthrough backing files */
 	int max_stack_depth;

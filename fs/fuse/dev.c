@@ -11,6 +11,7 @@
 #include "fuse_cpu_scope.h"
 #include "fuse_dev_i.h"
 #include "extfuse_i.h"
+#include "workload.h"
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -3338,6 +3339,15 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 
 	case FUSE_DEV_IOC_SYNC_INIT:
 		return fuse_dev_ioctl_sync_init(file);
+
+	case FUSE_DEV_IOC_MONITOR_CONFIG:
+	case FUSE_DEV_IOC_MONITOR_SNAPSHOT: {
+		struct fuse_dev *fud = fuse_get_dev(file);
+
+		if (IS_ERR(fud))
+			return PTR_ERR(fud);
+		return fuse_workload_ioctl(fud->fc, cmd, argp);
+	}
 
 	default:
 		return -ENOTTY;

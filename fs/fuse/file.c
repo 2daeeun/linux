@@ -9,6 +9,7 @@
 #include "fuse_i.h"
 #include "fuse_cpu_scope.h"
 #include "extfuse_i.h"
+#include "workload.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -1967,6 +1968,8 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	if (fuse_is_bad(inode))
 		return -EIO;
 
+	fuse_workload_observe(iocb, to, false);
+
 	if (FUSE_IS_DAX(inode))
 		return fuse_dax_read_iter(iocb, to);
 
@@ -1988,6 +1991,8 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	if (fuse_is_bad(inode))
 		return -EIO;
+
+	fuse_workload_observe(iocb, from, true);
 
 	if (FUSE_IS_DAX(inode))
 		return fuse_dax_write_iter(iocb, from);

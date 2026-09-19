@@ -12,6 +12,7 @@
 #include "fuse_dev_i.h"
 #include "extfuse_i.h"
 #include "dev_uring_i.h"
+#include "workload.h"
 
 #include <linux/dax.h>
 #include <linux/pagemap.h>
@@ -133,6 +134,7 @@ static struct inode *fuse_alloc_inode(struct super_block *sb)
 	mutex_init(&fi->mutex);
 	spin_lock_init(&fi->lock);
 	spin_lock_init(&fi->extfuse_coherence_lock);
+	spin_lock_init(&fi->workload_lock);
 	atomic64_set(&fi->extfuse_wbcache_read_refs, 0);
 	fi->extfuse_incarnation = atomic64_inc_return(
 		&get_fuse_conn_super(sb)->extfuse_incarnation_ctr);
@@ -1021,6 +1023,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	memset(fc, 0, sizeof(*fc));
 	spin_lock_init(&fc->lock);
 	spin_lock_init(&fc->bg_lock);
+	fuse_workload_init(fc);
 	init_rwsem(&fc->killsb);
 	refcount_set(&fc->count, 1);
 	atomic_set(&fc->dev_count, 1);
@@ -1084,6 +1087,8 @@ void fuse_conn_put(struct fuse_conn *fc)
 
 	if (!refcount_dec_and_test(&fc->count))
 		return;
+
+	fuse_workload_destroy(fc);
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_conn_free(fc);
@@ -1522,6 +1527,14 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 			}
 			if (flags & FUSE_OVER_IO_URING && fuse_uring_enabled())
 				fc->io_uring = 1;
+			if (flags & FUSE_HAS_IO_URING_RUNTIME) {
+				if (!fc->io_uring)
+					ok = false;
+				else
+					fc->io_uring_runtime = 1;
+			}
+			if (flags & FUSE_HAS_WORKLOAD_MONITOR)
+				fc->workload_monitor = 1;
 			if (flags & FUSE_HAS_IO_URING_BUFPOOL) {
 				if (arg->minor < 48 ||
 				    !(flags & FUSE_OVER_IO_URING) ||
@@ -1778,7 +1791,8 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
-		FUSE_REQUEST_TIMEOUT | FUSE_SYNCFS_SUPPORT;
+		FUSE_REQUEST_TIMEOUT | FUSE_SYNCFS_SUPPORT |
+		FUSE_HAS_WORKLOAD_MONITOR;
 	if (fm->fc->iq.ops == &fuse_dev_fiq_ops) {
 		flags |= EXTFUSE_FLAGS;
 		if (IS_ENABLED(CONFIG_EXTFUSE))
@@ -1813,7 +1827,8 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 
 	/* The server must echo these capabilities before uring_cmd is accepted. */
 	if (fuse_uring_enabled())
-		flags |= FUSE_OVER_IO_URING | FUSE_HAS_IO_URING_BUFPOOL;
+		flags |= FUSE_OVER_IO_URING | FUSE_HAS_IO_URING_BUFPOOL |
+			 FUSE_HAS_IO_URING_RUNTIME;
 
 	ia->in.flags = flags;
 	ia->in.flags2 = flags >> 32;

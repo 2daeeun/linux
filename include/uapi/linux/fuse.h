@@ -593,6 +593,9 @@ struct fuse_file_lock {
 #define FUSE_EXTFUSE_SYNCFS_PURE	(1ULL << 56)
 #define FUSE_EXTFUSE_PAPER_READ_GUARD (1ULL << 57)
 #define FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE (1ULL << 58)
+/* Local, opt-in runtime queue control and application-facing telemetry. */
+#define FUSE_HAS_IO_URING_RUNTIME (1ULL << 59)
+#define FUSE_HAS_WORKLOAD_MONITOR (1ULL << 60)
 
 /**
  * CUSE INIT request/reply flags
@@ -1473,6 +1476,95 @@ struct fuse_uring_cmd_req {
 		 */
 		uint16_t ent_zero_copy_buf_index;
 	};
+};
+
+/* Versioned application-facing requested-I/O telemetry, independent of policy. */
+#define FUSE_WORKLOAD_VERSION 1
+#define FUSE_WORKLOAD_ENABLE (1U << 0)
+#define FUSE_WORKLOAD_WORKER (1U << 0)
+#define FUSE_WORKLOAD_APPEND (1U << 1)
+#define FUSE_WORKLOAD_PASSTHROUGH (1U << 2)
+#define FUSE_WORKLOAD_DAX (1U << 3)
+
+struct fuse_workload_config {
+	uint32_t version;
+	uint32_t flags;
+	uint64_t thresholds[3];
+	uint64_t reserved[2];
+};
+
+struct fuse_workload_op_stats {
+	uint64_t count[4];
+	uint64_t bytes[4];
+	uint64_t min_size;
+	uint64_t max_size;
+	uint64_t seq_pairs;
+	uint64_t seq_contiguous;
+	uint32_t files; /* Saturated cardinality: 0, 1, or at least 2. */
+	uint32_t requesters;
+};
+
+struct fuse_workload_snapshot {
+	uint32_t version;
+	uint32_t flags;
+	uint64_t generation;
+	uint64_t window_id;
+	uint64_t start_ns;
+	uint64_t end_ns;
+	struct fuse_workload_op_stats op[2]; /* READ, WRITE */
+};
+
+#define FUSE_DEV_IOC_MONITOR_CONFIG _IOW(FUSE_DEV_IOC_MAGIC, 4, struct fuse_workload_config)
+#define FUSE_DEV_IOC_MONITOR_SNAPSHOT _IOWR(FUSE_DEV_IOC_MAGIC, 5, struct fuse_workload_snapshot)
+
+/* New command payload; legacy fuse_uring_cmd_req remains unchanged. */
+#define FUSE_URING_RUNTIME_VERSION 1
+#define FUSE_URING_RUNTIME_INIT (1U << 0)
+#define FUSE_URING_RUNTIME_ZERO_COPY (1U << 1)
+#define FUSE_URING_RUNTIME_WRITE_IN_TASK (1U << 2)
+#define FUSE_URING_CQE_RETIRED 1
+#define FUSE_IO_URING_CMD_PAUSE 5
+#define FUSE_IO_URING_CMD_QUERY 6
+#define FUSE_IO_URING_CMD_RECONFIG 7
+#define FUSE_IO_URING_CMD_REARM 8
+#define FUSE_IO_URING_CMD_RESUME 9
+
+/*
+ * Exactly the SQE128 command area's 80 bytes. Unused fields must be zero,
+ * except QUERY accepts any generation and returns the actual generation.
+ */
+struct fuse_uring_runtime_cmd {
+	uint32_t version;
+	uint32_t qid;
+	uint32_t flags;
+	uint32_t depth;
+	uint32_t max_depth;
+	uint32_t pool_index;
+	/* INIT: 1; RECONFIG: current + 1; other mutations: current; QUERY: ignored. */
+	uint64_t generation;
+	uint64_t addr; /* Pool base address. */
+	uint64_t len; /* Pool length, or private payload capacity for REARM. */
+	uint64_t entry_id;
+	uint64_t header_addr;
+	uint64_t payload_addr;
+	uint64_t result_addr; /* QUERY output: struct fuse_uring_runtime_state. */
+};
+
+#define FUSE_URING_STATE_RUNNING 0
+#define FUSE_URING_STATE_QUIESCING 1
+#define FUSE_URING_STATE_QUIESCED 2
+#define FUSE_URING_STATE_STOPPED 3
+struct fuse_uring_runtime_state {
+	uint32_t version;
+	uint32_t state;
+	uint32_t qid;
+	uint32_t depth;
+	uint32_t max_depth;
+	uint32_t active;
+	uint32_t parked;
+	uint32_t reserved;
+	uint64_t generation;
+	uint64_t payload_bytes;
 };
 
 #endif /* _LINUX_FUSE_H */
