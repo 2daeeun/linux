@@ -156,10 +156,10 @@ struct fuse_inode {
 	/** Distinguishes reuse of the same daemon-provided node ID. */
 	u64 extfuse_incarnation;
 
-	/* Optional workload monitor: inode-local, per-window READ/WRITE sequence. */
+	/* Optional per-window sequence: READ, WRITE, and combined READ/WRITE. */
 	spinlock_t workload_lock;
-	u64 workload_epoch[2];
-	loff_t workload_end[2];
+	u64 workload_epoch[3];
+	loff_t workload_end[3];
 
 	/** ATTR, XATTR, DATA and NAMESPACE epochs, in that order. */
 	u64 extfuse_epoch[4];

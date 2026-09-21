@@ -1481,6 +1481,9 @@ struct fuse_uring_cmd_req {
 /* Versioned application-facing requested-I/O telemetry, independent of policy. */
 #define FUSE_WORKLOAD_VERSION 1
 #define FUSE_WORKLOAD_ENABLE (1U << 0)
+#define FUSE_WORKLOAD_DETAIL (1U << 1)
+/* Detail cardinalities are exact below this limit, saturated at the limit. */
+#define FUSE_WORKLOAD_CARDINALITY_LIMIT 33
 #define FUSE_WORKLOAD_WORKER (1U << 0)
 #define FUSE_WORKLOAD_APPEND (1U << 1)
 #define FUSE_WORKLOAD_PASSTHROUGH (1U << 2)
@@ -1514,8 +1517,18 @@ struct fuse_workload_snapshot {
 	struct fuse_workload_op_stats op[2]; /* READ, WRITE */
 };
 
+/* Optional combined READ/WRITE statistics; the embedded snapshot stays v1. */
+struct fuse_workload_detail {
+	struct fuse_workload_snapshot snapshot;
+	uint64_t seq_pairs;
+	uint64_t seq_contiguous;
+	uint32_t files;
+	uint32_t requesters;
+};
+
 #define FUSE_DEV_IOC_MONITOR_CONFIG _IOW(FUSE_DEV_IOC_MAGIC, 4, struct fuse_workload_config)
 #define FUSE_DEV_IOC_MONITOR_SNAPSHOT _IOWR(FUSE_DEV_IOC_MAGIC, 5, struct fuse_workload_snapshot)
+#define FUSE_DEV_IOC_MONITOR_DETAIL _IOWR(FUSE_DEV_IOC_MAGIC, 6, struct fuse_workload_detail)
 
 /* New command payload; legacy fuse_uring_cmd_req remains unchanged. */
 #define FUSE_URING_RUNTIME_VERSION 1

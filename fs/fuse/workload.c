@@ -27,8 +27,27 @@ struct fuse_workload_cpu {
 	struct fuse_workload_bank bank[2];
 };
 
+/* Retain up to 32 identities; 33 means that exact cardinality was exceeded. */
+struct fuse_workload_detail_bank {
+	u64 files[FUSE_WORKLOAD_CARDINALITY_LIMIT - 1];
+	struct {
+		u64 task_start;
+		u32 tid;
+	} requesters[FUSE_WORKLOAD_CARDINALITY_LIMIT - 1];
+	u64 seq_pairs;
+	u64 seq_contiguous;
+	u32 nr_files;
+	u32 nr_requesters;
+};
+
+struct fuse_workload_detail_cpu {
+	/* Protected by the matching fuse_workload_cpu lock. */
+	struct fuse_workload_detail_bank bank[2];
+};
+
 struct fuse_workload {
 	struct fuse_workload_cpu __percpu *cpu;
+	struct fuse_workload_detail_cpu __percpu *detail_cpu;
 	u64 thresholds[3];
 	u64 generation;
 	u64 start_ns;
@@ -43,6 +62,7 @@ void fuse_workload_init(struct fuse_conn *fc)
 static void fuse_workload_free(struct fuse_workload *monitor)
 {
 	if (monitor) {
+		free_percpu(monitor->detail_cpu);
 		free_percpu(monitor->cpu);
 		kfree(monitor);
 	}
@@ -58,6 +78,59 @@ void fuse_workload_destroy(struct fuse_conn *fc)
 		synchronize_rcu();
 		fuse_workload_free(monitor);
 	}
+}
+
+static void fuse_workload_file_add(struct fuse_workload_detail_bank *bank,
+				   u64 file)
+{
+	unsigned int i;
+
+	if (bank->nr_files == FUSE_WORKLOAD_CARDINALITY_LIMIT)
+		return;
+	for (i = 0; i < bank->nr_files; i++)
+		if (bank->files[i] == file)
+			return;
+	if (bank->nr_files < FUSE_WORKLOAD_CARDINALITY_LIMIT - 1)
+		bank->files[bank->nr_files] = file;
+	bank->nr_files++;
+}
+
+static void fuse_workload_requester_add(struct fuse_workload_detail_bank *bank,
+					u32 tid, u64 task_start)
+{
+	unsigned int i;
+
+	if (bank->nr_requesters == FUSE_WORKLOAD_CARDINALITY_LIMIT)
+		return;
+	for (i = 0; i < bank->nr_requesters; i++)
+		if (bank->requesters[i].tid == tid &&
+		    bank->requesters[i].task_start == task_start)
+			return;
+	if (bank->nr_requesters < FUSE_WORKLOAD_CARDINALITY_LIMIT - 1) {
+		bank->requesters[bank->nr_requesters].tid = tid;
+		bank->requesters[bank->nr_requesters].task_start = task_start;
+	}
+	bank->nr_requesters++;
+}
+
+static void fuse_workload_detail_merge(struct fuse_workload_detail_bank *dst,
+				      const struct fuse_workload_detail_bank *src)
+{
+	unsigned int i;
+
+	if (src->nr_files == FUSE_WORKLOAD_CARDINALITY_LIMIT)
+		dst->nr_files = FUSE_WORKLOAD_CARDINALITY_LIMIT;
+	else
+		for (i = 0; i < src->nr_files; i++)
+			fuse_workload_file_add(dst, src->files[i]);
+	if (src->nr_requesters == FUSE_WORKLOAD_CARDINALITY_LIMIT)
+		dst->nr_requesters = FUSE_WORKLOAD_CARDINALITY_LIMIT;
+	else
+		for (i = 0; i < src->nr_requesters; i++)
+			fuse_workload_requester_add(dst, src->requesters[i].tid,
+						   src->requesters[i].task_start);
+	dst->seq_pairs += src->seq_pairs;
+	dst->seq_contiguous += src->seq_contiguous;
 }
 
 static void fuse_workload_identity_add(struct fuse_workload_op_stats *op,
@@ -100,6 +173,7 @@ void fuse_workload_observe(struct kiocb *iocb, struct iov_iter *iter, bool write
 	unsigned long irqflags;
 	unsigned int bucket, flags = 0;
 	bool pair = false, contiguous = false;
+	bool combined_pair = false, combined_contiguous = false;
 	loff_t offset = iocb->ki_pos;
 
 	/* The pointer check is the only work for ordinary disabled sessions. */
@@ -133,8 +207,18 @@ void fuse_workload_observe(struct kiocb *iocb, struct iov_iter *iter, bool write
 		}
 		fi->workload_epoch[write] = epoch;
 		fi->workload_end[write] = offset + size;
+		if (monitor->detail_cpu) {
+			if (fi->workload_epoch[2] == epoch) {
+				combined_pair = true;
+				combined_contiguous = fi->workload_end[2] == offset;
+			}
+			fi->workload_epoch[2] = epoch;
+			fi->workload_end[2] = offset + size;
+		}
 	} else {
 		fi->workload_epoch[write] = 0;
+		if (monitor->detail_cpu)
+			fi->workload_epoch[2] = 0;
 	}
 	spin_unlock(&fi->workload_lock);
 
@@ -154,6 +238,15 @@ void fuse_workload_observe(struct kiocb *iocb, struct iov_iter *iter, bool write
 	op->seq_contiguous += contiguous;
 	fuse_workload_identity_add(op, &bank->first[write], &id, 1, 1);
 	bank->flags |= flags;
+	if (monitor->detail_cpu) {
+		struct fuse_workload_detail_bank *detail;
+
+		detail = &this_cpu_ptr(monitor->detail_cpu)->bank[epoch & 1];
+		fuse_workload_file_add(detail, id.file);
+		fuse_workload_requester_add(detail, id.tid, id.task_start);
+		detail->seq_pairs += combined_pair;
+		detail->seq_contiguous += combined_contiguous;
+	}
 	raw_spin_unlock_irqrestore(&cpu->lock, irqflags);
 	put_cpu_ptr(monitor->cpu);
 out:
@@ -169,7 +262,9 @@ static long fuse_workload_configure(struct fuse_conn *fc, void __user *argp)
 	if (copy_from_user(&config, argp, sizeof(config)))
 		return -EFAULT;
 	if (config.version != FUSE_WORKLOAD_VERSION ||
-	    config.flags & ~FUSE_WORKLOAD_ENABLE ||
+	    config.flags & ~(FUSE_WORKLOAD_ENABLE | FUSE_WORKLOAD_DETAIL) ||
+	    ((config.flags & FUSE_WORKLOAD_DETAIL) &&
+	     !(config.flags & FUSE_WORKLOAD_ENABLE)) ||
 	    config.reserved[0] || config.reserved[1])
 		return -EINVAL;
 	if (config.flags & FUSE_WORKLOAD_ENABLE) {
@@ -184,6 +279,14 @@ static long fuse_workload_configure(struct fuse_conn *fc, void __user *argp)
 		if (!monitor->cpu) {
 			kfree(monitor);
 			return -ENOMEM;
+		}
+		if (config.flags & FUSE_WORKLOAD_DETAIL) {
+			monitor->detail_cpu =
+				alloc_percpu(struct fuse_workload_detail_cpu);
+			if (!monitor->detail_cpu) {
+				fuse_workload_free(monitor);
+				return -ENOMEM;
+			}
 		}
 		for_each_possible_cpu(cpu)
 			raw_spin_lock_init(&per_cpu_ptr(monitor->cpu, cpu)->lock);
@@ -206,9 +309,12 @@ static long fuse_workload_configure(struct fuse_conn *fc, void __user *argp)
 	return 0;
 }
 
-static long fuse_workload_snapshot(struct fuse_conn *fc, void __user *argp)
+static long fuse_workload_snapshot(struct fuse_conn *fc, void __user *argp,
+				  bool want_detail)
 {
-	struct fuse_workload_snapshot snapshot = {};
+	struct fuse_workload_detail detail = {};
+	struct fuse_workload_snapshot *snapshot = &detail.snapshot;
+	struct fuse_workload_detail_bank combined = {};
 	struct fuse_workload_identity first[2] = {};
 	struct fuse_workload *monitor;
 	u32 version;
@@ -226,13 +332,17 @@ static long fuse_workload_snapshot(struct fuse_conn *fc, void __user *argp)
 		mutex_unlock(&fc->workload_mutex);
 		return -ENODATA;
 	}
+	if (want_detail && !monitor->detail_cpu) {
+		mutex_unlock(&fc->workload_mutex);
+		return -EOPNOTSUPP;
+	}
 	epoch = atomic64_read(&monitor->epoch);
-	snapshot.version = FUSE_WORKLOAD_VERSION;
-	snapshot.generation = monitor->generation;
-	snapshot.window_id = epoch;
-	snapshot.start_ns = monitor->start_ns;
-	snapshot.end_ns = ktime_get_ns();
-	monitor->start_ns = snapshot.end_ns;
+	snapshot->version = FUSE_WORKLOAD_VERSION;
+	snapshot->generation = monitor->generation;
+	snapshot->window_id = epoch;
+	snapshot->start_ns = monitor->start_ns;
+	snapshot->end_ns = ktime_get_ns();
+	monitor->start_ns = snapshot->end_ns;
 	/* Publish the cleared destination bank before an observer can use it. */
 	atomic64_set_release(&monitor->epoch, ++fc->workload_epoch_ctr);
 	/* All writers of the retired bank must finish before reading it. */
@@ -241,9 +351,9 @@ static long fuse_workload_snapshot(struct fuse_conn *fc, void __user *argp)
 		struct fuse_workload_bank *bank;
 
 		bank = &per_cpu_ptr(monitor->cpu, cpu)->bank[epoch & 1];
-		snapshot.flags |= bank->flags;
+		snapshot->flags |= bank->flags;
 		for (rw = 0; rw < 2; rw++) {
-			struct fuse_workload_op_stats *dst = &snapshot.op[rw];
+			struct fuse_workload_op_stats *dst = &snapshot->op[rw];
 			struct fuse_workload_op_stats *src = &bank->op[rw];
 
 			for (bucket = 0; bucket < 4; bucket++) {
@@ -260,9 +370,25 @@ static long fuse_workload_snapshot(struct fuse_conn *fc, void __user *argp)
 					  src->files, src->requesters);
 		}
 		memset(bank, 0, sizeof(*bank));
+		if (monitor->detail_cpu) {
+			struct fuse_workload_detail_bank *src;
+
+			src = &per_cpu_ptr(monitor->detail_cpu, cpu)->bank[epoch & 1];
+			if (want_detail)
+				fuse_workload_detail_merge(&combined, src);
+			/* Either snapshot operation consumes this same window. */
+			memset(src, 0, sizeof(*src));
+		}
 	}
 	mutex_unlock(&fc->workload_mutex);
-	return copy_to_user(argp, &snapshot, sizeof(snapshot)) ? -EFAULT : 0;
+	if (want_detail) {
+		detail.seq_pairs = combined.seq_pairs;
+		detail.seq_contiguous = combined.seq_contiguous;
+		detail.files = combined.nr_files;
+		detail.requesters = combined.nr_requesters;
+		return copy_to_user(argp, &detail, sizeof(detail)) ? -EFAULT : 0;
+	}
+	return copy_to_user(argp, snapshot, sizeof(*snapshot)) ? -EFAULT : 0;
 }
 
 long fuse_workload_ioctl(struct fuse_conn *fc, unsigned int cmd,
@@ -278,6 +404,8 @@ long fuse_workload_ioctl(struct fuse_conn *fc, unsigned int cmd,
 	if (cmd == FUSE_DEV_IOC_MONITOR_CONFIG)
 		return fuse_workload_configure(fc, argp);
 	if (cmd == FUSE_DEV_IOC_MONITOR_SNAPSHOT)
-		return fuse_workload_snapshot(fc, argp);
+		return fuse_workload_snapshot(fc, argp, false);
+	if (cmd == FUSE_DEV_IOC_MONITOR_DETAIL)
+		return fuse_workload_snapshot(fc, argp, true);
 	return -ENOTTY;
 }

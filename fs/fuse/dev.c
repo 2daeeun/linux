@@ -3341,7 +3341,8 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 		return fuse_dev_ioctl_sync_init(file);
 
 	case FUSE_DEV_IOC_MONITOR_CONFIG:
-	case FUSE_DEV_IOC_MONITOR_SNAPSHOT: {
+	case FUSE_DEV_IOC_MONITOR_SNAPSHOT:
+	case FUSE_DEV_IOC_MONITOR_DETAIL: {
 		struct fuse_dev *fud = fuse_get_dev(file);
 
 		if (IS_ERR(fud))
