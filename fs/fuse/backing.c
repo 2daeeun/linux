@@ -95,7 +95,11 @@ int fuse_backing_open(struct fuse_conn *fc, struct fuse_backing_map *map)
 		goto out;
 
 	res = -EINVAL;
-	if (map->flags || map->padding)
+	if ((map->flags & ~FUSE_BACKING_CAPABILITY_NEGATIVE_LOOKUP) ||
+	    map->padding)
+		goto out;
+	if (map->flags && (!fc->passthrough || fc->writeback_cache ||
+			   fc->extfuse_wbcache_passthrough))
 		goto out;
 
 	file = fget_raw(map->fd);
@@ -119,6 +123,7 @@ int fuse_backing_open(struct fuse_conn *fc, struct fuse_backing_map *map)
 		goto out_fput;
 
 	fb->file = file;
+	fb->flags = map->flags;
 	fb->cred = prepare_creds();
 	refcount_set(&fb->count, 1);
 

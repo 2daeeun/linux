@@ -107,6 +107,7 @@ struct fuse_submount_lookup {
 struct fuse_backing {
 	struct file *file;
 	struct cred *cred;
+	u32 flags;
 
 	/** refcount */
 	refcount_t count;
@@ -1981,11 +1982,17 @@ ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
 				     struct pipe_inode_info *pipe,
 				     size_t len, unsigned int flags);
 #ifdef CONFIG_FUSE_PASSTHROUGH
+bool fuse_passthrough_capability_absent(struct fuse_req *req);
 void fuse_passthrough_attr_refresh(struct inode *inode);
 void fuse_passthrough_read_atime_refresh(struct inode *inode);
 void fuse_wbcache_read_atime_refresh(struct inode *inode, struct file *file,
 				    const struct cred *cred);
 #else
+static inline bool
+fuse_passthrough_capability_absent(struct fuse_req *req)
+{
+	return false;
+}
 static inline void fuse_passthrough_attr_refresh(struct inode *inode)
 {
 }

@@ -1256,6 +1256,15 @@ struct fuse_notify_inval_xattr_out {
 	uint32_t	padding;
 };
 
+/*
+ * FUSE_BACKING_CAPABILITY_NEGATIVE_LOOKUP opts a native backing file into
+ * lower-backed absence checks for security.capability size queries. The
+ * server promises that an absent lower capability also means that the upper
+ * capability is absent. Every check queries the lower filesystem; no absence
+ * is cached. Values and errors other than ENODATA still go to the server.
+ */
+#define FUSE_BACKING_CAPABILITY_NEGATIVE_LOOKUP (1U << 0)
+
 struct fuse_backing_map {
 	int32_t		fd;
 	uint32_t	flags;

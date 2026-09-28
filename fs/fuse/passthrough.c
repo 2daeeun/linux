@@ -12,6 +12,81 @@
 #include <linux/file.h>
 #include <linux/backing-file.h>
 #include <linux/splice.h>
+#include <linux/xattr.h>
+
+/*
+ * Called after normal request admission and compatibility adjustment. The
+ * registration contract covers absence only; all other results keep the
+ * existing daemon path and its capability conversion/removal semantics.
+ */
+bool fuse_passthrough_capability_absent(struct fuse_req *req)
+{
+	const struct fuse_args *args = req->args;
+	const struct fuse_getxattr_in *inarg;
+	struct fuse_conn *fc = req->fm->fc;
+	struct fuse_inode *fi;
+	struct fuse_backing *fb;
+	struct inode *inode;
+	const struct cred *old_cred;
+	bool absent = false;
+	ssize_t ret;
+
+	/* Accept only the ordinary, synchronous GETXATTR size-query layout. */
+	if (!args || args->opcode != FUSE_GETXATTR || args->force ||
+	    args->nocreds || args->noreply || args->end || args->is_ext ||
+	    args->in_pages || args->out_pages || args->user_pages ||
+	    args->out_argvar || args->out_arg_optional || args->zero_copy ||
+	    args->in_numargs != 2 || args->out_numargs != 1 ||
+	    args->in_args[0].size != sizeof(*inarg) ||
+	    !args->in_args[0].value ||
+	    args->in_args[1].size != sizeof(XATTR_NAME_CAPS) ||
+	    !args->in_args[1].value ||
+	    args->out_args[0].size != sizeof(struct fuse_getxattr_out) ||
+	    !args->out_args[0].value)
+		return false;
+	inarg = args->in_args[0].value;
+	if (inarg->size || inarg->padding ||
+	    memcmp(args->in_args[1].value, XATTR_NAME_CAPS,
+		   sizeof(XATTR_NAME_CAPS)))
+		return false;
+
+	inode = args->extfuse_inode;
+	if (!inode || !S_ISREG(inode->i_mode) || get_fuse_conn(inode) != fc ||
+	    args->nodeid != get_node_id(inode) || !fc->passthrough ||
+	    fc->writeback_cache)
+		return false;
+	fi = get_fuse_inode(inode);
+
+	/* Registration and last close can change fi->fb under fi->lock. */
+	spin_lock(&fi->lock);
+	fb = fuse_inode_backing(fi);
+	if (fb && (fb->flags & FUSE_BACKING_CAPABILITY_NEGATIVE_LOOKUP) &&
+	    !fuse_inode_wbcache_backing(fi))
+		fb = fuse_backing_get(fb);
+	else
+		fb = NULL;
+	spin_unlock(&fi->lock);
+	if (!fb)
+		return false;
+	if (!fb->cred)
+		goto out;
+
+	/* Keep lower permission/LSM checks and the backing mount's idmapping. */
+	old_cred = override_creds(fb->cred);
+	ret = vfs_getxattr(file_mnt_idmap(fb->file), fb->file->f_path.dentry,
+			   XATTR_NAME_CAPS, NULL, 0);
+	revert_creds(old_cred);
+	if (ret == -ENODATA) {
+		/* Never consume a result from a detached or replaced backing. */
+		spin_lock(&fi->lock);
+		absent = fuse_inode_backing(fi) == fb &&
+			 !fuse_inode_wbcache_backing(fi);
+		spin_unlock(&fi->lock);
+	}
+out:
+	fuse_backing_put(fb);
+	return absent;
+}
 
 struct fuse_passthrough_mmap {
 	atomic64_t mappings;

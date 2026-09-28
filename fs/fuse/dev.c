@@ -985,6 +985,11 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
 	 * This preserves connection errors and legacy argument layouts.
 	 */
 	fuse_args_to_req(req, args);
+	if (args->opcode == FUSE_GETXATTR &&
+	    fuse_passthrough_capability_absent(req)) {
+		fuse_put_request(req);
+		return -ENODATA;
+	}
 	route = extfuse_request_pre(req, GFP_KERNEL, &ret);
 	if (route == EXTFUSE_PRE_COMPLETE || route == EXTFUSE_PRE_ERROR) {
 		fuse_put_request(req);
