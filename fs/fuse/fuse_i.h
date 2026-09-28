@@ -1982,14 +1982,25 @@ ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
 				     struct pipe_inode_info *pipe,
 				     size_t len, unsigned int flags);
 #ifdef CONFIG_FUSE_PASSTHROUGH
-bool fuse_passthrough_capability_absent(struct fuse_req *req);
+bool fuse_passthrough_capability_can_defer(struct fuse_mount *fm,
+					   const struct fuse_args *args);
+bool fuse_passthrough_capability_absent(struct fuse_mount *fm,
+					const struct fuse_args *args);
 void fuse_passthrough_attr_refresh(struct inode *inode);
 void fuse_passthrough_read_atime_refresh(struct inode *inode);
 void fuse_wbcache_read_atime_refresh(struct inode *inode, struct file *file,
 				    const struct cred *cred);
 #else
 static inline bool
-fuse_passthrough_capability_absent(struct fuse_req *req)
+fuse_passthrough_capability_can_defer(struct fuse_mount *fm,
+				      const struct fuse_args *args)
+{
+	return false;
+}
+
+static inline bool
+fuse_passthrough_capability_absent(struct fuse_mount *fm,
+				   const struct fuse_args *args)
 {
 	return false;
 }

@@ -14,22 +14,13 @@
 #include <linux/splice.h>
 #include <linux/xattr.h>
 
-/*
- * Called after normal request admission and compatibility adjustment. The
- * registration contract covers absence only; all other results keep the
- * existing daemon path and its capability conversion/removal semantics.
- */
-bool fuse_passthrough_capability_absent(struct fuse_req *req)
+static struct inode *
+fuse_passthrough_capability_inode(struct fuse_mount *fm,
+				  const struct fuse_args *args)
 {
-	const struct fuse_args *args = req->args;
 	const struct fuse_getxattr_in *inarg;
-	struct fuse_conn *fc = req->fm->fc;
-	struct fuse_inode *fi;
-	struct fuse_backing *fb;
+	struct fuse_conn *fc = fm->fc;
 	struct inode *inode;
-	const struct cred *old_cred;
-	bool absent = false;
-	ssize_t ret;
 
 	/* Accept only the ordinary, synchronous GETXATTR size-query layout. */
 	if (!args || args->opcode != FUSE_GETXATTR || args->force ||
@@ -43,17 +34,73 @@ bool fuse_passthrough_capability_absent(struct fuse_req *req)
 	    !args->in_args[1].value ||
 	    args->out_args[0].size != sizeof(struct fuse_getxattr_out) ||
 	    !args->out_args[0].value)
-		return false;
+		return NULL;
 	inarg = args->in_args[0].value;
 	if (inarg->size || inarg->padding ||
 	    memcmp(args->in_args[1].value, XATTR_NAME_CAPS,
 		   sizeof(XATTR_NAME_CAPS)))
-		return false;
+		return NULL;
 
 	inode = args->extfuse_inode;
 	if (!inode || !S_ISREG(inode->i_mode) || get_fuse_conn(inode) != fc ||
 	    args->nodeid != get_node_id(inode) || !fc->passthrough ||
 	    fc->writeback_cache)
+		return NULL;
+	return inode;
+}
+
+/*
+ * This is only a selection hint before admission, never an absence result.
+ * The actual lookup reacquires the backing and validates its identity again.
+ * INIT must be complete so an ExtFUSE connection cannot enter this path
+ * before its program and coherence policy have been published.
+ */
+bool fuse_passthrough_capability_can_defer(struct fuse_mount *fm,
+					   const struct fuse_args *args)
+{
+	struct fuse_conn *fc = fm->fc;
+	struct fuse_inode *fi;
+	struct fuse_backing *fb;
+	struct inode *inode;
+	bool eligible;
+
+	/* Pairs with fuse_set_initialized() after INIT policy publication. */
+	if (!smp_load_acquire(&fc->initialized) ||
+	    rcu_access_pointer(fc->fc_priv) ||
+	    READ_ONCE(fc->extfuse_passthrough_coherence) ||
+	    READ_ONCE(fc->extfuse_coherence_epochs))
+		return false;
+	inode = fuse_passthrough_capability_inode(fm, args);
+	if (!inode)
+		return false;
+	fi = get_fuse_inode(inode);
+
+	spin_lock(&fi->lock);
+	fb = fuse_inode_backing(fi);
+	eligible = fb && fb->cred &&
+		(fb->flags & FUSE_BACKING_CAPABILITY_NEGATIVE_LOOKUP) &&
+		!fuse_inode_wbcache_backing(fi);
+	spin_unlock(&fi->lock);
+	return eligible;
+}
+
+/*
+ * Called after normal request admission and compatibility adjustment. The
+ * registration contract covers absence only; all other results keep the
+ * existing daemon path and its capability conversion/removal semantics.
+ */
+bool fuse_passthrough_capability_absent(struct fuse_mount *fm,
+					const struct fuse_args *args)
+{
+	struct fuse_inode *fi;
+	struct fuse_backing *fb;
+	struct inode *inode;
+	const struct cred *old_cred;
+	bool absent = false;
+	ssize_t ret;
+
+	inode = fuse_passthrough_capability_inode(fm, args);
+	if (!inode)
 		return false;
 	fi = get_fuse_inode(inode);
 

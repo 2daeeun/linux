@@ -204,15 +204,9 @@ static void fuse_drop_waiting(struct fuse_conn *fc)
 
 static void fuse_put_request(struct fuse_req *req);
 
-static struct fuse_req *fuse_get_req(struct mnt_idmap *idmap,
-				     struct fuse_mount *fm,
-				     bool for_background)
+/* A successful admission owns one num_waiting reference. */
+static int fuse_request_admit(struct fuse_conn *fc, bool for_background)
 {
-	struct fuse_conn *fc = fm->fc;
-	struct fuse_req *req;
-	bool no_idmap = !fm->sb || (fm->sb->s_iflags & SB_I_NOIDMAP);
-	kuid_t fsuid;
-	kgid_t fsgid;
 	int err;
 
 	atomic_inc(&fc->num_waiting);
@@ -232,19 +226,22 @@ static struct fuse_req *fuse_get_req(struct mnt_idmap *idmap,
 	if (fc->conn_error)
 		goto out;
 
-	req = fuse_request_alloc(fm, GFP_KERNEL);
-	err = -ENOMEM;
-	if (!req) {
-		if (for_background)
-			wake_up(&fc->blocked_waitq);
-		goto out;
-	}
+	return 0;
 
-	req->in.h.pid = pid_nr_ns(task_pid(current), fc->pid_ns);
+ out:
+	fuse_drop_waiting(fc);
+	return err;
+}
 
-	__set_bit(FR_WAITING, &req->flags);
-	if (for_background)
-		__set_bit(FR_BACKGROUND, &req->flags);
+static int fuse_request_prepare_creds(struct mnt_idmap *idmap,
+				      struct fuse_mount *fm, bool no_idmap,
+				      struct fuse_in_header *in)
+{
+	struct fuse_conn *fc = fm->fc;
+	kuid_t fsuid;
+	kgid_t fsgid;
+
+	in->pid = pid_nr_ns(task_pid(current), fc->pid_ns);
 
 	/*
 	 * Keep the old behavior when idmappings support was not
@@ -253,17 +250,48 @@ static struct fuse_req *fuse_get_req(struct mnt_idmap *idmap,
 	 * For those FUSE servers who support idmapped mounts,
 	 * we send UID/GID only along with "inode creation"
 	 * fuse requests, otherwise idmap == &invalid_mnt_idmap and
-	 * req->in.h.{u,g}id will be equal to FUSE_INVALID_UIDGID.
+	 * in->{u,g}id will be equal to FUSE_INVALID_UIDGID.
 	 */
 	fsuid = no_idmap ? current_fsuid() : mapped_fsuid(idmap, fc->user_ns);
 	fsgid = no_idmap ? current_fsgid() : mapped_fsgid(idmap, fc->user_ns);
-	req->in.h.uid = from_kuid(fc->user_ns, fsuid);
-	req->in.h.gid = from_kgid(fc->user_ns, fsgid);
+	in->uid = from_kuid(fc->user_ns, fsuid);
+	in->gid = from_kgid(fc->user_ns, fsgid);
 
-	if (no_idmap && unlikely(req->in.h.uid == ((uid_t)-1) ||
-				 req->in.h.gid == ((gid_t)-1))) {
+	if (no_idmap && unlikely(in->uid == ((uid_t)-1) ||
+				 in->gid == ((gid_t)-1)))
+		return -EOVERFLOW;
+	return 0;
+}
+
+static struct fuse_req *fuse_get_req(struct mnt_idmap *idmap,
+				     struct fuse_mount *fm,
+				     bool for_background)
+{
+	struct fuse_conn *fc = fm->fc;
+	struct fuse_req *req;
+	bool no_idmap = !fm->sb || (fm->sb->s_iflags & SB_I_NOIDMAP);
+	int err;
+
+	err = fuse_request_admit(fc, for_background);
+	if (err)
+		return ERR_PTR(err);
+
+	req = fuse_request_alloc(fm, GFP_KERNEL);
+	err = -ENOMEM;
+	if (!req) {
+		if (for_background)
+			wake_up(&fc->blocked_waitq);
+		goto out;
+	}
+
+	__set_bit(FR_WAITING, &req->flags);
+	if (for_background)
+		__set_bit(FR_BACKGROUND, &req->flags);
+
+	err = fuse_request_prepare_creds(idmap, fm, no_idmap, &req->in.h);
+	if (err) {
 		fuse_put_request(req);
-		return ERR_PTR(-EOVERFLOW);
+		return ERR_PTR(err);
 	}
 
 	return req;
@@ -889,6 +917,51 @@ static void fuse_args_to_req(struct fuse_req *req, struct fuse_args *args)
 		__set_bit(FR_ASYNC, &req->flags);
 }
 
+/*
+ * A native negative capability lookup needs admission and caller credentials,
+ * but no transport request. Keep only its header until a lower lookup misses.
+ * This intentionally removes allocation failures from negative hits; on this
+ * narrow path credential errors also precede a possible miss allocation.
+ */
+static struct fuse_req *
+fuse_get_req_capability(struct mnt_idmap *idmap, struct fuse_mount *fm,
+			struct fuse_args *args)
+{
+	struct fuse_conn *fc = fm->fc;
+	struct fuse_in_header in = { };
+	struct fuse_req *req;
+	bool no_idmap = !fm->sb || (fm->sb->s_iflags & SB_I_NOIDMAP);
+	int err;
+
+	err = fuse_request_admit(fc, false);
+	if (err)
+		return ERR_PTR(err);
+	err = fuse_request_prepare_creds(idmap, fm, no_idmap, &in);
+	if (err)
+		goto out;
+
+	/* Admission has acquired INIT and checked io_uring readiness. */
+	fuse_adjust_compat(fc, args);
+	if (fuse_passthrough_capability_absent(fm, args)) {
+		err = -ENODATA;
+		goto out;
+	}
+
+	req = fuse_request_alloc(fm, GFP_KERNEL);
+	if (!req) {
+		err = -ENOMEM;
+		goto out;
+	}
+	req->in.h = in;
+	/* Transfer the existing admission; do not count this request twice. */
+	__set_bit(FR_WAITING, &req->flags);
+	return req;
+
+ out:
+	fuse_drop_waiting(fc);
+	return ERR_PTR(err);
+}
+
 static ssize_t __fuse_wbcache_request_execute(struct fuse_req *req, gfp_t gfp,
 					      bool *lower_started)
 {
@@ -958,6 +1031,7 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
 	struct fuse_conn *fc = fm->fc;
 	struct fuse_req *req;
 	enum extfuse_pre_route route;
+	bool capability_checked = false;
 	bool lower_started;
 	ssize_t ret;
 
@@ -972,21 +1046,29 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
 		__set_bit(FR_FORCE, &req->flags);
 	} else {
 		WARN_ON(args->nocreds);
-		req = fuse_get_req(idmap, fm, false);
+		if (args->opcode == FUSE_GETXATTR &&
+		    fuse_passthrough_capability_can_defer(fm, args)) {
+			req = fuse_get_req_capability(idmap, fm, args);
+			/* A miss must not repeat compatibility or the lower query. */
+			capability_checked = true;
+		} else {
+			req = fuse_get_req(idmap, fm, false);
+		}
 		if (IS_ERR(req))
 			return PTR_ERR(req);
 	}
 
 	/* Needs to be done after fuse_get_req() so that fc->minor is valid */
-	fuse_adjust_compat(fc, args);
+	if (!capability_checked)
+		fuse_adjust_compat(fc, args);
 
 	/*
 	 * Run ExtFUSE after request admission and compatibility adjustment.
 	 * This preserves connection errors and legacy argument layouts.
 	 */
 	fuse_args_to_req(req, args);
-	if (args->opcode == FUSE_GETXATTR &&
-	    fuse_passthrough_capability_absent(req)) {
+	if (!capability_checked && args->opcode == FUSE_GETXATTR &&
+	    fuse_passthrough_capability_absent(fm, args)) {
 		fuse_put_request(req);
 		return -ENODATA;
 	}
