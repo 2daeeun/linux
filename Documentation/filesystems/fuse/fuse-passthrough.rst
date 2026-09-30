@@ -131,3 +131,64 @@ file descriptors, starting with a higher privilege requirement (like
 ``CAP_SYS_ADMIN``) is a conservative and common security practice. This allows
 the feature to be used and tested while further security implications are
 evaluated and addressed.
+
+Advisory Lower-cache Writeback Hints
+==================================
+
+Native passthrough may optionally request asynchronous writeback of sampled
+byte ranges in the backing file's page cache. This retains native data I/O and
+does not enable ``FUSE_WRITEBACK_CACHE`` or create an upper FUSE data cache.
+The policy borrows deferred range processing from writeback caching; the lower
+filesystem still owns dirty pages, cache consistency and durable I/O errors.
+No userspace protocol or libfuse change is required.
+
+The ``passthrough_seq_wb_hints`` module parameter is disabled by default and
+sampled when a native passthrough file is opened. Eligible backing files must
+be initially empty, writable, non-DAX ext4 regular files with a writeback-capable
+mapping. Direct, append and synchronous opens are excluded. Successful ordinary
+synchronous ``write_iter`` calls sample exact 1MiB boundaries. At a sampled
+boundary, an unsupported I/O class, a missed boundary or a contended state
+update abandons the optional policy.
+Boundary sampling is not a complete sequential-access detector.
+
+An eligible open owns at most one pending or running delayed work item. A
+boundary records one 1MiB byte range; boundaries encountered while a work item
+exists do not queue additional work. After approximately 100ms, a shared ordered
+workqueue may invoke ``filemap_flush_range()`` with ``WB_SYNC_NONE`` under the
+backing-file credentials. A shared 100ms cooldown after helper completion limits
+helper starts across all opens. The range and cooldown do not impose a strict
+physical I/O size or device bandwidth cap, and the lower helper can sleep during
+allocation or journal work.
+
+Workers skip clean mappings, mappings already tagged for writeback, a frozen
+lower superblock or a shared cooldown. A clean/writeback tag check applies to
+the file mapping, not to the whole device. An advisory helper error is counted
+and stops further hints for that open. The lower filesystem retains its normal
+durable-error reporting; transient advisory failures are not explicitly promoted
+to permanent ``fsync`` errors. Close attempts non-waiting cancellation. A running
+callback retains its own file and credential references until it finishes.
+
+The read-only ``passthrough_wb_hint_stats`` parameter reports admission,
+boundaries, queued work, callbacks, helper calls/errors, skip reasons,
+cancellations, live states and active workers. Counters update in optional slow
+paths, not on every 4KiB write. A helper call does not prove that dirty pages were
+submitted or completed. ``skipped_clean`` combines clean and already-writeback
+mapping skips. These counters are module-global and are not per-mount accounts.
+
+For a clean OFF/ON comparison, close all participating files and verify
+``live_states=0`` and ``active_workers=0`` before changing the parameter. Existing
+opens retain their open-time policy after a parameter change. Keep preparation
+and measured counter windows separate and exclude concurrent passthrough users.
+
+The new writeback hook is confined to native passthrough ``write_iter`` and its
+open/release lifecycle. Ordinary FUSE and eBPF without native passthrough do not
+invoke it. Combining eBPF with native passthrough makes the file eligible under
+the same rules. Reads, mmap writes, splice writes and sync entry points receive
+no new hint hook. There is a shared per-open pointer field and FUSE-initialization
+workqueue allocation even with the parameter disabled. This is not a guarantee
+of zero performance impact on other FUSE paths or users of the same device.
+
+Throughput preservation is not guaranteed. Single-run DELL Fig6 comparisons
+observed both gains and regressions; the policy remains explicitly opt-in.
+Runtime activation, data checks and performance observations do not establish
+crash durability, long-running race safety or every error/freeze scenario.

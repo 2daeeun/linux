@@ -8,6 +8,7 @@
 #include "fuse_i.h"
 #include "fuse_cpu_scope.h"
 #include "extfuse_i.h"
+#include "passthrough_wb_hints.h"
 
 #include <linux/file.h>
 #include <linux/backing-file.h>
@@ -460,6 +461,7 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
 		return 0;
 	ret = backing_file_write_iter_locked(backing_file, iter, iocb,
 					     iocb->ki_flags, &ctx);
+	fuse_passthrough_wb_hint_maybe_note(ff->passthrough_wb_hint, iocb, ret);
 
 	return ret;
 }
@@ -610,6 +612,8 @@ struct fuse_backing *fuse_passthrough_open(struct file *file, int backing_id)
 	ff->passthrough_mmap = mmap_state;
 	ff->passthrough = backing_file;
 	ff->cred = get_cred(fb->cred);
+	ff->passthrough_wb_hint =
+		fuse_passthrough_wb_hint_open(backing_file, ff->cred);
 out:
 	pr_debug("%s: backing_id=%d, fb=0x%p, backing_file=0x%p, err=%i\n", __func__,
 		 backing_id, fb, ff->passthrough, err);
@@ -622,6 +626,8 @@ void fuse_passthrough_release(struct fuse_file *ff, struct fuse_backing *fb)
 	pr_debug("%s: fb=0x%p, backing_file=0x%p\n", __func__,
 		 fb, ff->passthrough);
 
+	fuse_passthrough_wb_hint_close(ff->passthrough_wb_hint);
+	ff->passthrough_wb_hint = NULL;
 	fput(ff->passthrough);
 	ff->passthrough = NULL;
 	ff->passthrough_mmap = NULL;

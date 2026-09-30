@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "passthrough_wb_hints.h"
 #include "fuse_trace.h"
 #include "fuse_cpu_scope.h"
 #include "fuse_dev_i.h"
@@ -2593,6 +2594,7 @@ static int __init fuse_init(void)
 		goto err_sysfs_cleanup;
 
 	fuse_dentry_tree_init();
+	fuse_passthrough_wb_hints_init();
 
 	sanitize_global_limit(&max_user_bgreq);
 	sanitize_global_limit(&max_user_congthresh);
@@ -2613,6 +2615,7 @@ static void __exit fuse_exit(void)
 {
 	pr_debug("exit\n");
 
+	fuse_passthrough_wb_hints_exit();
 	fuse_dentry_tree_cleanup();
 	fuse_ctl_cleanup();
 	fuse_sysfs_cleanup();

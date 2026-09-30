@@ -365,6 +365,7 @@ struct fuse_file {
 	struct file *passthrough;
 	const struct cred *cred;
 	struct fuse_passthrough_mmap *passthrough_mmap;
+	struct fuse_passthrough_wb_hint *passthrough_wb_hint;
 
 	/** Per-open lower file used by cached ExtFUSE passthrough */
 	struct file *extfuse_wbcache_file;
