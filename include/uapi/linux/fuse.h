@@ -596,6 +596,8 @@ struct fuse_file_lock {
 /* Local, opt-in runtime queue control and application-facing telemetry. */
 #define FUSE_HAS_IO_URING_RUNTIME (1ULL << 59)
 #define FUSE_HAS_WORKLOAD_MONITOR (1ULL << 60)
+/* Local, opt-in FUSE page-cache forwarding without an ExtFUSE program. */
+#define FUSE_WBCACHE_PASSTHROUGH_DIO (1ULL << 61)
 
 /**
  * CUSE INIT request/reply flags

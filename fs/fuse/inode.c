@@ -1039,6 +1039,15 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->max_background = FUSE_DEFAULT_MAX_BACKGROUND;
 	fc->congestion_threshold = FUSE_DEFAULT_CONGESTION_THRESHOLD;
 	atomic64_set(&fc->khctr, 0);
+	atomic64_set(&fc->wbcache_dio_read_requests, 0);
+	atomic64_set(&fc->wbcache_dio_write_requests, 0);
+	atomic64_set(&fc->wbcache_dio_read_bytes, 0);
+	atomic64_set(&fc->wbcache_dio_write_bytes, 0);
+	atomic64_set(&fc->wbcache_buffered_read_requests, 0);
+	atomic64_set(&fc->wbcache_buffered_write_requests, 0);
+	atomic64_set(&fc->wbcache_writeback_requests, 0);
+	atomic64_set(&fc->wbcache_async_requests, 0);
+	atomic64_set(&fc->wbcache_dio_errors, 0);
 	fc->polled_files = RB_ROOT;
 	fc->blocked = 0;
 	fc->initialized = 0;
@@ -1646,6 +1655,34 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				else
 					fc->extfuse_notify_inval_xattr = 1;
 			}
+			if (flags & FUSE_WBCACHE_PASSTHROUGH_DIO) {
+				/* This mode has no BPF policy or native upper-cache bypass. */
+				if (arg->minor < 48 ||
+				    !IS_ENABLED(CONFIG_FUSE_PASSTHROUGH) ||
+				    !(flags & FUSE_WRITEBACK_CACHE) ||
+				    !fc->writeback_cache ||
+				    (flags & (FUSE_PASSTHROUGH | FUSE_FS_EXTFUSE |
+					      FUSE_EXTFUSE_WBCACHE_PASSTHROUGH |
+					      FUSE_EXTFUSE_WBCACHE_WRITE_STREAM |
+					      FUSE_EXTFUSE_COHERENCE_EPOCHS |
+					      FUSE_EXTFUSE_PAPER_READ_GUARD)) ||
+				    arg->max_stack_depth <= 0 ||
+				    arg->max_stack_depth > FILESYSTEM_MAX_STACK_DEPTH) {
+					ok = false;
+				} else {
+					fc->extfuse_wbcache_wq = alloc_workqueue(
+						"fuse-wbcache-dio",
+						WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+					if (!fc->extfuse_wbcache_wq) {
+						ok = false;
+					} else {
+						fc->wbcache_passthrough_dio = 1;
+						fc->extfuse_wbcache_passthrough = 1;
+						fc->max_stack_depth = arg->max_stack_depth;
+						fm->sb->s_stack_depth = arg->max_stack_depth;
+					}
+				}
+			}
 			if (flags & FUSE_EXTFUSE_WBCACHE_PASSTHROUGH) {
 				/* Coherence epochs opt into the strict policy, not forwarding. */
 				if (arg->minor < 47 ||
@@ -1753,6 +1790,7 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 			fc->extfuse_wbcache_wq = NULL;
 		}
 		fc->extfuse_wbcache_passthrough = 0;
+		fc->wbcache_passthrough_dio = 0;
 		fc->extfuse_read_upcall_only = 0;
 		fc->extfuse_wbcache_write_stream = 0;
 		fc->extfuse_paper_read_guard = 0;
@@ -1796,6 +1834,8 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		FUSE_HAS_WORKLOAD_MONITOR;
 	if (fm->fc->iq.ops == &fuse_dev_fiq_ops) {
 		flags |= EXTFUSE_FLAGS;
+		if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
+			flags |= FUSE_WBCACHE_PASSTHROUGH_DIO;
 		if (IS_ENABLED(CONFIG_EXTFUSE))
 			flags |= FUSE_EXTFUSE_COHERENCE_EPOCHS |
 				 FUSE_MUTATION_METADATA |

@@ -46,7 +46,7 @@
 #define FUSE_NAME_MAX (PATH_MAX - 1)
 
 /** Number of dentries for each connection in the control filesystem */
-#define FUSE_CTL_NUM_DENTRIES 5
+#define FUSE_CTL_NUM_DENTRIES 6
 
 /* Frequency (in seconds) of request timeout checks, if opted into */
 #define FUSE_TIMEOUT_TIMER_FREQ 15
@@ -369,6 +369,9 @@ struct fuse_file {
 
 	/** Per-open lower file used by cached ExtFUSE passthrough */
 	struct file *extfuse_wbcache_file;
+	struct file *wbcache_dio_file;
+	u32 wbcache_dio_mem_align;
+	u32 wbcache_dio_offset_align;
 	struct fuse_backing *extfuse_wbcache_fb;
 
 	/** Serialize admission to the current contiguous lower-WRITE batch */
@@ -1031,6 +1034,18 @@ struct fuse_conn {
 
 	/** ExtFUSE forwarding below the ordinary FUSE writeback cache */
 	unsigned int extfuse_wbcache_passthrough;
+
+	/* Independent, opt-in upper-cache forwarding to a direct-I/O file. */
+	unsigned int wbcache_passthrough_dio;
+	atomic64_t wbcache_dio_read_requests;
+	atomic64_t wbcache_dio_write_requests;
+	atomic64_t wbcache_dio_read_bytes;
+	atomic64_t wbcache_dio_write_bytes;
+	atomic64_t wbcache_buffered_read_requests;
+	atomic64_t wbcache_buffered_write_requests;
+	atomic64_t wbcache_writeback_requests;
+	atomic64_t wbcache_async_requests;
+	atomic64_t wbcache_dio_errors;
 
 	/** FUSE_READ bypasses the BPF program and uses the daemon transport */
 	unsigned int extfuse_read_upcall_only;
@@ -1889,6 +1904,9 @@ struct fuse_wbcache_io *fuse_wbcache_passthrough_prepare(struct fuse_req *req);
 ssize_t fuse_wbcache_passthrough_execute(struct fuse_req *req,
 					 struct fuse_wbcache_io *io);
 void fuse_wbcache_passthrough_finish(struct fuse_wbcache_io *io);
+bool fuse_wbcache_passthrough_dio_request(const struct fuse_req *req);
+int fuse_wbcache_passthrough_dio_submit(struct fuse_req *req,
+		void (*complete)(struct fuse_req *req, ssize_t result));
 ssize_t fuse_wbcache_passthrough_execute_paper(struct fuse_req *req,
 						bool *lower_started);
 #else
@@ -1918,6 +1936,19 @@ fuse_wbcache_passthrough_execute(struct fuse_req *req,
 static inline void
 fuse_wbcache_passthrough_finish(struct fuse_wbcache_io *io)
 {
+}
+
+static inline bool
+fuse_wbcache_passthrough_dio_request(const struct fuse_req *req)
+{
+	return false;
+}
+
+static inline int
+fuse_wbcache_passthrough_dio_submit(struct fuse_req *req,
+		void (*complete)(struct fuse_req *req, ssize_t result))
+{
+	return -EOPNOTSUPP;
 }
 
 static inline ssize_t

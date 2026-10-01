@@ -186,6 +186,42 @@ static const struct file_operations fuse_ctl_abort_ops = {
 	.write = fuse_conn_abort_write,
 };
 
+static ssize_t fuse_conn_wbcache_dio_read(struct file *file, char __user *buf,
+					 size_t len, loff_t *ppos)
+{
+	struct fuse_conn *fc = fuse_ctl_file_conn_get(file);
+	char tmp[640];
+	size_t size;
+
+	if (!fc)
+		return 0;
+	size = scnprintf(tmp, sizeof(tmp),
+		"enabled %u\nwriteback_cache %u\nnative_passthrough %u\n"
+		"bpf_program %u\ndirect_read_requests %lld\n"
+		"direct_write_requests %lld\ndirect_read_bytes %lld\n"
+		"direct_write_bytes %lld\nbuffered_read_requests %lld\n"
+		"buffered_write_requests %lld\nwriteback_requests %lld\n"
+		"async_requests %lld\nerrors %lld\n",
+		READ_ONCE(fc->wbcache_passthrough_dio), fc->writeback_cache,
+		fc->passthrough, !!rcu_access_pointer(fc->fc_priv),
+		atomic64_read(&fc->wbcache_dio_read_requests),
+		atomic64_read(&fc->wbcache_dio_write_requests),
+		atomic64_read(&fc->wbcache_dio_read_bytes),
+		atomic64_read(&fc->wbcache_dio_write_bytes),
+		atomic64_read(&fc->wbcache_buffered_read_requests),
+		atomic64_read(&fc->wbcache_buffered_write_requests),
+		atomic64_read(&fc->wbcache_writeback_requests),
+		atomic64_read(&fc->wbcache_async_requests),
+		atomic64_read(&fc->wbcache_dio_errors));
+	fuse_conn_put(fc);
+	return simple_read_from_buffer(buf, len, ppos, tmp, size);
+}
+
+static const struct file_operations fuse_conn_wbcache_dio_ops = {
+	.open = nonseekable_open,
+	.read = fuse_conn_wbcache_dio_read,
+};
+
 static const struct file_operations fuse_ctl_waiting_ops = {
 	.open = nonseekable_open,
 	.read = fuse_conn_waiting_read,
@@ -275,7 +311,9 @@ int fuse_ctl_add_conn(struct fuse_conn *fc)
 				 NULL, &fuse_conn_max_background_ops) ||
 	    !fuse_ctl_add_dentry(parent, fc, "congestion_threshold",
 				 S_IFREG | 0600, NULL,
-				 &fuse_conn_congestion_threshold_ops))
+				 &fuse_conn_congestion_threshold_ops) ||
+	    !fuse_ctl_add_dentry(parent, fc, "wbcache_dio_stats", S_IFREG | 0400,
+				 NULL, &fuse_conn_wbcache_dio_ops))
 		goto err;
 
 	return 0;

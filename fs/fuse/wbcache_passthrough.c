@@ -5,16 +5,24 @@
  * The upper inode continues to use the FUSE page cache.  Only page-backed
  * FUSE_READ and FUSE_WRITE requests selected by the ExtFUSE policy are
  * forwarded to a daemon-registered lower file.
+ *
+ * FUSE_WBCACHE_PASSTHROUGH_DIO separately opts into forwarding without a BPF
+ * program.  Aligned requests use the lower direct-I/O file; an unaligned EOF
+ * tail or partial-folio request uses an explicit, counted buffered fallback.
+ * Direct-I/O counters describe submissions, not lower-filesystem internals.
  */
 
 #include "fuse_i.h"
 #include "extfuse_i.h"
 #include "fuse_trace.h"
+#include "fuse_cpu_scope.h"
 
 #include <linux/backing-file.h>
 #include <linux/bvec.h>
 #include <linux/file.h>
+#include <linux/fsnotify.h>
 #include <linux/overflow.h>
+#include <linux/refcount.h>
 #include <linux/uio.h>
 
 #define FUSE_WBCACHE_INLINE_BVECS 32
@@ -30,6 +38,14 @@ struct fuse_wbcache_io {
 	bool write;
 	bool refs_owned;
 	bool bvec_owned;
+	bool direct;
+	bool queued;
+	struct kiocb iocb;
+	struct fuse_req *req;
+	void (*complete)(struct fuse_req *req, ssize_t result);
+	struct work_struct completion_work;
+	refcount_t async_refs;
+	ssize_t result;
 };
 
 struct fuse_wbcache_alloc {
@@ -96,7 +112,10 @@ int fuse_wbcache_passthrough_open(struct file *file, int backing_id)
 	struct fuse_conn *fc = ff->fm->fc;
 	struct fuse_backing *fb;
 	struct file *lower;
+	struct file *direct = NULL;
+	struct kstat stat;
 	int flags;
+	int err;
 
 	if (backing_id <= 0)
 		return -EINVAL;
@@ -112,14 +131,48 @@ int fuse_wbcache_passthrough_open(struct file *file, int backing_id)
 		fuse_backing_put(fb);
 		return PTR_ERR(lower);
 	}
+	if (READ_ONCE(fc->wbcache_passthrough_dio)) {
+		direct = backing_file_open(&file->f_path, flags | O_DIRECT,
+					   &fb->file->f_path, fb->cred);
+		if (IS_ERR(direct)) {
+			err = PTR_ERR(direct);
+			goto out_lower;
+		}
+		err = vfs_getattr(&direct->f_path, &stat, STATX_DIOALIGN,
+				  AT_STATX_DONT_SYNC);
+		if (err)
+			goto out_direct;
+		if (!(direct->f_mode & FMODE_CAN_ODIRECT) ||
+		    !(stat.result_mask & STATX_DIOALIGN) ||
+		    !is_power_of_2(stat.dio_mem_align) ||
+		    !is_power_of_2(stat.dio_offset_align) ||
+		    stat.dio_mem_align > PAGE_SIZE) {
+			err = -EOPNOTSUPP;
+			goto out_direct;
+		}
+		ff->wbcache_dio_mem_align = stat.dio_mem_align;
+		ff->wbcache_dio_offset_align = stat.dio_offset_align;
+	}
 
 	ff->extfuse_wbcache_file = lower;
+	ff->wbcache_dio_file = direct;
 	ff->extfuse_wbcache_fb = fb;
 	return 0;
+
+out_direct:
+	fput(direct);
+out_lower:
+	fput(lower);
+	fuse_backing_put(fb);
+	return err;
 }
 
 void fuse_wbcache_passthrough_release(struct fuse_file *ff)
 {
+	if (ff->wbcache_dio_file) {
+		fput(ff->wbcache_dio_file);
+		ff->wbcache_dio_file = NULL;
+	}
 	if (ff->extfuse_wbcache_file) {
 		fput(ff->extfuse_wbcache_file);
 		ff->extfuse_wbcache_file = NULL;
@@ -232,6 +285,34 @@ static int fuse_wbcache_request_shape(struct fuse_req *req,
 	return remaining ? -EINVAL : 0;
 }
 
+bool fuse_wbcache_passthrough_dio_request(const struct fuse_req *req)
+{
+	const struct fuse_args *args = req->args;
+	const struct fuse_file *ff = args->extfuse_file;
+
+	return READ_ONCE(req->fm->fc->wbcache_passthrough_dio) && ff &&
+		(args->opcode == FUSE_READ || args->opcode == FUSE_WRITE) &&
+		(ff->open_flags & FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH);
+}
+
+static bool fuse_wbcache_dio_aligned(const struct fuse_file *ff,
+				     const struct fuse_wbcache_io *io)
+{
+	unsigned int i;
+
+	if (!ff->wbcache_dio_file ||
+	    !IS_ALIGNED(io->pos | io->count, ff->wbcache_dio_offset_align))
+		return false;
+	for (i = 0; i < io->nr_bvecs; i++) {
+		const struct bio_vec *bv = &io->bvec[i];
+
+		if (!IS_ALIGNED(bv->bv_offset | bv->bv_len,
+				ff->wbcache_dio_mem_align))
+			return false;
+	}
+	return true;
+}
+
 static int fuse_wbcache_passthrough_init(struct fuse_req *req,
 					 struct fuse_wbcache_io *io,
 					 struct bio_vec *preallocated_bvec,
@@ -241,6 +322,7 @@ static int fuse_wbcache_passthrough_init(struct fuse_req *req,
 {
 	struct fuse_file *ff = req->args->extfuse_file;
 	unsigned int nr_folios;
+	struct file *lower;
 	int err;
 
 	memset(io, 0, sizeof(*io));
@@ -265,8 +347,11 @@ static int fuse_wbcache_passthrough_init(struct fuse_req *req,
 		return err;
 	}
 
+	io->direct = READ_ONCE(req->fm->fc->wbcache_passthrough_dio) &&
+		fuse_wbcache_dio_aligned(ff, io);
+	lower = io->direct ? ff->wbcache_dio_file : ff->extfuse_wbcache_file;
 	if (own_refs) {
-		io->file = get_file(ff->extfuse_wbcache_file);
+		io->file = get_file(lower);
 		io->cred = get_cred(ff->extfuse_wbcache_fb->cred);
 		io->refs_owned = true;
 	} else {
@@ -276,7 +361,7 @@ static int fuse_wbcache_passthrough_init(struct fuse_req *req,
 		 * fuse_file references.  fuse_file_io_release() therefore cannot
 		 * release these backing objects while this lower operation runs.
 		 */
-		io->file = ff->extfuse_wbcache_file;
+		io->file = lower;
 		io->cred = ff->extfuse_wbcache_fb->cred;
 	}
 	return 0;
@@ -317,25 +402,39 @@ struct fuse_wbcache_io *fuse_wbcache_passthrough_prepare(struct fuse_req *req)
 	return io;
 }
 
-ssize_t fuse_wbcache_passthrough_execute(struct fuse_req *req,
-					 struct fuse_wbcache_io *io)
+static void fuse_wbcache_dio_account_submit(struct fuse_req *req,
+					    struct fuse_wbcache_io *io)
+{
+	struct fuse_conn *fc = req->fm->fc;
+
+	if (!READ_ONCE(fc->wbcache_passthrough_dio))
+		return;
+	if (io->write) {
+		const struct fuse_write_in *in = req->args->in_args[0].value;
+
+		if (in->write_flags & FUSE_WRITE_CACHE)
+			atomic64_inc(&fc->wbcache_writeback_requests);
+		atomic64_inc(io->direct ? &fc->wbcache_dio_write_requests :
+			     &fc->wbcache_buffered_write_requests);
+	} else {
+		atomic64_inc(io->direct ? &fc->wbcache_dio_read_requests :
+			     &fc->wbcache_buffered_read_requests);
+	}
+	trace_fuse_wbcache_dio(fc->dev, req->args->nodeid, req->args->opcode,
+			      io->direct, false, io->count, 0);
+}
+
+static ssize_t fuse_wbcache_passthrough_result(struct fuse_req *req,
+					      struct fuse_wbcache_io *io,
+					      ssize_t ret)
 {
 	struct fuse_args *args = req->args;
 	struct fuse_args_pages *ap =
 		container_of(args, struct fuse_args_pages, args);
 	struct iov_iter iter;
-	const struct cred *old_cred;
-	ssize_t ret;
+	struct fuse_conn *fc = req->fm->fc;
+	ssize_t result = ret;
 	unsigned int i;
-
-	iov_iter_bvec(&iter, io->write ? ITER_SOURCE : ITER_DEST, io->bvec,
-		       io->nr_bvecs, io->count);
-	old_cred = override_creds(io->cred);
-	if (io->write)
-		ret = vfs_iter_write(io->file, &iter, &io->pos, io->rwf);
-	else
-		ret = vfs_iter_read(io->file, &iter, &io->pos, 0);
-	revert_creds(old_cred);
 
 	if (io->write) {
 		struct fuse_write_out *out = args->out_args[0].value;
@@ -343,19 +442,55 @@ ssize_t fuse_wbcache_passthrough_execute(struct fuse_req *req,
 		if (ret >= 0)
 			out->size = (u32)ret;
 		if (ret >= 0 && (size_t)ret != io->count)
-			return -EIO;
-		return ret < 0 ? ret : 0;
+			result = -EIO;
+		else
+			result = ret < 0 ? ret : 0;
+	} else if (ret >= 0) {
+		/* Rebuild the iterator: an asynchronous DIO may advance it early. */
+		iov_iter_bvec(&iter, ITER_DEST, io->bvec, io->nr_bvecs, io->count);
+		if ((size_t)ret > io->count) {
+			result = -EIO;
+		} else {
+			iov_iter_advance(&iter, ret);
+			if (ret < io->count &&
+			    iov_iter_zero(io->count - ret, &iter) != io->count - ret)
+				result = -EIO;
+		}
+		if (result >= 0) {
+			args->out_args[0].size = (unsigned int)ret;
+			for (i = 0; i < ap->num_folios; i++)
+				flush_dcache_folio(ap->folios[i]);
+		}
 	}
+	if (READ_ONCE(fc->wbcache_passthrough_dio)) {
+		if (result < 0)
+			atomic64_inc(&fc->wbcache_dio_errors);
+		if (io->direct && ret > 0)
+			atomic64_add(ret, io->write ? &fc->wbcache_dio_write_bytes :
+				     &fc->wbcache_dio_read_bytes);
+		trace_fuse_wbcache_dio(fc->dev, args->nodeid, args->opcode,
+				      io->direct, true, io->count, ret);
+	}
+	return result;
+}
 
-	if (ret >= 0 && ret < io->count &&
-	    iov_iter_zero(io->count - ret, &iter) != io->count - ret)
-		return -EIO;
-	if (ret >= 0) {
-		args->out_args[0].size = (unsigned int)ret;
-		for (i = 0; i < ap->num_folios; i++)
-			flush_dcache_folio(ap->folios[i]);
-	}
-	return ret;
+ssize_t fuse_wbcache_passthrough_execute(struct fuse_req *req,
+					 struct fuse_wbcache_io *io)
+{
+	struct iov_iter iter;
+	const struct cred *old_cred;
+	ssize_t ret;
+
+	iov_iter_bvec(&iter, io->write ? ITER_SOURCE : ITER_DEST, io->bvec,
+		       io->nr_bvecs, io->count);
+	fuse_wbcache_dio_account_submit(req, io);
+	old_cred = override_creds(io->cred);
+	if (io->write)
+		ret = vfs_iter_write(io->file, &iter, &io->pos, io->rwf);
+	else
+		ret = vfs_iter_read(io->file, &iter, &io->pos, 0);
+	revert_creds(old_cred);
+	return fuse_wbcache_passthrough_result(req, io, ret);
 }
 
 void fuse_wbcache_passthrough_finish(struct fuse_wbcache_io *io)
@@ -365,6 +500,100 @@ void fuse_wbcache_passthrough_finish(struct fuse_wbcache_io *io)
 
 	fuse_wbcache_passthrough_cleanup(io);
 	kfree(alloc);
+}
+
+static void fuse_wbcache_dio_put(struct fuse_wbcache_io *io)
+{
+	if (refcount_dec_and_test(&io->async_refs))
+		fuse_wbcache_passthrough_finish(io);
+}
+
+static void fuse_wbcache_dio_complete_work(struct work_struct *work)
+{
+	struct fuse_wbcache_io *io = container_of(work, struct fuse_wbcache_io,
+						 completion_work);
+	struct fuse_req *req = io->req;
+	ssize_t result;
+
+	FUSE_CPU_SCOPE(req->fm->fc);
+
+	if (io->queued) {
+		if (io->write && io->result > 0)
+			fsnotify_modify(io->file);
+		else if (!io->write && io->result >= 0)
+			fsnotify_access(io->file);
+	}
+	result = fuse_wbcache_passthrough_result(req, io, io->result);
+	io->complete(req, result);
+	fuse_wbcache_dio_put(io);
+}
+
+static void fuse_wbcache_dio_queue_complete(struct fuse_wbcache_io *io,
+					   ssize_t result)
+{
+	io->result = result;
+	WARN_ON_ONCE(!queue_work(io->req->fm->fc->extfuse_wbcache_wq,
+				&io->completion_work));
+}
+
+static void fuse_wbcache_dio_complete(struct kiocb *iocb, long result)
+{
+	struct fuse_wbcache_io *io = container_of(iocb, struct fuse_wbcache_io,
+						 iocb);
+
+	/* Release freeze accounting before work can wait behind new submissions. */
+	if (io->write)
+		kiocb_end_write(iocb);
+	io->queued = true;
+	atomic64_inc(&io->req->fm->fc->wbcache_async_requests);
+	fuse_wbcache_dio_queue_complete(io, result);
+}
+
+int fuse_wbcache_passthrough_dio_submit(struct fuse_req *req,
+		void (*complete)(struct fuse_req *req, ssize_t result))
+{
+	struct fuse_wbcache_io *io;
+	struct iov_iter iter;
+	const struct cred *old_cred;
+	ssize_t ret;
+
+	FUSE_CPU_SCOPE(req->fm->fc);
+
+	io = fuse_wbcache_passthrough_prepare(req);
+	if (IS_ERR(io))
+		return PTR_ERR(io);
+	if (!READ_ONCE(req->fm->fc->connected)) {
+		fuse_wbcache_passthrough_finish(io);
+		return -ENOTCONN;
+	}
+	io->req = req;
+	io->complete = complete;
+	init_sync_kiocb(&io->iocb, io->file);
+	ret = kiocb_set_rw_flags(&io->iocb, io->rwf, io->write ? WRITE : READ);
+	if (ret) {
+		fuse_wbcache_passthrough_finish(io);
+		return ret;
+	}
+	/* Completion may run before the lower submission returns. */
+	refcount_set(&io->async_refs, 2);
+	INIT_WORK(&io->completion_work, fuse_wbcache_dio_complete_work);
+	io->iocb.ki_pos = io->pos;
+	io->iocb.ki_complete = fuse_wbcache_dio_complete;
+	if (io->write)
+		io->iocb.ki_flags |= IOCB_WRITE;
+	iov_iter_bvec(&iter, io->write ? ITER_SOURCE : ITER_DEST, io->bvec,
+		       io->nr_bvecs, io->count);
+	fuse_wbcache_dio_account_submit(req, io);
+	old_cred = override_creds(io->cred);
+	if (io->write)
+		ret = vfs_iocb_iter_write(io->file, &io->iocb, &iter);
+	else
+		ret = vfs_iocb_iter_read(io->file, &io->iocb, &iter);
+	revert_creds(old_cred);
+	if (ret != -EIOCBQUEUED)
+		fuse_wbcache_dio_queue_complete(io, ret);
+	fuse_wbcache_dio_put(io);
+	return 0;
 }
 
 #define FUSE_WBCACHE_READ_BUSY S64_MAX

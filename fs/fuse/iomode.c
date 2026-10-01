@@ -377,7 +377,8 @@ static int fuse_file_wbcache_passthrough_open(struct inode *inode,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	int err;
 
-	if (!IS_ENABLED(CONFIG_EXTFUSE) ||
+	if ((!IS_ENABLED(CONFIG_EXTFUSE) &&
+	     !READ_ONCE(fc->wbcache_passthrough_dio)) ||
 	    !IS_ENABLED(CONFIG_FUSE_PASSTHROUGH) ||
 	    !READ_ONCE(fc->extfuse_wbcache_passthrough) ||
 	    !fc->writeback_cache ||

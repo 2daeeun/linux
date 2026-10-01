@@ -367,6 +367,39 @@ TRACE_EVENT(fuse_cpu_scope,
 		  __entry->enter)
 );
 
+/* direct describes submission intent; the lower filesystem may fall back. */
+TRACE_EVENT(fuse_wbcache_dio,
+	TP_PROTO(dev_t connection, u64 nodeid, u32 opcode, bool direct,
+		 bool complete, u64 count, s64 result),
+
+	TP_ARGS(connection, nodeid, opcode, direct, complete, count, result),
+
+	TP_STRUCT__entry(
+		__field(dev_t, connection)
+		__field(u64, nodeid)
+		__field(u32, opcode)
+		__field(bool, direct)
+		__field(bool, complete)
+		__field(u64, count)
+		__field(s64, result)
+	),
+
+	TP_fast_assign(
+		__entry->connection = connection;
+		__entry->nodeid = nodeid;
+		__entry->opcode = opcode;
+		__entry->direct = direct;
+		__entry->complete = complete;
+		__entry->count = count;
+		__entry->result = result;
+	),
+
+	TP_printk("connection %u nodeid %llu opcode %u direct %u complete %u count %llu result %lld",
+		  __entry->connection, __entry->nodeid, __entry->opcode,
+		  __entry->direct, __entry->complete, __entry->count,
+		  __entry->result)
+);
+
 #endif /* _TRACE_FUSE_H */
 
 #undef TRACE_INCLUDE_PATH

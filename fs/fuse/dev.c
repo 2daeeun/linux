@@ -970,6 +970,19 @@ static ssize_t __fuse_wbcache_request_execute(struct fuse_req *req, gfp_t gfp,
 	int err;
 
 	*lower_started = false;
+	if (READ_ONCE(req->fm->fc->wbcache_passthrough_dio)) {
+		/* The opt-in data path fails closed; never replay it in userspace. */
+		*lower_started = true;
+		io = fuse_wbcache_passthrough_prepare(req);
+		if (IS_ERR(io))
+			return PTR_ERR(io);
+		if (!READ_ONCE(req->fm->fc->connected))
+			ret = -ENOTCONN;
+		else
+			ret = fuse_wbcache_passthrough_execute(req, io);
+		fuse_wbcache_passthrough_finish(io);
+		return ret;
+	}
 	if (!READ_ONCE(req->fm->fc->extfuse_coherence_epochs))
 		return fuse_wbcache_passthrough_execute_paper(req,
 							       lower_started);
@@ -1072,7 +1085,12 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
 		fuse_put_request(req);
 		return -ENODATA;
 	}
-	route = extfuse_request_pre(req, GFP_KERNEL, &ret);
+	if (fuse_wbcache_passthrough_dio_request(req)) {
+		ret = 0;
+		route = EXTFUSE_PRE_WBCACHE_FORWARD;
+	} else {
+		route = extfuse_request_pre(req, GFP_KERNEL, &ret);
+	}
 	if (route == EXTFUSE_PRE_COMPLETE || route == EXTFUSE_PRE_ERROR) {
 		fuse_put_request(req);
 		return ret;
@@ -1206,11 +1224,31 @@ static void fuse_wbcache_background_complete(struct fuse_req *req, ssize_t ret,
 	fuse_request_end(req);
 }
 
+static void fuse_wbcache_dio_background_complete(struct fuse_req *req,
+						 ssize_t result)
+{
+	fuse_trace_wbcache_terminal(req,
+				    FUSE_REQUEST_COUNT_ACTION_WBCACHE_COMPLETE,
+				    result);
+	fuse_wbcache_background_complete(req, result, true);
+}
+
 static void fuse_wbcache_background_work(struct work_struct *work)
 {
 	struct fuse_req *req = container_of(work, struct fuse_req,
 					    extfuse_wbcache_work);
 	unsigned int processed = 0;
+	int err;
+
+	if (READ_ONCE(req->fm->fc->wbcache_passthrough_dio)) {
+		err = fuse_wbcache_passthrough_dio_submit(
+			req, fuse_wbcache_dio_background_complete);
+		if (err) {
+			atomic64_inc(&req->fm->fc->wbcache_dio_errors);
+			fuse_wbcache_dio_background_complete(req, err);
+		}
+		return;
+	}
 
 	for (;;) {
 		struct fuse_req *next;
@@ -1304,7 +1342,12 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 	if (READ_ONCE(fm->fc->extfuse_wbcache_passthrough) ||
 	    ((args->opcode == FUSE_READ || args->opcode == FUSE_WRITE) &&
 	     rcu_access_pointer(fm->fc->fc_priv))) {
-		route = extfuse_request_pre(req, gfp_flags, &result);
+		if (fuse_wbcache_passthrough_dio_request(req)) {
+			result = 0;
+			route = EXTFUSE_PRE_WBCACHE_FORWARD;
+		} else {
+			route = extfuse_request_pre(req, gfp_flags, &result);
+		}
 		if (route == EXTFUSE_PRE_COMPLETE) {
 			fuse_request_end_unqueued(req, 0);
 			return 0;
