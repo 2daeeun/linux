@@ -11,6 +11,7 @@
 
 struct iou_loop_params;
 struct io_uring_bpf_ops;
+struct io_spare_q;
 
 enum {
 	/*
@@ -145,6 +146,7 @@ struct io_uring_task {
 	const struct io_ring_ctx 	*last;
 	struct task_struct		*task;
 	struct io_wq			*io_wq;
+	void				*spare_exec;	/* SpareRing executor thread: its struct io_spare_exec */
 	/*
 	 * Consumer cursor for ->task_list. Only popped by the task itself,
 	 * or by ->fallback_work once the task can no longer run task_work.
@@ -485,6 +487,7 @@ struct io_ring_ctx {
 	unsigned int		file_alloc_end;
 
 	/* Keep this last, we don't need it for the fast path */
+	struct io_spare_q		*spare;
 	struct wait_queue_head		poll_wq;
 	struct io_restriction		restrictions;
 
@@ -610,6 +613,8 @@ enum {
 	REQ_F_IMPORT_BUFFER_BIT,
 	REQ_F_SQE_COPIED_BIT,
 	REQ_F_IOPOLL_BIT,
+	REQ_F_EXEC_BIT,
+	REQ_F_EXEC_FILE_BIT,
 
 	/* not a real bit, just to check we're not overflowing the space */
 	__REQ_F_LAST_BIT,
@@ -705,6 +710,10 @@ enum {
 	REQ_F_SQE_COPIED	= IO_REQ_FLAG(REQ_F_SQE_COPIED_BIT),
 	/* request must be iopolled to completion (set in ->issue()) */
 	REQ_F_IOPOLL		= IO_REQ_FLAG(REQ_F_IOPOLL_BIT),
+	/* request owned by a SpareRing executor */
+	REQ_F_EXEC		= IO_REQ_FLAG(REQ_F_EXEC_BIT),
+	/* ->file is borrowed from the chunk's table, never put by the request */
+	REQ_F_EXEC_FILE		= IO_REQ_FLAG(REQ_F_EXEC_FILE_BIT),
 };
 
 struct io_tw_req {

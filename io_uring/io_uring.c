@@ -98,6 +98,7 @@
 #include "wait.h"
 #include "bpf_filter.h"
 #include "loop.h"
+#include "spare.h"
 
 #define SQE_COMMON_FLAGS (IOSQE_FIXED_FILE | IOSQE_IO_LINK | \
 			  IOSQE_IO_HARDLINK | IOSQE_ASYNC)
@@ -182,6 +183,13 @@ static inline void io_req_add_to_cache(struct io_kiocb *req, struct io_ring_ctx 
 	if (IS_ENABLED(CONFIG_KASAN))
 		io_poison_cached_req(req);
 	wq_stack_add_head(&req->comp_list, &ctx->submit_state.free_list);
+}
+
+/* A takeover preallocates before q->lock and refunds unused task refs separately. */
+void io_spare_unused_req(struct io_ring_ctx *ctx, struct io_kiocb *req)
+{
+	lockdep_assert_held(&ctx->uring_lock);
+	io_req_add_to_cache(req, ctx);
 }
 
 static __cold void io_ring_ctx_ref_free(struct percpu_ref *ref)
@@ -457,7 +465,9 @@ static __cold noinline void io_queue_deferred(struct io_ring_ctx *ctx)
 						struct io_defer_entry, list);
 
 		drain_seen |= de->req->flags & REQ_F_IO_DRAIN;
-		if ((drain_seen || first) && ctx->nr_req_allocated != ctx->nr_drained)
+		/* SpareRing: SQEs delegated to executors are live work without a request here yet. */
+		if ((drain_seen || first) &&
+		    ctx->nr_req_allocated + io_spare_inflight(ctx) != ctx->nr_drained)
 			return;
 
 		list_del_init(&de->list);
@@ -466,6 +476,15 @@ static __cold noinline void io_queue_deferred(struct io_ring_ctx *ctx)
 		kfree(de);
 		first = false;
 	}
+}
+
+void io_spare_queue_deferred(struct io_ring_ctx *ctx)
+{
+	lockdep_assert_held(&ctx->uring_lock);
+	if (!list_empty(&ctx->defer_list))
+		io_queue_deferred(ctx);
+	/* io_queue_deferred() queues non-lazy local work, as at the normal flush. */
+	io_submit_flush_completions(ctx);
 }
 
 void __io_commit_cqring_flush(struct io_ring_ctx *ctx)
@@ -853,6 +872,21 @@ void io_add_aux_cqe(struct io_ring_ctx *ctx, u64 user_data, s32 res, u32 cflags)
 }
 
 /*
+ * SpareRing executor, holding uring_lock it tried for (never waited for):
+ * commit the CQEs it added with io_add_aux_cqe(), as the owner's task_work
+ * run would at its end. Nothing of the owner's is pending: it flushes before
+ * it drops the lock. The owner waiting on the CQ is counted down by the caller.
+ */
+void io_spare_commit_cqes(struct io_ring_ctx *ctx)
+{
+	lockdep_assert_held(&ctx->uring_lock);
+	lockdep_assert(ctx->int_flags & IO_RING_F_LOCKLESS_CQ);
+	__io_cq_lock(ctx);
+	__io_cq_unlock_post(ctx);
+	ctx->submit_state.cq_flush = false;
+}
+
+/*
  * A helper for multishot requests posting additional CQEs.
  * Should only be used from a task_work including IO_URING_F_MULTISHOT.
  */
@@ -913,6 +947,8 @@ static void io_req_complete_post(struct io_kiocb *req, unsigned issue_flags)
 {
 	struct io_ring_ctx *ctx = req->ctx;
 	bool completed = true;
+
+	WARN_ON_ONCE(req->flags & REQ_F_EXEC);
 
 	/*
 	 * All execution paths but io-wq use the deferred completions by
@@ -995,6 +1031,8 @@ __cold bool __io_alloc_req_refill(struct io_ring_ctx *ctx)
 
 __cold void io_free_req(struct io_kiocb *req)
 {
+	WARN_ON_ONCE(req->flags & REQ_F_EXEC);
+
 	/* refs were already put, restore them for io_req_task_complete() */
 	req->flags &= ~REQ_F_REFCOUNT;
 	/* we only want to free it, don't post CQEs */
@@ -1042,6 +1080,8 @@ void io_req_task_submit(struct io_tw_req tw_req, io_tw_token_t tw)
 	struct io_kiocb *req = tw_req.req;
 	struct io_ring_ctx *ctx = req->ctx;
 
+	WARN_ON_ONCE(req->flags & REQ_F_EXEC);
+
 	io_tw_lock(ctx, tw);
 	if (unlikely(tw.cancel))
 		io_req_defer_failed(req, -EFAULT);
@@ -1053,6 +1093,8 @@ void io_req_task_submit(struct io_tw_req tw_req, io_tw_token_t tw)
 
 void io_req_task_queue_fail(struct io_kiocb *req, int ret)
 {
+	WARN_ON_ONCE(req->flags & REQ_F_EXEC);
+
 	io_req_set_res(req, ret, 0);
 	req->io_task_work.func = io_req_task_cancel;
 	io_req_task_work_add(req);
@@ -1060,6 +1102,8 @@ void io_req_task_queue_fail(struct io_kiocb *req, int ret)
 
 void io_req_task_queue(struct io_kiocb *req)
 {
+	WARN_ON_ONCE(req->flags & REQ_F_EXEC);
+
 	req->io_task_work.func = io_req_task_submit;
 	io_req_task_work_add(req);
 }
@@ -1398,6 +1442,11 @@ static inline int __io_issue_sqe(struct io_kiocb *req,
 	}
 
 	return ret;
+}
+
+int io_spare_issue(struct io_kiocb *req, unsigned int issue_flags)
+{
+	return __io_issue_sqe(req, issue_flags, &io_issue_defs[req->opcode]);
 }
 
 static int io_issue_sqe(struct io_kiocb *req, unsigned int issue_flags)
@@ -1956,10 +2005,92 @@ static void io_submit_state_start(struct io_submit_state *state,
 	state->link.head = NULL;
 }
 
+/*
+ * SpareRing SQE copies the owner takes back are submitted in a batch of their
+ * own, sharing one submit state and plug like an inline submission: one plug
+ * per copy dispatched every bio alone. Submitter only, with uring_lock held.
+ * Must not run inside an active submit batch: starting a batch here resets its
+ * link and plug state. The copies have no link flags. The caller must call
+ * io_submit_flush_completions(ctx) before releasing uring_lock, including
+ * completions queued by the surrounding inline rescue work.
+ */
+void io_submit_copies_start(struct io_ring_ctx *ctx, unsigned int nr)
+	__must_hold(&ctx->uring_lock)
+{
+	lockdep_assert_held(&ctx->uring_lock);
+	io_submit_state_start(&ctx->submit_state, nr);
+}
+
+void io_submit_copies_end(struct io_ring_ctx *ctx)
+	__must_hold(&ctx->uring_lock)
+{
+	io_submit_state_end(ctx);
+}
+
+/*
+ * SpareRing owner, inside io_submit_copies_start/end: submit a copied SQE
+ * with the file the owner resolved at delegation (one reference of its own)
+ * instead of the fd, which may name another file by now. NULL: resolve the
+ * fd as usual. On init failure the CQE is already posted. Copied SQEs carry
+ * no link flags.
+ */
+int io_submit_copied_sqe_file(struct io_ring_ctx *ctx,
+			      const struct io_uring_sqe *sqe, struct file *file)
+{
+	struct io_kiocb *req;
+
+	if (WARN_ON_ONCE(current != ctx->submitter_task))
+		return -EEXIST;
+	if (unlikely(!io_alloc_req(ctx, &req)))
+		return -EAGAIN;
+	io_get_task_refs(1);
+	return io_submit_copied_sqe_req(ctx, req, sqe, file);
+}
+
+/* The caller already allocated req and charged its task reference before q->lock. */
+int io_submit_copied_sqe_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
+			     const struct io_uring_sqe *sqe, struct file *file)
+	__must_hold(&ctx->uring_lock)
+{
+	unsigned int left = 1;
+	int ret;
+
+	lockdep_assert_held(&ctx->uring_lock);
+	if (!file)
+		return io_submit_sqe(ctx, req, sqe, &left);
+	ret = io_init_req(ctx, req, sqe, &left);
+	if (unlikely(ret))
+		return io_submit_fail_init(sqe, req, IS_ERR(file) ? PTR_ERR(file) : ret);
+	/* A failed pull-time lookup must not resolve a reused fd at takeover. */
+	if (IS_ERR(file))
+		return io_submit_fail_init(sqe, req, PTR_ERR(file));
+	if (unlikely(ctx->bpf_filters)) {
+		ret = io_uring_run_bpf_filters(ctx->bpf_filters, req);
+		if (ret)
+			return io_submit_fail_init(sqe, req, ret);
+	}
+	trace_io_uring_submit_req(req);
+	/* io_assign_file() keeps a file that is set; track an io_uring file as it would. */
+	if (!(req->flags & REQ_F_FIXED_FILE)) {
+		req->file = get_file(file);
+		if (io_is_uring_fops(file))
+			io_req_track_inflight(req);
+	}
+	if (unlikely(req->flags & (REQ_F_FORCE_ASYNC | REQ_F_FAIL)))
+		io_queue_sqe_fallback(req);
+	else
+		io_queue_sqe(req, IO_URING_F_INLINE);
+	return 0;
+}
+
 static void io_commit_sqring(struct io_ring_ctx *ctx)
 {
 	struct io_rings *rings = ctx->rings;
 
+	if (unlikely(ctx->spare) && io_spare_pull(ctx)) {
+		io_spare_commit_head(ctx);
+		return;
+	}
 	if (ctx->flags & IORING_SETUP_SQ_REWIND) {
 		ctx->cached_sq_head = 0;
 	} else {
@@ -1980,7 +2111,7 @@ static void io_commit_sqring(struct io_ring_ctx *ctx)
  * used, it's important that those reads are done through READ_ONCE() to
  * prevent a re-load down the line.
  */
-static bool io_get_sqe(struct io_ring_ctx *ctx, const struct io_uring_sqe **sqe)
+bool io_get_sqe(struct io_ring_ctx *ctx, const struct io_uring_sqe **sqe)
 {
 	unsigned mask = ctx->sq_entries - 1;
 	unsigned head = ctx->cached_sq_head++ & mask;
@@ -2017,24 +2148,50 @@ int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr)
 {
 	unsigned int entries;
 	unsigned int left;
+	bool stop = false, pull = unlikely(ctx->spare) && io_spare_pull(ctx);
 	int ret;
 
-	if (ctx->flags & IORING_SETUP_SQ_REWIND)
+	/* cached_sq_head belongs to the owner only after the lease is taken back. */
+	if (pull) {
+		io_spare_submit_takeover(ctx, nr);
+		entries = io_spare_submit_entries(ctx);
+	} else if (ctx->flags & IORING_SETUP_SQ_REWIND) {
 		entries = ctx->sq_entries;
-	else
+	} else {
 		entries = __io_sqring_entries(ctx);
+	}
 
-	entries = min(nr, entries);
-	if (unlikely(!entries))
-		return 0;
+	if (!pull)
+		entries = min(nr, entries);
+	if (unlikely(!entries)) {
+		ret = 0;
+		if (pull)
+			goto out;
+		return ret;
+	}
+
+	if (unlikely(ctx->spare))
+		io_spare_submit_start(ctx, entries);
 
 	ret = left = entries;
 	io_get_task_refs(left);
 	io_submit_state_start(&ctx->submit_state, left);
 
-	do {
+	while (left) {
 		const struct io_uring_sqe *sqe;
 		struct io_kiocb *req;
+		int err;
+
+		if (unlikely(ctx->spare) && (!pull || !io_spare_took_over(ctx))) {
+			unsigned int n = io_spare_delegate(ctx, left, &stop);
+
+			/* The delegate refunds the task refs for these SQEs. */
+			left -= n;
+			if (stop)
+				break;
+			if (n)
+				continue;
+		}
 
 		if (unlikely(!io_alloc_req(ctx, &req)))
 			break;
@@ -2047,24 +2204,28 @@ int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr)
 		 * Continue submitting even for sqe failure if the
 		 * ring was setup with IORING_SETUP_SUBMIT_ALL
 		 */
-		if (unlikely(io_submit_sqe(ctx, req, sqe, &left)) &&
-		    !(ctx->flags & IORING_SETUP_SUBMIT_ALL)) {
-			left--;
+		err = io_submit_sqe(ctx, req, sqe, &left);
+		left--;
+		if (unlikely(err) && !(ctx->flags & IORING_SETUP_SUBMIT_ALL))
 			break;
-		}
-	} while (--left);
+	}
 
 	if (unlikely(left)) {
 		ret -= left;
 		/* try again if it submitted nothing and can't allocate a req */
-		if (!ret && io_req_cache_empty(ctx))
+		if (!ret && !stop && io_req_cache_empty(ctx))
 			ret = -EAGAIN;
 		current->io_uring->cached_refs += left;
 	}
 
 	io_submit_state_end(ctx);
+	if (unlikely(ctx->spare))
+		io_spare_submit_end(ctx, ret > 0 ? ret : 0);
+out:
 	 /* Commit SQ ring head once we've consumed and submitted all SQEs */
 	io_commit_sqring(ctx);
+	if (pull)
+		ret = io_spare_submit_ret(ctx, nr, ret);
 	return ret;
 }
 
@@ -2160,6 +2321,7 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 	io_sq_thread_finish(ctx);
 
 	mutex_lock(&ctx->uring_lock);
+	io_spare_ctx_free(ctx);
 	io_sqe_buffers_unregister(ctx);
 	io_sqe_files_unregister(ctx);
 	io_unregister_zcrx(ctx);
@@ -2373,6 +2535,9 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		 */
 	} while (!wait_for_completion_interruptible_timeout(&ctx->ref_comp, interval));
 
+	if (unlikely(ctx->spare))
+		io_spare_ctx_quiesce(ctx);
+
 	init_completion(&exit.completion);
 	init_task_work(&exit.task_work, io_tctx_exit_cb);
 	exit.ctx = ctx;
@@ -2420,6 +2585,7 @@ static __cold void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
 
 	mutex_lock(&ctx->uring_lock);
 	percpu_ref_kill(&ctx->refs);
+	io_spare_ctx_exit(ctx);
 	xa_for_each(&ctx->personalities, index, creds)
 		io_unregister_personality(ctx, index);
 	mutex_unlock(&ctx->uring_lock);

@@ -14,6 +14,7 @@
 #include "io_uring.h"
 #include "napi.h"
 #include "wait.h"
+#include "spare.h"
 
 static int io_wake_function(struct wait_queue_entry *curr, unsigned int mode,
 			    int wake_flags, void *key)
@@ -159,6 +160,9 @@ static int __io_cqring_wait_schedule(struct io_ring_ctx *ctx,
 	else
 		schedule();
 	current->in_iowait = 0;
+	/* SpareRing: the sleep just ended counts as owner idle time. */
+	if (unlikely(ctx->spare))
+		io_spare_wait_woke(ctx);
 	return ret;
 }
 
@@ -178,6 +182,20 @@ static inline int io_cqring_wait_schedule(struct io_ring_ctx *ctx,
 		return -EINTR;
 	if (unlikely(io_should_wake(iowq)))
 		return 0;
+	/*
+	 * SpareRing implies DEFER_TASKRUN: cq_wait_nr and the task state were
+	 * stored with a full barrier. A countdown already at zero issued this
+	 * cycle's wake before our state was set, so that wake was lost and no
+	 * later add wakes us: an executor counting down CQEs that its in-flight
+	 * token made us post already (io_spare_lazy_wake()) hits this. Chunks
+	 * left to an executor that has stopped serving this ring meanwhile go
+	 * back to the wait loop's rescue.
+	 */
+	if (unlikely(ctx->spare) &&
+	    (atomic_read(&ctx->cq_wait_nr) <= 0 || io_spare_wait_unserved(ctx)))
+		return 1;
+	if (unlikely(ctx->spare))
+		io_spare_wait_last_check(ctx);
 
 	return __io_cqring_wait_schedule(ctx, iowq, ext_arg, start_time);
 }
@@ -190,8 +208,10 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 		   struct ext_arg *ext_arg)
 {
 	struct io_wait_queue iowq;
+	struct hrtimer_sleeper rs;
 	struct io_rings *rings;
 	ktime_t start_time;
+	bool rs_init = false;
 	int ret, nr_wait;
 
 	min_events = min_t(int, min_events, ctx->cq_entries);
@@ -202,6 +222,9 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 		io_run_local_work(ctx, min_events,
 				  max(IO_LOCAL_TW_DEFAULT_MAX, min_events));
 	io_run_task_work();
+
+	if (unlikely(ctx->spare))
+		io_spare_wait_start(ctx, min_events);
 
 	if (unlikely(test_bit(IO_CHECK_CQ_OVERFLOW_BIT, &ctx->check_cq)))
 		io_cqring_do_overflow_flush(ctx);
@@ -255,16 +278,74 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 	trace_io_uring_cqring_wait(ctx, min_events);
 	do {
 		unsigned long check_cq;
+		bool rs_armed = false;
+
+		/*
+		 * Rescue may take uring_lock and issue IO, so stay TASK_RUNNING.
+		 * Each call is bounded; retry without sleeping only while it makes
+		 * progress and nothing else needs this waiter.
+		 */
+		if (unlikely(ctx->spare)) {
+			if (io_spare_rescue(ctx) && !io_should_wake(&iowq) &&
+			    !io_local_work_pending(ctx) && !task_work_pending(current) &&
+			    !READ_ONCE(ctx->check_cq) && !task_sigpending(current)) {
+				ktime_t timeout = iowq.timeout;
+				ktime_t now = io_get_time(ctx);
+
+				/*
+				 * Follow the min timer first, but keep rescuing if it
+				 * would only switch to the general timeout without events.
+				 */
+				if (iowq.min_timeout) {
+					ktime_t min_timeout = ktime_add_ns(iowq.min_timeout,
+									 start_time);
+
+					rcu_read_lock();
+					if (ktime_before(now, min_timeout) ||
+					    timeout == KTIME_MAX ||
+					    ktime_compare(iowq.min_timeout, timeout) >= 0 ||
+					    iowq.cq_min_tail !=
+						READ_ONCE(io_get_rings(ctx)->cq.tail) ||
+					    io_cqring_events(ctx))
+						timeout = min_timeout;
+					rcu_read_unlock();
+				}
+				/* Due timers and signals use the normal wait path below. */
+				if (timeout == KTIME_MAX ||
+				    ktime_before(now, timeout)) {
+					cond_resched();
+					continue;
+				}
+			}
+		}
 
 		if (ctx->flags & IORING_SETUP_DEFER_TASKRUN) {
-			atomic_set(&ctx->cq_wait_nr, nr_wait);
+			atomic_set(&ctx->cq_wait_nr, io_cq_wake_budget(ctx, nr_wait));
 			set_current_state(TASK_INTERRUPTIBLE);
 		} else {
 			prepare_to_wait_exclusive(&ctx->cq_wait, &iowq.wq,
 							TASK_INTERRUPTIBLE);
 		}
 
+		if (unlikely(ctx->spare) && io_spare_wait_rescue_timer(ctx)) {
+			if (!rs_init) {
+				hrtimer_setup_sleeper_on_stack(&rs, ctx->clockid,
+						       HRTIMER_MODE_REL);
+				rs_init = true;
+			}
+			/* hrtimer_wakeup() clears task at expiry (kernel/time/hrtimer.c:2327). */
+			WRITE_ONCE(rs.task, current);
+			hrtimer_set_expires(&rs.timer, ns_to_ktime(io_spare_rescue_ns(ctx)));
+			io_spare_timer_event(ctx, false);
+			hrtimer_sleeper_start_expires(&rs, HRTIMER_MODE_REL);
+			rs_armed = true;
+		}
 		ret = io_cqring_wait_schedule(ctx, &iowq, ext_arg, start_time);
+		if (rs_armed) {
+			hrtimer_cancel(&rs.timer);
+			if (!READ_ONCE(rs.task))
+				io_spare_timer_event(ctx, true);
+		}
 		__set_current_state(TASK_RUNNING);
 		atomic_set(&ctx->cq_wait_nr, IO_CQ_WAKE_INIT);
 
@@ -317,6 +398,8 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 
 	if (!(ctx->flags & IORING_SETUP_DEFER_TASKRUN))
 		finish_wait(&ctx->cq_wait, &iowq.wq);
+	if (rs_init)
+		destroy_hrtimer_on_stack(&rs.timer);
 	restore_saved_sigmask_unless(ret == -EINTR);
 
 	guard(rcu)();

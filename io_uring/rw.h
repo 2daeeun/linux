@@ -47,6 +47,13 @@ int io_read_fixed(struct io_kiocb *req, unsigned int issue_flags);
 int io_write_fixed(struct io_kiocb *req, unsigned int issue_flags);
 void io_readv_writev_cleanup(struct io_kiocb *req);
 void io_rw_fail(struct io_kiocb *req);
+struct folio_batch;
+int io_rw_spare_pin(struct io_kiocb *req, struct folio_batch *fbatch,
+		    unsigned int max_folios, loff_t *pos, bool nowait);
+void io_rw_spare_notify(struct io_kiocb *req);
+bool io_rw_spare_progress(struct io_kiocb *req);
+void io_rw_spare_finish(struct io_kiocb *req, bool notify);
+void io_rw_spare_free(struct io_kiocb *req);
 void io_req_rw_complete(struct io_tw_req tw_req, io_tw_token_t tw);
 int io_read_mshot_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe);
 int io_read_mshot(struct io_kiocb *req, unsigned int issue_flags);

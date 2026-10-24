@@ -1049,7 +1049,7 @@ const struct file_operations ext4_file_operations = {
 	.splice_read	= ext4_file_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.fallocate	= ext4_fallocate,
-	.fop_flags	= FOP_MMAP_SYNC | FOP_BUFFER_RASYNC |
+	.fop_flags	= FOP_MMAP_SYNC | FOP_BUFFER_RASYNC | FOP_SPLIT_READ |
 			  FOP_DIO_PARALLEL_WRITE |
 			  FOP_DONTCACHE,
 	.setlease	= generic_setlease,

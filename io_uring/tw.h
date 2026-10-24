@@ -39,6 +39,7 @@ void tctx_task_work_run(struct io_uring_task *tctx, unsigned int max_entries, un
 
 static inline void __io_req_task_work_add(struct io_kiocb *req, unsigned flags)
 {
+	/* SpareRing executor-issued requests complete on the owner, like these. */
 	if (req->ctx->flags & IORING_SETUP_DEFER_TASKRUN)
 		io_req_local_work_add(req, flags);
 	else

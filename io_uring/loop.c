@@ -12,7 +12,7 @@ static inline int io_loop_nr_cqes(const struct io_ring_ctx *ctx,
 
 static inline void io_loop_wait_start(struct io_ring_ctx *ctx, unsigned nr_wait)
 {
-	atomic_set(&ctx->cq_wait_nr, nr_wait);
+	atomic_set(&ctx->cq_wait_nr, io_cq_wake_budget(ctx, nr_wait));
 	set_current_state(TASK_INTERRUPTIBLE);
 }
 

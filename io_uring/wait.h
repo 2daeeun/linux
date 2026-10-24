@@ -29,6 +29,21 @@ int io_run_task_work_sig(struct io_ring_ctx *ctx);
 void io_cqring_do_overflow_flush(struct io_ring_ctx *ctx);
 void io_cqring_overflow_flush_locked(struct io_ring_ctx *ctx);
 
+/*
+ * The number of lazy task_work adds that may be counted before the waiter
+ * is woken. A drained request is issued from the waiter's own task_work once
+ * the completions queued before it have run; lazy adds only count towards
+ * the wait, so a wait that includes the drained request itself (N lazy
+ * completions, wait for N + 1) can never be satisfied without running them:
+ * while a drain is pending, wake on the first completion.
+ */
+static inline int io_cq_wake_budget(struct io_ring_ctx *ctx, int nr_wait)
+{
+	if (unlikely(ctx->int_flags & IO_RING_F_DRAIN_ACTIVE))
+		return 1;
+	return nr_wait;
+}
+
 static inline unsigned int __io_cqring_events(struct io_ring_ctx *ctx)
 {
 	struct io_rings *rings = io_get_rings(ctx);

@@ -34,6 +34,7 @@
 #include "zcrx.h"
 #include "query.h"
 #include "bpf_filter.h"
+#include "spare.h"
 
 #define IORING_MAX_RESTRICTIONS	(IORING_RESTRICTION_LAST + \
 				 IORING_REGISTER_LAST + IORING_OP_LAST)
@@ -507,6 +508,10 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	u32 *o_sq_array, *n_sq_array = NULL;
 	int ret;
 
+	/* SpareRing: executors read the rings outside uring_lock while attached. */
+	if (unlikely(ctx->spare) && io_spare_frozen(ctx))
+		return -EBUSY;
+
 	memset(&config, 0, sizeof(config));
 
 	/* limited to DEFER_TASKRUN for now */
@@ -779,6 +784,26 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 			return -EACCES;
 	}
 
+	if (unlikely(ctx->spare) && io_spare_frozen(ctx)) {
+		switch (opcode) {
+		case IORING_REGISTER_FILES:
+		case IORING_REGISTER_FILES2:
+		case IORING_UNREGISTER_FILES:
+		case IORING_REGISTER_FILES_UPDATE:
+		case IORING_REGISTER_FILES_UPDATE2:
+		case IORING_REGISTER_BUFFERS:
+		case IORING_REGISTER_BUFFERS2:
+		case IORING_UNREGISTER_BUFFERS:
+		case IORING_REGISTER_BUFFERS_UPDATE:
+		case IORING_REGISTER_CLONE_BUFFERS:
+		case IORING_REGISTER_FILE_ALLOC_RANGE:
+		case IORING_REGISTER_BPF_FILTER:
+			return -EBUSY;
+		default:
+			break;
+		}
+	}
+
 	switch (opcode) {
 	case IORING_REGISTER_BUFFERS:
 		ret = -EFAULT;
@@ -977,6 +1002,18 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 		if (!ret)
 			WRITE_ONCE(ctx->bpf_filters,
 				   ctx->restrictions.bpf_filters->filters);
+		break;
+	case IORING_REGISTER_SPARE:
+		ret = io_register_spare(ctx, arg, nr_args);
+		break;
+	case IORING_REGISTER_SPARE_DEBUG:
+		ret = io_register_spare_debug(ctx, arg, nr_args);
+		break;
+	case IORING_UNREGISTER_SPARE:
+		ret = -EINVAL;
+		if (arg || nr_args)
+			break;
+		ret = io_unregister_spare(ctx);
 		break;
 	default:
 		ret = -EINVAL;

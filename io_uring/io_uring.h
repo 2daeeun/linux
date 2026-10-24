@@ -177,6 +177,7 @@ bool io_cqe_cache_refill(struct io_ring_ctx *ctx, bool overflow, bool cqe32);
 void io_req_defer_failed(struct io_kiocb *req, s32 res);
 bool io_post_aux_cqe(struct io_ring_ctx *ctx, u64 user_data, s32 res, u32 cflags);
 void io_add_aux_cqe(struct io_ring_ctx *ctx, u64 user_data, s32 res, u32 cflags);
+void io_spare_commit_cqes(struct io_ring_ctx *ctx);
 bool io_req_post_cqe(struct io_kiocb *req, s32 res, u32 cflags);
 bool io_req_post_cqe32(struct io_kiocb *req, struct io_uring_cqe src_cqe[2]);
 void __io_commit_cqring_flush(struct io_ring_ctx *ctx);
@@ -200,6 +201,16 @@ void io_queue_iowq(struct io_kiocb *req);
 
 int io_poll_issue(struct io_kiocb *req, io_tw_token_t tw);
 int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr);
+bool io_get_sqe(struct io_ring_ctx *ctx, const struct io_uring_sqe **sqe);
+int io_spare_issue(struct io_kiocb *req, unsigned int issue_flags);
+void io_submit_copies_start(struct io_ring_ctx *ctx, unsigned int nr);
+void io_submit_copies_end(struct io_ring_ctx *ctx);
+int io_submit_copied_sqe_file(struct io_ring_ctx *ctx,
+			      const struct io_uring_sqe *sqe, struct file *file);
+int io_submit_copied_sqe_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
+			     const struct io_uring_sqe *sqe, struct file *file);
+void io_spare_unused_req(struct io_ring_ctx *ctx, struct io_kiocb *req);
+void io_spare_queue_deferred(struct io_ring_ctx *ctx);
 int io_do_iopoll(struct io_ring_ctx *ctx, bool force_nonspin);
 __cold void io_iopoll_try_reap_events(struct io_ring_ctx *ctx);
 void __io_submit_flush_completions(struct io_ring_ctx *ctx);
@@ -235,8 +246,10 @@ static inline void io_lockdep_assert_cq_locked(struct io_ring_ctx *ctx)
 		 * Not from an SQE, as those cannot be submitted, but via
 		 * updating tagged resources.
 		 */
+		/* A SpareRing executor posts under uring_lock too (io_exec_port_flush()). */
 		if (!percpu_ref_is_dying(&ctx->refs))
-			lockdep_assert(current == ctx->submitter_task);
+			lockdep_assert(current == ctx->submitter_task ||
+				       (ctx->spare && (current->flags & PF_IO_WORKER)));
 	}
 #endif
 }

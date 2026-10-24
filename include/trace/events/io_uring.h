@@ -671,6 +671,1032 @@ TRACE_EVENT(io_uring_local_work_run,
 	TP_printk("ring %p, count %d, loops %u", __entry->ctx, __entry->count, __entry->loops)
 );
 
+/*
+ * SpareRing (research prototype, io_uring/spare.c). A chunk is identified by
+ * (ring, seq); executor events carry the executor in common_pid and the CPU
+ * in the record header. Owner events run in the submitter task.
+ */
+#ifndef __IO_URING_SPARE_TRACE_DEFS
+#define __IO_URING_SPARE_TRACE_DEFS
+/* io_uring_spare_skip: why the owner kept SQEs inline */
+#define IO_SPARE_SKIP_STATE		0	/* link, drain, BPF filter or restriction */
+#define IO_SPARE_SKIP_BUDGET		1	/* u_chunks chunks outstanding */
+#define IO_SPARE_SKIP_INELIGIBLE	2	/* head SQE not delegable */
+#define IO_SPARE_SKIP_ASLEEP		3	/* AUTO with no executor awake */
+#define IO_SPARE_SKIP_PENDING		4	/* u_pending chunks unclaimed */
+#define IO_SPARE_SKIP_NOMEM		5	/* chunk or token allocation */
+#define IO_SPARE_SKIP_SHORT		6	/* eligible run shorter than n_min */
+#define IO_SPARE_SKIP_NR		7
+/* io_uring_spare_issue: how an executor finished one slot */
+#define IO_SPARE_ISSUE_INLINE		0
+#define IO_SPARE_ISSUE_ASYNC		1
+#define IO_SPARE_ISSUE_BOUNCE		2
+#define IO_SPARE_ISSUE_FAILED		3
+#define IO_SPARE_ISSUE_CANCELLED	4
+#define IO_SPARE_ISSUE_DEFERRED	5	/* folios pinned, the owner copies */
+#define IO_SPARE_ISSUE_BLOCKED	6	/* issued blocking after the scan, io-wq style */
+/* io_uring_spare_bounce: why a request moved to the owner */
+#define IO_SPARE_BOUNCE_FILE		0	/* io_uring fd, O_APPEND or fsnotify HSM */
+#define IO_SPARE_BOUNCE_EAGAIN		1	/* nonblocking issue would block */
+#define IO_SPARE_BOUNCE_REISSUE		2	/* completion asked for a reissue */
+/* io_uring_spare_retire: how the owner retired a chunk */
+#define IO_SPARE_RETIRE_FIN		0
+#define IO_SPARE_RETIRE_RESCUE		1	/* unclaimed chunk taken back whole */
+#define IO_SPARE_RETIRE_CANCEL		2	/* unclaimed chunk cancelled at exit */
+/* io_uring_spare_wake */
+#define IO_SPARE_WAKE_CREDIT		0	/* credit-limited policy wake */
+#define IO_SPARE_WAKE_PUBLISH		1	/* published while no executor awake */
+/* io_uring_spare_post: what made the owner post */
+#define IO_SPARE_POST_LEASE		0	/* executor kick */
+#define IO_SPARE_POST_FIN		1	/* executor's last access */
+#define IO_SPARE_POST_HARVEST		2	/* owner wait, executor off CPU */
+#define IO_SPARE_POST_PORT		3	/* executor's async CQE journal (chunk 0) */
+#define IO_SPARE_POST_DIRECT		4	/* the executor itself, uring_lock tried and held */
+/* io_uring_spare_rescue: what the owner took back */
+#define IO_SPARE_RESCUE_PENDING		0	/* a whole unclaimed chunk */
+#define IO_SPARE_RESCUE_TAIL		1	/* a stalled executor's unissued tail */
+#define IO_SPARE_RESCUE_SPLIT		2	/* owner wait: half a running executor's tail */
+/* io_uring_spare_async: who finished an async completion */
+#define IO_SPARE_ASYNC_EXEC		0	/* the executor, CQE through its journal */
+#define IO_SPARE_ASYNC_OWNER		1	/* the owner, CQE posted directly */
+#define IO_SPARE_ASYNC_REISSUE		2	/* reissued on the owner, no CQE yet */
+#endif
+
+/**
+ * io_uring_spare_register - ring attached to an executor group
+ *
+ * @ctx:	pointer to a ring context structure
+ * @grp:	executor group, shared by attached rings
+ * @attach:	joined an existing group instead of creating one
+ * @nr_exec:	executors in the group
+ * @n_max:	max SQEs per chunk
+ * @u_pending:	max unclaimed chunks
+ * @u_chunks:	max outstanding chunks
+ * @mode:	IORING_SPARE_MODE_*
+ */
+TRACE_EVENT(io_uring_spare_register,
+
+	TP_PROTO(void *ctx, void *grp, bool attach, u32 nr_exec, u32 n_max,
+		 u32 u_pending, u32 u_chunks, u32 mode),
+
+	TP_ARGS(ctx, grp, attach, nr_exec, n_max, u_pending, u_chunks, mode),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  void *,	grp		)
+		__field(  bool,		attach		)
+		__field(  u32,		nr_exec		)
+		__field(  u32,		n_max		)
+		__field(  u32,		u_pending	)
+		__field(  u32,		u_chunks	)
+		__field(  u32,		mode		)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->grp		= grp;
+		__entry->attach		= attach;
+		__entry->nr_exec	= nr_exec;
+		__entry->n_max		= n_max;
+		__entry->u_pending	= u_pending;
+		__entry->u_chunks	= u_chunks;
+		__entry->mode		= mode;
+	),
+
+	TP_printk("ring %p, grp %p, %s, nr_exec %u, n_max %u, u_pending %u, u_chunks %u, mode %u",
+		  __entry->ctx, __entry->grp, __entry->attach ? "attach" : "create",
+		  __entry->nr_exec, __entry->n_max, __entry->u_pending,
+		  __entry->u_chunks, __entry->mode)
+);
+
+/**
+ * io_uring_spare_detach - ring left its executor group
+ *
+ * @ctx:	pointer to a ring context structure
+ * @grp:	executor group
+ * @last:	the group had no other ring, its executors are stopping
+ */
+TRACE_EVENT(io_uring_spare_detach,
+
+	TP_PROTO(void *ctx, void *grp, bool last),
+
+	TP_ARGS(ctx, grp, last),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx	)
+		__field(  void *,	grp	)
+		__field(  bool,		last	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx	= ctx;
+		__entry->grp	= grp;
+		__entry->last	= last;
+	),
+
+	TP_printk("ring %p, grp %p, last %d", __entry->ctx, __entry->grp,
+		  __entry->last)
+);
+
+/**
+ * io_uring_spare_free - SpareRing state of a ring freed
+ *
+ * @ctx:	pointer to a ring context structure
+ *
+ * With io_uring_spare_detach, bounds the ring teardown latency.
+ */
+TRACE_EVENT(io_uring_spare_free,
+
+	TP_PROTO(void *ctx),
+
+	TP_ARGS(ctx),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx	= ctx;
+	),
+
+	TP_printk("ring %p", __entry->ctx)
+);
+
+/**
+ * io_uring_spare_signal - adaptive signal sampled at an owner service point
+ *
+ * @ctx:	pointer to a ring context structure
+ * @wait:	sampled at wait entry, otherwise at submit
+ * @min_events:	completions the caller asked for
+ * @ready_hits:	consecutive samples that already had them (0..2)
+ */
+TRACE_EVENT(io_uring_spare_signal,
+
+	TP_PROTO(void *ctx, bool wait, unsigned int min_events,
+		 unsigned int ready_hits),
+
+	TP_ARGS(ctx, wait, min_events, ready_hits),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  bool,		wait		)
+		__field(  unsigned int,	min_events	)
+		__field(  unsigned int,	ready_hits	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->wait		= wait;
+		__entry->min_events	= min_events;
+		__entry->ready_hits	= ready_hits;
+	),
+
+	TP_printk("ring %p, %s, min_events %u, ready_hits %u", __entry->ctx,
+		  __entry->wait ? "wait" : "submit", __entry->min_events,
+		  __entry->ready_hits)
+);
+
+/**
+ * io_uring_spare_skip - owner kept the SQEs at the SQ head inline
+ *
+ * @ctx:	pointer to a ring context structure
+ * @reason:	IO_SPARE_SKIP_*
+ * @left:	SQEs left in this submission
+ */
+TRACE_EVENT(io_uring_spare_skip,
+
+	TP_PROTO(void *ctx, int reason, unsigned int left),
+
+	TP_ARGS(ctx, reason, left),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx	)
+		__field(  int,		reason	)
+		__field(  unsigned int,	left	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx	= ctx;
+		__entry->reason	= reason;
+		__entry->left	= left;
+	),
+
+	TP_printk("ring %p, %s, left %u", __entry->ctx,
+		  __print_symbolic(__entry->reason,
+				   { IO_SPARE_SKIP_STATE,	"state" },
+				   { IO_SPARE_SKIP_BUDGET,	"budget" },
+				   { IO_SPARE_SKIP_INELIGIBLE,	"ineligible" },
+				   { IO_SPARE_SKIP_ASLEEP,	"asleep" },
+				   { IO_SPARE_SKIP_PENDING,	"pending" },
+				   { IO_SPARE_SKIP_NOMEM,	"nomem" },
+				   { IO_SPARE_SKIP_SHORT,	"short" }),
+		  __entry->left)
+);
+
+/**
+ * io_uring_spare_delegate - owner published a chunk
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number in this ring
+ * @n:		SQEs copied into the chunk
+ * @left:	SQEs left in this submission, including these
+ * @nr_pending:	unclaimed chunks, including this one
+ * @nr_chunks:	outstanding chunks, including this one
+ */
+TRACE_EVENT(io_uring_spare_delegate,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int n, unsigned int left,
+		 unsigned int nr_pending, unsigned int nr_chunks),
+
+	TP_ARGS(ctx, seq, n, left, nr_pending, nr_chunks),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		seq		)
+		__field(  unsigned int,	n		)
+		__field(  unsigned int,	left		)
+		__field(  unsigned int,	nr_pending	)
+		__field(  unsigned int,	nr_chunks	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->seq		= seq;
+		__entry->n		= n;
+		__entry->left		= left;
+		__entry->nr_pending	= nr_pending;
+		__entry->nr_chunks	= nr_chunks;
+	),
+
+	TP_printk("ring %p, chunk %llu, n %u, left %u, pending %u, chunks %u",
+		  __entry->ctx, (unsigned long long) __entry->seq, __entry->n,
+		  __entry->left, __entry->nr_pending, __entry->nr_chunks)
+);
+
+/**
+ * io_uring_spare_append - owner added a short eligible run to its last unclaimed chunk
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @n:		SQEs in the chunk before the append
+ * @added:	SQEs appended
+ */
+TRACE_EVENT(io_uring_spare_append,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int n, unsigned int added),
+
+	TP_ARGS(ctx, seq, n, added),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		seq		)
+		__field(  unsigned int,	n		)
+		__field(  unsigned int,	added		)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->seq		= seq;
+		__entry->n		= n;
+		__entry->added		= added;
+	),
+
+	TP_printk("ring %p, chunk %llu, n %u, added %u",
+		  __entry->ctx, (unsigned long long) __entry->seq, __entry->n,
+		  __entry->added)
+);
+
+/**
+ * io_uring_spare_wake - owner woke a sleeping executor
+ *
+ * @ctx:	pointer to a ring context structure
+ * @reason:	IO_SPARE_WAKE_*
+ * @nr_awake:	executors awake before the wake
+ * @nr_live:	executors alive
+ * @credit:	outstanding wake credit after this wake
+ */
+TRACE_EVENT(io_uring_spare_wake,
+
+	TP_PROTO(void *ctx, int reason, int nr_awake, int nr_live, int credit),
+
+	TP_ARGS(ctx, reason, nr_awake, nr_live, credit),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  int,		reason		)
+		__field(  int,		nr_awake	)
+		__field(  int,		nr_live		)
+		__field(  int,		credit		)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->reason		= reason;
+		__entry->nr_awake	= nr_awake;
+		__entry->nr_live	= nr_live;
+		__entry->credit		= credit;
+	),
+
+	TP_printk("ring %p, %s, awake %d/%d, credit %d", __entry->ctx,
+		  __print_symbolic(__entry->reason,
+				   { IO_SPARE_WAKE_CREDIT,	"credit" },
+				   { IO_SPARE_WAKE_PUBLISH,	"publish" }),
+		  __entry->nr_awake, __entry->nr_live, __entry->credit)
+);
+
+/**
+ * io_uring_spare_select - executor picked the ring it will claim from
+ *
+ * @ctx:	pointer to a ring context structure
+ * @nr_pending:	unclaimed chunks of that ring when picked
+ */
+TRACE_EVENT(io_uring_spare_select,
+
+	TP_PROTO(void *ctx, unsigned int nr_pending),
+
+	TP_ARGS(ctx, nr_pending),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  unsigned int,	nr_pending	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->nr_pending	= nr_pending;
+	),
+
+	TP_printk("ring %p, pending %u", __entry->ctx, __entry->nr_pending)
+);
+
+/**
+ * io_uring_spare_claim - executor claimed a chunk
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @n:		SQEs in the chunk
+ */
+TRACE_EVENT(io_uring_spare_claim,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int n),
+
+	TP_ARGS(ctx, seq, n),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx	)
+		__field(  u64,		seq	)
+		__field(  unsigned int,	n	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx	= ctx;
+		__entry->seq	= seq;
+		__entry->n	= n;
+	),
+
+	TP_printk("ring %p, chunk %llu, n %u", __entry->ctx,
+		  (unsigned long long) __entry->seq, __entry->n)
+);
+
+/**
+ * io_uring_spare_issue - executor finished issuing one chunk slot
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @slot:	slot index in the chunk
+ * @user_data:	user data of the SQE
+ * @opcode:	opcode of the SQE
+ * @outcome:	IO_SPARE_ISSUE_*
+ * @res:	result for INLINE and FAILED, otherwise 0
+ */
+TRACE_EVENT(io_uring_spare_issue,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int slot, u64 user_data,
+		 u8 opcode, int outcome, int res),
+
+	TP_ARGS(ctx, seq, slot, user_data, opcode, outcome, res),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		seq		)
+		__field(  unsigned int,	slot		)
+		__field(  u64,		user_data	)
+		__field(  u8,		opcode		)
+		__field(  int,		outcome		)
+		__field(  int,		res		)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->seq		= seq;
+		__entry->slot		= slot;
+		__entry->user_data	= user_data;
+		__entry->opcode		= opcode;
+		__entry->outcome	= outcome;
+		__entry->res		= res;
+	),
+
+	TP_printk("ring %p, chunk %llu, slot %u, user_data 0x%llx, opcode %s, %s, res %d",
+		  __entry->ctx, (unsigned long long) __entry->seq, __entry->slot,
+		  (unsigned long long) __entry->user_data,
+		  io_uring_get_opcode(__entry->opcode),
+		  __print_symbolic(__entry->outcome,
+				   { IO_SPARE_ISSUE_INLINE,	"inline" },
+				   { IO_SPARE_ISSUE_ASYNC,	"async" },
+				   { IO_SPARE_ISSUE_BOUNCE,	"bounce" },
+				   { IO_SPARE_ISSUE_FAILED,	"failed" },
+				   { IO_SPARE_ISSUE_CANCELLED,	"cancelled" },
+				   { IO_SPARE_ISSUE_DEFERRED,	"deferred" },
+				   { IO_SPARE_ISSUE_BLOCKED,	"blocked" }),
+		  __entry->res)
+);
+
+/**
+ * io_uring_spare_bounce - executor handed a request to the owner task
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @user_data:	user data of the request
+ * @reason:	IO_SPARE_BOUNCE_*
+ */
+TRACE_EVENT(io_uring_spare_bounce,
+
+	TP_PROTO(void *ctx, u64 seq, u64 user_data, int reason),
+
+	TP_ARGS(ctx, seq, user_data, reason),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		seq		)
+		__field(  u64,		user_data	)
+		__field(  int,		reason		)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->seq		= seq;
+		__entry->user_data	= user_data;
+		__entry->reason		= reason;
+	),
+
+	TP_printk("ring %p, chunk %llu, user_data 0x%llx, %s", __entry->ctx,
+		  (unsigned long long) __entry->seq,
+		  (unsigned long long) __entry->user_data,
+		  __print_symbolic(__entry->reason,
+				   { IO_SPARE_BOUNCE_FILE,	"file" },
+				   { IO_SPARE_BOUNCE_EAGAIN,	"eagain" },
+				   { IO_SPARE_BOUNCE_REISSUE,	"reissue" }))
+);
+
+/**
+ * io_uring_spare_complete - executor stored a CQE in the chunk buffer
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @idx:	index in the chunk CQE buffer
+ * @user_data:	user data of the CQE
+ * @res:	result of the CQE
+ */
+TRACE_EVENT(io_uring_spare_complete,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int idx, u64 user_data, int res),
+
+	TP_ARGS(ctx, seq, idx, user_data, res),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		seq		)
+		__field(  unsigned int,	idx		)
+		__field(  u64,		user_data	)
+		__field(  int,		res		)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->seq		= seq;
+		__entry->idx		= idx;
+		__entry->user_data	= user_data;
+		__entry->res		= res;
+	),
+
+	TP_printk("ring %p, chunk %llu, idx %u, user_data 0x%llx, res %d",
+		  __entry->ctx, (unsigned long long) __entry->seq, __entry->idx,
+		  (unsigned long long) __entry->user_data, __entry->res)
+);
+
+/**
+ * io_uring_spare_kick - executor queued the lease task_work to the owner
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @produced:	CQEs stored in the chunk so far
+ * @kick:	kick number for this chunk, starting at 1
+ */
+TRACE_EVENT(io_uring_spare_kick,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int produced, unsigned int kick),
+
+	TP_ARGS(ctx, seq, produced, kick),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		seq		)
+		__field(  unsigned int,	produced	)
+		__field(  unsigned int,	kick		)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->seq		= seq;
+		__entry->produced	= produced;
+		__entry->kick		= kick;
+	),
+
+	TP_printk("ring %p, chunk %llu, produced %u, kick %u", __entry->ctx,
+		  (unsigned long long) __entry->seq, __entry->produced,
+		  __entry->kick)
+);
+
+/**
+ * io_uring_spare_post - owner posted chunk CQEs to the CQ
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @from:	first CQE index posted
+ * @to:		one past the last CQE index posted (from == to: nothing new)
+ * @src:	IO_SPARE_POST_*
+ */
+TRACE_EVENT(io_uring_spare_post,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int from, unsigned int to, int src),
+
+	TP_ARGS(ctx, seq, from, to, src),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx	)
+		__field(  u64,		seq	)
+		__field(  unsigned int,	from	)
+		__field(  unsigned int,	to	)
+		__field(  int,		src	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx	= ctx;
+		__entry->seq	= seq;
+		__entry->from	= from;
+		__entry->to	= to;
+		__entry->src	= src;
+	),
+
+	TP_printk("ring %p, chunk %llu, cqes [%u, %u), %s", __entry->ctx,
+		  (unsigned long long) __entry->seq, __entry->from, __entry->to,
+		  __print_symbolic(__entry->src,
+				   { IO_SPARE_POST_LEASE,	"lease" },
+				   { IO_SPARE_POST_FIN,		"fin" },
+				   { IO_SPARE_POST_HARVEST,	"harvest" },
+				   { IO_SPARE_POST_PORT,	"port" },
+				   { IO_SPARE_POST_DIRECT,	"direct" }))
+);
+
+/**
+ * io_uring_spare_async - an executor-issued request's async completion was finished
+ *
+ * @ctx:	pointer to a ring context structure
+ * @user_data:	user data of the request
+ * @res:	result of the request
+ * @where:	IO_SPARE_ASYNC_*
+ */
+TRACE_EVENT(io_uring_spare_async,
+
+	TP_PROTO(void *ctx, u64 user_data, int res, int where),
+
+	TP_ARGS(ctx, user_data, res, where),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		user_data	)
+		__field(  int,		res		)
+		__field(  int,		where		)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->user_data	= user_data;
+		__entry->res		= res;
+		__entry->where		= where;
+	),
+
+	TP_printk("ring %p, user_data 0x%llx, res %d, %s", __entry->ctx,
+		  (unsigned long long) __entry->user_data, __entry->res,
+		  __print_symbolic(__entry->where,
+				   { IO_SPARE_ASYNC_EXEC,	"exec" },
+				   { IO_SPARE_ASYNC_OWNER,	"owner" },
+				   { IO_SPARE_ASYNC_REISSUE,	"reissue" }))
+);
+
+/**
+ * io_uring_spare_fin - executor queued the fin task_work, its last chunk access
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @taken:	slots the executor took
+ * @handled:	of those, finished (stored, bounced or cancelled)
+ * @produced:	CQEs stored in the chunk
+ * @async:	issued requests whose completions finish outside the chunk (port)
+ */
+TRACE_EVENT(io_uring_spare_fin,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int taken, unsigned int handled,
+		 unsigned int produced, unsigned int async),
+
+	TP_ARGS(ctx, seq, taken, handled, produced, async),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		seq		)
+		__field(  unsigned int,	taken		)
+		__field(  unsigned int,	handled		)
+		__field(  unsigned int,	produced	)
+		__field(  unsigned int,	async		)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->seq		= seq;
+		__entry->taken		= taken;
+		__entry->handled	= handled;
+		__entry->produced	= produced;
+		__entry->async		= async;
+	),
+
+	TP_printk("ring %p, chunk %llu, taken %u, handled %u, produced %u, async %u",
+		  __entry->ctx, (unsigned long long) __entry->seq, __entry->taken,
+		  __entry->handled, __entry->produced, __entry->async)
+);
+
+/**
+ * io_uring_spare_retire - owner freed a chunk
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @n:		SQEs in the chunk
+ * @produced:	CQEs the executor stored
+ * @how:	IO_SPARE_RETIRE_*
+ */
+TRACE_EVENT(io_uring_spare_retire,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int n, unsigned int produced, int how),
+
+	TP_ARGS(ctx, seq, n, produced, how),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		seq		)
+		__field(  unsigned int,	n		)
+		__field(  unsigned int,	produced	)
+		__field(  int,		how		)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->seq		= seq;
+		__entry->n		= n;
+		__entry->produced	= produced;
+		__entry->how		= how;
+	),
+
+	TP_printk("ring %p, chunk %llu, n %u, produced %u, %s", __entry->ctx,
+		  (unsigned long long) __entry->seq, __entry->n, __entry->produced,
+		  __print_symbolic(__entry->how,
+				   { IO_SPARE_RETIRE_FIN,	"fin" },
+				   { IO_SPARE_RETIRE_RESCUE,	"rescue" },
+				   { IO_SPARE_RETIRE_CANCEL,	"cancel" }))
+);
+
+/**
+ * io_uring_spare_rescue - owner took unissued SQEs back from a chunk
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @nr:		SQEs taken back
+ * @cancelled:	of those, marked cancelled (posted as -ECANCELED)
+ * @kind:	IO_SPARE_RESCUE_*
+ */
+TRACE_EVENT(io_uring_spare_rescue,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int nr, unsigned int cancelled,
+		 u8 kind),
+
+	TP_ARGS(ctx, seq, nr, cancelled, kind),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		seq		)
+		__field(  unsigned int,	nr		)
+		__field(  unsigned int,	cancelled	)
+		__field(  u8,		kind		)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->seq		= seq;
+		__entry->nr		= nr;
+		__entry->cancelled	= cancelled;
+		__entry->kind		= kind;
+	),
+
+	TP_printk("ring %p, chunk %llu, nr %u, cancelled %u, %s", __entry->ctx,
+		  (unsigned long long) __entry->seq, __entry->nr,
+		  __entry->cancelled,
+		  __print_symbolic(__entry->kind,
+				   { IO_SPARE_RESCUE_PENDING,	"pending" },
+				   { IO_SPARE_RESCUE_TAIL,	"tail" },
+				   { IO_SPARE_RESCUE_SPLIT,	"split" }))
+);
+
+/**
+ * io_uring_spare_handback - executor returned unissued slots to the owner
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @nr:		slots returned
+ * @cancelled:	of those, marked cancelled
+ *
+ * Happens on detach, executor stop or a fatal signal.
+ */
+TRACE_EVENT(io_uring_spare_handback,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int nr, unsigned int cancelled),
+
+	TP_ARGS(ctx, seq, nr, cancelled),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		seq		)
+		__field(  unsigned int,	nr		)
+		__field(  unsigned int,	cancelled	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->seq		= seq;
+		__entry->nr		= nr;
+		__entry->cancelled	= cancelled;
+	),
+
+	TP_printk("ring %p, chunk %llu, nr %u, cancelled %u", __entry->ctx,
+		  (unsigned long long) __entry->seq, __entry->nr,
+		  __entry->cancelled)
+);
+
+/**
+ * io_uring_spare_cancel - async cancel marked a delegated, unissued slot
+ *
+ * @ctx:	pointer to a ring context structure
+ * @seq:	chunk sequence number
+ * @slot:	slot index in the chunk
+ * @user_data:	user data of the cancelled SQE
+ */
+TRACE_EVENT(io_uring_spare_cancel,
+
+	TP_PROTO(void *ctx, u64 seq, unsigned int slot, u64 user_data),
+
+	TP_ARGS(ctx, seq, slot, user_data),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  u64,		seq		)
+		__field(  unsigned int,	slot		)
+		__field(  u64,		user_data	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->seq		= seq;
+		__entry->slot		= slot;
+		__entry->user_data	= user_data;
+	),
+
+	TP_printk("ring %p, chunk %llu, slot %u, user_data 0x%llx", __entry->ctx,
+		  (unsigned long long) __entry->seq, __entry->slot,
+		  (unsigned long long) __entry->user_data)
+);
+
+/**
+ * io_uring_spare_exec_sleep - executor is about to sleep
+ *
+ * @linger_ns:	current linger budget
+ * @idle_ns:	time spent idle (lingering) before sleeping
+ */
+TRACE_EVENT(io_uring_spare_exec_sleep,
+
+	TP_PROTO(u64 linger_ns, u64 idle_ns),
+
+	TP_ARGS(linger_ns, idle_ns),
+
+	TP_STRUCT__entry (
+		__field(  u64,	linger_ns	)
+		__field(  u64,	idle_ns		)
+	),
+
+	TP_fast_assign(
+		__entry->linger_ns	= linger_ns;
+		__entry->idle_ns	= idle_ns;
+	),
+
+	TP_printk("linger %llu ns, idle %llu ns",
+		  (unsigned long long) __entry->linger_ns,
+		  (unsigned long long) __entry->idle_ns)
+);
+
+/**
+ * io_uring_spare_exec_wake - executor woke up
+ *
+ * @slept_ns:	time asleep
+ * @nr_pending:	unclaimed chunks in the group at wake
+ * @empty:	no chunk and no completion to run (counts towards linger 0)
+ */
+TRACE_EVENT(io_uring_spare_exec_wake,
+
+	TP_PROTO(u64 slept_ns, unsigned int nr_pending, bool empty),
+
+	TP_ARGS(slept_ns, nr_pending, empty),
+
+	TP_STRUCT__entry (
+		__field(  u64,		slept_ns	)
+		__field(  unsigned int,	nr_pending	)
+		__field(  bool,		empty		)
+	),
+
+	TP_fast_assign(
+		__entry->slept_ns	= slept_ns;
+		__entry->nr_pending	= nr_pending;
+		__entry->empty		= empty;
+	),
+
+	TP_printk("slept %llu ns, pending %u, %s",
+		  (unsigned long long) __entry->slept_ns, __entry->nr_pending,
+		  __entry->empty ? "empty" : "work")
+);
+
+/**
+ * io_uring_spare_exec_exit - executor finished its exit cancellation
+ *
+ * @cancel_ns:	time spent returning chunks and handing its completions to owners
+ */
+TRACE_EVENT(io_uring_spare_exec_exit,
+
+	TP_PROTO(u64 cancel_ns),
+
+	TP_ARGS(cancel_ns),
+
+	TP_STRUCT__entry (
+		__field(  u64,	cancel_ns	)
+	),
+
+	TP_fast_assign(
+		__entry->cancel_ns	= cancel_ns;
+	),
+
+	TP_printk("cancel %llu ns", (unsigned long long) __entry->cancel_ns)
+);
+
+/* Pull lease transitions and publication results, shared with the call sites. */
+#define IO_SPARE_LEASE_ACQUIRE		0
+#define IO_SPARE_LEASE_RELEASE		1
+#define IO_SPARE_LEASE_HANDBACK		2
+#define IO_SPARE_LEASE_TAKEOVER		3
+#define IO_SPARE_LEASE_DROP		4
+#define IO_SPARE_PULL_PUBLISHED		0
+#define IO_SPARE_PULL_ABORTED		1
+#define IO_SPARE_PULL_WITHDRAW_SELF	2
+#define IO_SPARE_PULL_WITHDRAW_OWNER	3
+#define IO_SPARE_PULL_CLAIMED		4
+
+TRACE_EVENT(io_uring_spare_lease,
+
+	TP_PROTO(void *ctx, void *exec, int op, u32 cursor, int reason),
+
+	TP_ARGS(ctx, exec, op, cursor, reason),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx	)
+		__field(  void *,	exec	)
+		__field(  int,	op	)
+		__field(  u32,	cursor	)
+		__field(  int,	reason	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx	= ctx;
+		__entry->exec	= exec;
+		__entry->op	= op;
+		__entry->cursor	= cursor;
+		__entry->reason	= reason;
+	),
+
+	TP_printk("ring %p, exec %p, op %d, cursor %u, reason %d",
+		  __entry->ctx, __entry->exec, __entry->op, __entry->cursor, __entry->reason)
+);
+
+TRACE_EVENT(io_uring_spare_pull_publish,
+
+	TP_PROTO(void *ctx, void *exec, u32 start, u32 k, int result),
+
+	TP_ARGS(ctx, exec, start, k, result),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx	)
+		__field(  void *,	exec	)
+		__field(  u32,	start	)
+		__field(  u32,	k	)
+		__field(  int,	result	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx	= ctx;
+		__entry->exec	= exec;
+		__entry->start	= start;
+		__entry->k	= k;
+		__entry->result	= result;
+	),
+
+	TP_printk("ring %p, exec %p, start %u, k %u, result %d",
+		  __entry->ctx, __entry->exec, __entry->start, __entry->k, __entry->result)
+);
+
+TRACE_EVENT(io_uring_spare_head,
+
+	TP_PROTO(void *ctx, int who, u32 want, u32 limit),
+
+	TP_ARGS(ctx, who, want, limit),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx	)
+		__field(  int,	who	)
+		__field(  u32,	want	)
+		__field(  u32,	limit	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx	= ctx;
+		__entry->who	= who;
+		__entry->want	= want;
+		__entry->limit	= limit;
+	),
+
+	TP_printk("ring %p, who %d, want %u, limit %u",
+		  __entry->ctx, __entry->who, __entry->want, __entry->limit)
+);
+
+TRACE_EVENT(io_uring_spare_rtoken,
+
+	TP_PROTO(void *ctx, int producer, bool queued),
+
+	TP_ARGS(ctx, producer, queued),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx	)
+		__field(  int,	producer	)
+		__field(  bool,	queued	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx	= ctx;
+		__entry->producer	= producer;
+		__entry->queued	= queued;
+	),
+
+	TP_printk("ring %p, producer %d, queued %d",
+		  __entry->ctx, __entry->producer, __entry->queued)
+);
+
+TRACE_EVENT(io_uring_spare_rtimer,
+
+	TP_PROTO(void *ctx, bool armed, bool fired, u32 pending, u32 rsv_chunks),
+
+	TP_ARGS(ctx, armed, fired, pending, rsv_chunks),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx	)
+		__field(  bool,	armed	)
+		__field(  bool,	fired	)
+		__field(  u32,	pending	)
+		__field(  u32,	rsv_chunks	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx	= ctx;
+		__entry->armed	= armed;
+		__entry->fired	= fired;
+		__entry->pending	= pending;
+		__entry->rsv_chunks	= rsv_chunks;
+	),
+
+	TP_printk("ring %p, armed %d, fired %d, pending %u, rsv_chunks %u",
+		  __entry->ctx, __entry->armed, __entry->fired, __entry->pending, __entry->rsv_chunks)
+);
+
 #endif /* _TRACE_IO_URING_H */
 
 /* This part must be outside protection */

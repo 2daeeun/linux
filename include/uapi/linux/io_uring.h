@@ -576,6 +576,7 @@ struct io_sqring_offsets {
 #define IORING_SQ_NEED_WAKEUP	(1U << 0) /* needs io_uring_enter wakeup */
 #define IORING_SQ_CQ_OVERFLOW	(1U << 1) /* CQ ring is overflown */
 #define IORING_SQ_TASKRUN	(1U << 2) /* task should enter the kernel */
+#define IORING_SQ_LEASED	(1U << 3) /* an executor holds the SQ lease */
 
 struct io_cqring_offsets {
 	__u32 head;
@@ -722,6 +723,11 @@ enum io_uring_register_op {
 
 	/* register bpf filtering programs */
 	IORING_REGISTER_BPF_FILTER		= 37,
+
+	/* SpareRing: attach this ring to a spare executor group */
+	IORING_REGISTER_SPARE			= 38,
+	IORING_UNREGISTER_SPARE			= 39,
+	IORING_REGISTER_SPARE_DEBUG		= 40,
 
 	/* this goes last */
 	IORING_REGISTER_LAST,
@@ -1021,6 +1027,88 @@ struct io_uring_sync_cancel_reg {
 struct io_uring_file_index_range {
 	__u32	off;
 	__u32	len;
+	__u64	resv;
+};
+
+enum io_uring_spare_mode {
+	IORING_SPARE_MODE_AUTO		= 0,	/* adaptive delegation (docs/12 5.3) */
+	/* delegate every eligible run, wake executors as needed */
+	IORING_SPARE_MODE_ALWAYS		= 1,
+	IORING_SPARE_MODE_NEVER		= 2,	/* attached but never delegate */
+};
+
+/* io_uring_spare_reg.flags */
+/* ablation: wait-time rescue splits only a stalled executor's chunk, not a running one's */
+#define IORING_SPARE_F_NO_SPLIT	(1U << 0)
+/* ablation: only the owner posts CQEs (executors never take uring_lock to post) */
+#define IORING_SPARE_F_OWNER_POST	(1U << 1)
+/* ablation: a short run never joins the ring's last unclaimed chunk */
+#define IORING_SPARE_F_NO_ACCUMULATE	(1U << 2)
+/* ablation: executors bounce to the owner instead of blocking on a slow path */
+#define IORING_SPARE_F_NO_BLOCK	(1U << 3)
+/* ablation: n_min is the constant given here, not the owner's cost model */
+#define IORING_SPARE_F_FIXED_NMIN	(1U << 4)
+#define IORING_SPARE_F_NO_PULL	(1U << 5)
+#define IORING_SPARE_F_EXEC_BLOCK	(1U << 6)
+#define IORING_SPARE_F_EXEC_FINISH	(1U << 7)
+#define IORING_SPARE_F_NO_TIER	(1U << 8)
+#define IORING_SPARE_F_NO_NOTIFIER	(1U << 9)
+#define IORING_SPARE_F_PULL_HANDOFF	(1U << 10)
+
+#define IORING_SPARE_FEAT_PULL	(1U << 0)
+
+/* argument for IORING_REGISTER_SPARE, nr_args must be 1 */
+struct io_uring_spare_reg {
+	__s32	attach_fd;	/* -1: create a new group; else fd of a ring already in a group */
+	__u32	nr_exec;	/* new group only: executors to create, 1..64 */
+	__u32	n_max;		/* max SQEs per chunk, 0 = default 32, max 64 */
+	__u32	u_pending;	/* max unclaimed chunks per ring, 0 = default 4 */
+	__u32	u_chunks;	/* max outstanding chunks per ring, 0 = default 16 */
+	__u32	linger_us;	/* executor polling before sleep, 0 = default 50, max 1000 */
+	__u32	mode;		/* enum io_uring_spare_mode */
+	__u32	flags;		/* IORING_SPARE_F_* */
+	__u64	cpumask;	/* new group only: user pointer to a cpu bitmap, 0 = any cpu */
+	__u32	cpumask_len;	/* bytes at cpumask */
+	__u32	n_min;		/* min eligible run to delegate, 0 = default 16, capped at n_max */
+	__u32	rescue_us;	/* rescue period, 0 = 1000 us */
+	__u32	features;	/* out: IORING_SPARE_FEAT_* */
+};
+
+enum io_uring_spare_dbg_point {
+	IORING_SPARE_DBG_EXEC_BEFORE_PUBLISH = 1,
+	IORING_SPARE_DBG_EXEC_BEFORE_CLAIM = 2,
+	IORING_SPARE_DBG_EXEC_BEFORE_WITHDRAW = 3,
+	IORING_SPARE_DBG_EXEC_MID_COPY = 4,
+	IORING_SPARE_DBG_EXEC_BEFORE_HEAD = 5,
+	IORING_SPARE_DBG_EXEC_RELEASE_WINDOW = 6,
+	IORING_SPARE_DBG_EXEC_TOKEN_CLAIMED = 7,
+	IORING_SPARE_DBG_EXEC_IN_ISSUE = 8,
+	IORING_SPARE_DBG_OWNER_AFTER_LAST_CHECK = 9,
+	IORING_SPARE_DBG_OWNER_ALLOC_FAIL = 10,
+	IORING_SPARE_DBG_RING_INIT_HEAD = 11,
+	IORING_SPARE_DBG_EXEC_BEFORE_REAP = 12,	/* executor, port done non-empty: before it reaps */
+};
+
+enum io_uring_spare_dbg_action {
+	IORING_SPARE_DBG_PARK = 1,
+	IORING_SPARE_DBG_BLOCK = 2,
+	IORING_SPARE_DBG_SPIN = 3,
+	IORING_SPARE_DBG_KILL = 4,
+	IORING_SPARE_DBG_FAIL = 5,
+	IORING_SPARE_DBG_SET = 6,
+	IORING_SPARE_DBG_RELEASE = 7,
+	IORING_SPARE_DBG_QUERY = 8,
+	IORING_SPARE_DBG_DISARM = 9,
+};
+
+/* Argument for IORING_REGISTER_SPARE_DEBUG, nr_args must be 1, in/out. */
+struct io_uring_spare_debug {
+	__u32	point;
+	__u32	action;
+	__u32	count;
+	__u32	usec;
+	__u32	slot;
+	__u32	hits;
 	__u64	resv;
 };
 

@@ -20,6 +20,7 @@
 #include "futex.h"
 #include "cancel.h"
 #include "wait.h"
+#include "spare.h"
 
 struct io_cancel {
 	struct file			*file;
@@ -109,6 +110,12 @@ int io_try_cancel(struct io_uring_task *tctx, struct io_cancel_data *cd,
 	int ret;
 
 	WARN_ON_ONCE(!io_wq_current_is_worker() && tctx != current->io_uring);
+
+	if (unlikely(ctx->spare)) {
+		ret = io_spare_try_cancel(ctx, cd);
+		if (!ret)
+			return 0;
+	}
 
 	ret = io_async_cancel_one(tctx, cd);
 	/*
@@ -262,6 +269,7 @@ static int __io_sync_cancel(struct io_uring_task *tctx,
 			return -EBADF;
 	}
 
+	/* S5: also cancel pull RESERVED slots here, while uring_lock pins their SQEs. */
 	return __io_async_cancel(cd, tctx, 0);
 }
 
@@ -556,6 +564,8 @@ __cold bool io_uring_try_cancel_requests(struct io_ring_ctx *ctx,
 	    io_allowed_defer_tw_run(ctx))
 		ret |= io_run_local_work(ctx, INT_MAX, INT_MAX) > 0;
 	mutex_lock(&ctx->uring_lock);
+	if (unlikely(ctx->spare))
+		ret |= io_spare_cancel_pending(ctx, cancel_all);
 	ret |= io_cancel_defer_files(ctx, tctx, cancel_all);
 	ret |= io_poll_remove_all(ctx, tctx, cancel_all);
 	ret |= io_waitid_remove_all(ctx, tctx, cancel_all);

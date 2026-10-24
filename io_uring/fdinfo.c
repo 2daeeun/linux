@@ -16,6 +16,7 @@
 #include "cancel.h"
 #include "rsrc.h"
 #include "opdef.h"
+#include "spare.h"
 
 #ifdef CONFIG_NET_RX_BUSY_POLL
 static __cold void common_tracking_show_fdinfo(struct io_ring_ctx *ctx,
@@ -250,6 +251,8 @@ static void __io_uring_show_fdinfo(struct io_ring_ctx *ctx, struct seq_file *m)
 	}
 	spin_unlock(&ctx->completion_lock);
 	napi_show_fdinfo(ctx, m);
+	if (ctx->spare)
+		io_spare_show_fdinfo(ctx, m);
 }
 
 /*

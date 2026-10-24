@@ -12,6 +12,7 @@
 #include "io_uring.h"
 #include "rsrc.h"
 #include "filetable.h"
+#include "spare.h"
 
 static int io_file_bitmap_get(struct io_ring_ctx *ctx)
 {
@@ -90,6 +91,9 @@ int __io_fixed_fd_install(struct io_ring_ctx *ctx, struct file *file,
 	bool alloc_slot = file_slot == IORING_FILE_INDEX_ALLOC;
 	int ret;
 
+	if (unlikely(ctx->spare) && io_spare_frozen(ctx))
+		return -EBUSY;
+
 	if (alloc_slot) {
 		ret = io_file_bitmap_get(ctx);
 		if (unlikely(ret < 0))
@@ -126,6 +130,9 @@ int io_fixed_fd_install(struct io_kiocb *req, unsigned int issue_flags,
 int io_fixed_fd_remove(struct io_ring_ctx *ctx, unsigned int offset)
 {
 	struct io_rsrc_node *node;
+
+	if (unlikely(ctx->spare) && io_spare_frozen(ctx))
+		return -EBUSY;
 
 	if (unlikely(!ctx->file_table.data.nr))
 		return -ENXIO;

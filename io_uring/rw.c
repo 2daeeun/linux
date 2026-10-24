@@ -3,6 +3,8 @@
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/folio_batch.h>
+#include <linux/swap.h>
 #include <linux/blk-mq.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
@@ -22,8 +24,10 @@
 #include "rsrc.h"
 #include "poll.h"
 #include "rw.h"
+#include "spare.h"
 
 static void io_complete_rw(struct kiocb *kiocb, long res);
+static int io_rw_init_file(struct io_kiocb *req, fmode_t mode, int rw_type);
 static void io_complete_rw_iopoll(struct kiocb *kiocb, long res);
 
 struct io_rw {
@@ -192,7 +196,21 @@ static int io_rw_alloc_async(struct io_kiocb *req)
 	struct io_ring_ctx *ctx = req->ctx;
 	struct io_async_rw *rw;
 
-	rw = io_uring_alloc_async_data(&ctx->rw_cache, req);
+	if (unlikely(req->flags & REQ_F_EXEC)) {
+		struct io_alloc_cache *cache = io_spare_rw_cache(req);
+
+		if (cache) {
+			rw = io_uring_alloc_async_data(cache, req);
+		} else {
+			/* A fresh rw_cache entry has a zeroed vec prefix. */
+			rw = kzalloc_obj(*rw);
+			req->async_data = rw;
+			if (rw)
+				req->flags |= REQ_F_ASYNC_DATA;
+		}
+	} else {
+		rw = io_uring_alloc_async_data(&ctx->rw_cache, req);
+	}
 	if (!rw)
 		return -ENOMEM;
 	if (rw->vec.iovec)
@@ -528,6 +546,149 @@ static void io_req_io_notify(struct io_kiocb *req)
 		fsnotify_access(req->file);
 }
 
+/*
+ * SpareRing executor: the page-cache half of a buffered read, filemap_read()
+ * up to its copy loop, with IOCB_NOWAIT. On success the uptodate folios stay
+ * referenced in fbatch for the owner to copy on its own core, *pos is the read
+ * position, and the return value is the byte count that copy may produce.
+ * Returns 0 at EOF (nothing to copy), -EAGAIN when the data is not resident
+ * or the file cannot be read without blocking, -EOPNOTSUPP when this read is
+ * not one to split (the caller issues it normally), or another error.
+ */
+int io_rw_spare_pin(struct io_kiocb *req, struct folio_batch *fbatch,
+		    unsigned int max_folios, loff_t *pos, bool nowait)
+{
+	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
+	struct kiocb *kiocb = &rw->kiocb;
+	struct file *file = req->file;
+	struct inode *inode = file_inode(file);
+	struct folio *last;
+	loff_t isize, end, *ppos;
+	size_t count = rw->len;
+	unsigned int i, nr;
+	int ret;
+
+	if (!S_ISREG(inode->i_mode) || IS_DAX(inode) || !count ||
+	    !(file->f_op->fop_flags & FOP_SPLIT_READ))
+		return -EOPNOTSUPP;
+	count = min_t(size_t, count, MAX_RW_COUNT);
+	ret = io_rw_init_file(req, FMODE_READ, READ);
+	if (unlikely(ret))
+		return ret;
+	if (kiocb->ki_flags & (IOCB_DIRECT | IOCB_DONTCACHE))
+		return -EOPNOTSUPP;
+	if (nowait) {
+		if (unlikely(!io_file_supports_nowait(req, EPOLLIN)))
+			return -EAGAIN;
+		kiocb->ki_flags |= IOCB_NOWAIT;
+	} else {
+		/* After the scan: the lookup may read the data in and wait for it. */
+		kiocb->ki_flags &= ~IOCB_NOWAIT;
+	}
+	ppos = io_kiocb_update_pos(req);
+	if (!ppos)
+		return -EOPNOTSUPP;
+	ret = rw_verify_area(READ, file, ppos, count);
+	if (unlikely(ret))
+		return ret;
+	/* The checks filemap_read() makes before looking up pages. */
+	if (unlikely(kiocb->ki_pos < 0))
+		return -EINVAL;
+	if (unlikely(kiocb->ki_pos >= inode->i_sb->s_maxbytes))
+		return 0;
+	count = min_t(loff_t, count, inode->i_sb->s_maxbytes - kiocb->ki_pos);
+	if (unlikely(kiocb->ki_pos >= i_size_read(inode)))
+		return 0;
+	folio_batch_init(fbatch);
+	ret = filemap_get_pages(kiocb, count, fbatch, false);
+	if (ret < 0)
+		return ret;
+	nr = folio_batch_count(fbatch);
+	/* i_size must be checked after the folios are known to be uptodate. */
+	isize = i_size_read(inode);
+	if (unlikely(kiocb->ki_pos >= isize)) {
+		ret = 0;
+		goto put;
+	}
+	end = min_t(loff_t, isize, kiocb->ki_pos + count);
+	last = fbatch->folios[nr - 1];
+	/* More folios than a slot holds, or a batch that stops short: not split. */
+	if (nr > max_folios || folio_pos(last) + folio_size(last) < end) {
+		ret = -EOPNOTSUPP;
+		goto put;
+	}
+	/* A dropbehind folio wants filemap_end_dropbehind_read() at copy time. */
+	for (i = 0; i < nr; i++) {
+		if (folio_test_dropbehind(fbatch->folios[i])) {
+			ret = -EOPNOTSUPP;
+			goto put;
+		}
+	}
+	/* As filemap_read(): the first folio counts as accessed once per folio. */
+	if ((kiocb->ki_pos >> folio_shift(fbatch->folios[0])) !=
+	    ((file->f_ra.prev_pos - 1) >> folio_shift(fbatch->folios[0])))
+		folio_mark_accessed(fbatch->folios[0]);
+	for (i = 1; i < nr; i++)
+		folio_mark_accessed(fbatch->folios[i]);
+	*pos = kiocb->ki_pos;
+	/*
+	 * The rest of filemap_read()'s bookkeeping is done here, on this core,
+	 * so the owner's copy touches no line of the file: the readahead state
+	 * as a full copy leaves it, and the access time.
+	 */
+	file->f_ra.prev_pos = end;
+	file_accessed(file);
+	return end - kiocb->ki_pos;
+put:
+	for (i = 0; i < nr; i++)
+		folio_put(fbatch->folios[i]);
+	folio_batch_init(fbatch);
+	return ret;
+}
+
+void io_rw_spare_notify(struct io_kiocb *req)
+{
+	io_req_io_notify(req);
+}
+
+/*
+ * SpareRing executor: a read that already transferred part of its range (a
+ * short read, -EAGAIN after it) must finish through the normal path, whose
+ * completion adds bytes_done; a pin at the advanced position would see EOF.
+ */
+bool io_rw_spare_progress(struct io_kiocb *req)
+{
+	struct io_async_rw *io = req->async_data;
+
+	return io && io->bytes_done;
+}
+
+void io_rw_spare_finish(struct io_kiocb *req, bool notify)
+{
+	if (notify)
+		io_req_io_notify(req);
+	/* Prep can fail before an async object has been allocated. */
+	if (req->async_data)
+		io_req_rw_cleanup(req, IO_URING_F_UNLOCKED);
+}
+
+void io_rw_spare_free(struct io_kiocb *req)
+{
+	struct io_alloc_cache *cache = io_spare_rw_cache(req);
+	struct io_async_rw *rw = req->async_data;
+
+	if (cache) {
+		io_alloc_cache_vec_kasan(&rw->vec);
+		if (rw->vec.nr > IO_VEC_CACHE_SOFT_CAP)
+			io_vec_free(&rw->vec);
+		if (io_alloc_cache_put(cache, rw))
+			goto clear;
+	}
+	io_rw_cache_free(rw);
+clear:
+	io_req_async_data_clear(req, 0);
+}
+
 /* Finish write accounting and notify, for inline completions only. */
 static void io_req_io_end(struct io_kiocb *req)
 {
@@ -568,6 +729,7 @@ void io_req_rw_complete(struct io_tw_req tw_req, io_tw_token_t tw)
 {
 	struct io_kiocb *req = tw_req.req;
 
+	WARN_ON_ONCE(req->flags & REQ_F_EXEC);
 	io_req_io_notify(req);
 
 	if (req->flags & (REQ_F_BUFFER_SELECTED|REQ_F_BUFFER_RING))
@@ -588,6 +750,11 @@ static void io_complete_rw(struct kiocb *kiocb, long res)
 
 	__io_complete_rw_common(req, res);
 	io_req_set_res(req, io_fixup_rw_res(req, res), 0);
+	/* A SpareRing executor issued it: its executor or the owner finishes it. */
+	if (unlikely(req->flags & REQ_F_EXEC)) {
+		io_spare_rw_done(req);
+		return;
+	}
 	req->io_task_work.func = io_req_rw_complete;
 	__io_req_task_work_add(req, IOU_F_TWQ_LAZY_WAKE);
 }
@@ -799,10 +966,10 @@ static bool io_rw_should_retry(struct io_kiocb *req)
 	struct kiocb *kiocb = &rw->kiocb;
 
 	/*
-	 * Never retry for NOWAIT or a request with metadata, we just complete
-	 * with -EAGAIN.
+	 * Executors bounce instead of entering the owner's IOCB_WAITQ path.
+	 * Never retry for NOWAIT or a request with metadata either.
 	 */
-	if (req->flags & (REQ_F_NOWAIT | REQ_F_HAS_METADATA))
+	if (req->flags & (REQ_F_EXEC | REQ_F_NOWAIT | REQ_F_HAS_METADATA))
 		return false;
 
 	/* Only for buffered IO */

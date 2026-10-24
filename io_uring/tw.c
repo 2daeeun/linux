@@ -210,6 +210,9 @@ void io_req_normal_work_add(struct io_kiocb *req)
 	struct io_uring_task *tctx = req->tctx;
 	struct io_ring_ctx *ctx = req->ctx;
 
+	/* SpareRing requires DEFER_TASKRUN: its requests never come here. */
+	WARN_ON_ONCE(req->flags & REQ_F_EXEC);
+
 	/* SQPOLL can retire the request on push, see io_ring_exit_work() */
 	guard(rcu)();
 

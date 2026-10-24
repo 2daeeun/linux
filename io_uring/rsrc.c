@@ -19,6 +19,7 @@
 #include "rsrc.h"
 #include "memmap.h"
 #include "register.h"
+#include "spare.h"
 
 struct io_rsrc_update {
 	struct file			*file;
@@ -424,6 +425,9 @@ static int __io_register_rsrc_update(struct io_ring_ctx *ctx, unsigned type,
 	__u32 tmp;
 
 	lockdep_assert_held(&ctx->uring_lock);
+
+	if (unlikely(ctx->spare) && io_spare_frozen(ctx))
+		return -EBUSY;
 
 	if (check_add_overflow(up->offset, nr_args, &tmp))
 		return -EOVERFLOW;
@@ -1027,6 +1031,9 @@ static struct io_mapped_ubuf *io_kernel_buffer_init(struct io_ring_ctx *ctx,
 	struct io_mapped_ubuf *imu;
 	struct io_rsrc_node *node;
 
+	if (unlikely(ctx->spare) && io_spare_frozen(ctx))
+		return ERR_PTR(-EBUSY);
+
 	if (index >= data->nr)
 		return ERR_PTR(-EINVAL);
 	index = array_index_nospec(index, data->nr);
@@ -1140,6 +1147,10 @@ int io_buffer_unregister(struct io_uring_cmd *cmd, unsigned int index,
 	int ret = 0;
 
 	io_ring_submit_lock(ctx, issue_flags);
+	if (unlikely(ctx->spare) && io_spare_frozen(ctx)) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 	if (index >= data->nr) {
 		ret = -EINVAL;
 		goto unlock;
@@ -1264,6 +1275,13 @@ inline struct io_rsrc_node *io_find_buf_node(struct io_kiocb *req,
 	return NULL;
 }
 
+/* SpareRing owner copy: a registered buffer by node, with no request object. */
+int io_import_reg_buf_node(struct io_rsrc_node *node, struct iov_iter *iter,
+			   u64 buf_addr, size_t len, int ddir)
+{
+	return io_import_fixed(ddir, iter, node->buf, buf_addr, len);
+}
+
 int io_import_reg_buf(struct io_kiocb *req, struct iov_iter *iter,
 			u64 buf_addr, size_t len, int ddir,
 			unsigned issue_flags)
@@ -1345,6 +1363,10 @@ static int io_clone_buffers(struct io_ring_ctx *ctx, struct io_ring_ctx *src_ctx
 
 	lockdep_assert_held(&ctx->uring_lock);
 	lockdep_assert_held(&src_ctx->uring_lock);
+
+	/* io_register_clone_buffers() may have dropped the destination lock. */
+	if (unlikely(ctx->spare) && io_spare_frozen(ctx))
+		return -EBUSY;
 
 	/*
 	 * Accounting state is shared between the two rings; that only works if

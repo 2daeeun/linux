@@ -3,6 +3,13 @@
 # io_uring configuration
 #
 
+config IO_URING_SPARE_DEBUG
+	bool "SpareRing deterministic fault injection"
+	depends on IO_URING
+	default n
+	help
+	  Enable ring-local SpareRing lease fault injection for protocol tests.
+
 config IO_URING_ZCRX
 	def_bool y
 	depends on IO_URING

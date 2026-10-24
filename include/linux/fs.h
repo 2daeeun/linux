@@ -1980,6 +1980,12 @@ struct file_operations {
 #define FOP_DONTCACHE		((__force fop_flags_t)(1 << 7))
 /* Never changes and is never removed, readdir of a directory takes no lock */
 #define FOP_IMMUTABLE		((__force fop_flags_t)(1 << 8))
+/*
+ * Buffered reads are plain filemap_read() with no file system locking around
+ * it, so a caller may do the page-cache lookup on one CPU and the copy on
+ * another (io_uring SpareRing).
+ */
+#define FOP_SPLIT_READ		((__force fop_flags_t)(1 << 9))
 
 /* Wrap a directory iterator that needs exclusive inode access */
 int wrap_directory_iterator(struct file *, struct dir_context *,
@@ -3086,6 +3092,9 @@ extern int generic_write_check_limits(struct file *file, loff_t pos,
 extern int generic_file_rw_checks(struct file *file_in, struct file *file_out);
 ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *to,
 		ssize_t already_read);
+struct folio_batch;
+int filemap_get_pages(struct kiocb *iocb, size_t count,
+		struct folio_batch *fbatch, bool need_uptodate);
 extern ssize_t generic_file_read_iter(struct kiocb *, struct iov_iter *);
 extern ssize_t __generic_file_write_iter(struct kiocb *, struct iov_iter *);
 extern ssize_t generic_file_write_iter(struct kiocb *, struct iov_iter *);
