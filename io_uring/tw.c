@@ -15,6 +15,7 @@
 #include "eventfd.h"
 #include "wait.h"
 #include "mpscq.h"
+#include "sqpoll.h"
 
 static void ctx_flush_and_put(struct io_ring_ctx *ctx, io_tw_token_t tw)
 {
@@ -89,7 +90,15 @@ void tctx_task_work_run(struct io_uring_task *tctx, unsigned int max_entries,
 		if (req->ctx != ctx) {
 			ctx_flush_and_put(ctx, ts);
 			ctx = req->ctx;
-			mutex_lock(&ctx->uring_lock);
+			if (!ctx->ringback || !io_ringback_tw_lock(ctx)) {
+				/*
+				 * Lock ceiling: raise at the lock, not at the
+				 * pending check.
+				 */
+				if (ctx->ringback)
+					io_ringback_tw_raise(ctx);
+				mutex_lock(&ctx->uring_lock);
+			}
 			percpu_ref_get(&ctx->refs);
 			ts.cancel = io_should_terminate_tw(ctx);
 		}
@@ -148,7 +157,24 @@ static void io_ctx_mark_taskrun(struct io_ring_ctx *ctx)
 	}
 }
 
-void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
+static bool io_tw_push(struct mpscq *q, struct llist_node *node)
+{
+	bool empty;
+
+	/* Do not strand an owner's FIFO between tail xchg and linking. */
+	preempt_disable();
+	empty = mpscq_push(q, node);
+	preempt_enable();
+	return empty;
+}
+
+/*
+ * @ringback: a RingBack ring in OWNER mode, whose waiter is the creator.
+ * Returns whether a waiter of this wait cycle exists (armed, or woken by this
+ * add): it runs the list itself once it wakes.
+ */
+static bool __io_req_local_work_add(struct io_kiocb *req, unsigned int flags,
+				    bool ringback)
 {
 	struct io_ring_ctx *ctx = req->ctx;
 	int nr_wait;
@@ -182,7 +208,7 @@ void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
 	 */
 	nr_wait = atomic_read(&ctx->cq_wait_nr);
 	if (nr_wait <= 0)
-		return;
+		return false;
 	if (flags & IOU_F_TWQ_LAZY_WAKE) {
 		/*
 		 * ->cq_wait_nr counts down the number of lazy adds, once it
@@ -192,7 +218,7 @@ void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
 		 * early wake, not a lost one.
 		 */
 		if (!atomic_dec_and_test(&ctx->cq_wait_nr))
-			return;
+			return true;
 	} else if (atomic_xchg(&ctx->cq_wait_nr, IO_CQ_WAKE_INIT) <= 0) {
 		/*
 		 * Potentially raced with lazy add, claim the wake. A value
@@ -200,21 +226,74 @@ void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
 		 * claimed IO_CQ_WAKE_INIT. Either way, the wake up for this
 		 * wait cycle has already been done.
 		 */
-		return;
+		return true;
 	}
-	wake_up_state(ctx->submitter_task, TASK_INTERRUPTIBLE);
+	wake_up_state(ringback ? ctx->ringback_owner : ctx->submitter_task,
+		      TASK_INTERRUPTIBLE);
+	return true;
+}
+
+void io_req_local_work_add(struct io_kiocb *req, unsigned int flags)
+{
+	(void)__io_req_local_work_add(req, flags, false);
+}
+
+/*
+ * RingBack ring-local completions: in OWNER mode the creator runs its own
+ * read/write completions from ->work_list, as DEFER_TASKRUN does, instead of
+ * taking a task_work IPI for them. False: not eligible, use normal task_work.
+ */
+bool io_req_ringback_local_work_add(struct io_kiocb *req, unsigned int flags)
+{
+	/* A runner may complete and free @req once it is pushed. */
+	struct io_ring_ctx *ctx = req->ctx;
+	bool waiter;
+
+	/*
+	 * Eligibility through the kick: io_ringback_stop() waits for this,
+	 * and io_ring_ctx_free()'s synchronize_rcu() keeps @ctx alive.
+	 */
+	guard(rcu)();
+	if (!io_ringback_defer_ok(req))
+		return false;
+	/*
+	 * No lazy countdown: the waiting owner's CQEs can also come from other
+	 * paths (redirect, poll), which do not count it down.
+	 */
+	waiter = __io_req_local_work_add(req, flags & ~IOU_F_TWQ_LAZY_WAKE,
+					 true);
+	io_ringback_defer_kick(ctx, waiter);
+	return true;
 }
 
 void io_req_normal_work_add(struct io_kiocb *req)
 {
 	struct io_uring_task *tctx = req->tctx;
 	struct io_ring_ctx *ctx = req->ctx;
+	bool owner_homed = tctx->task == ctx->ringback_owner;
+	enum task_work_notify_mode mode;
+	bool empty, lazy;
 
 	/* SQPOLL can retire the request on push, see io_ring_exit_work() */
 	guard(rcu)();
 
-	/* tw run already pending, nothing else to do */
-	if (!mpscq_push(&tctx->task_list, &req->io_task_work.node))
+	/*
+	 * RingBack OWNER mode: do not wait for the withdrawn poller to run it.
+	 */
+	if (ctx->ringback && !owner_homed && io_ringback_owner_mode(ctx) &&
+	    io_ringback_redirect(req))
+		return;
+
+	/*
+	 * tw run already pending, nothing else to do. A RingBack ring's poller
+	 * may be boosted to FIFO: it must not preempt a producer between the
+	 * tail xchg and linking, then spin on the unlinked node.
+	 */
+	if (owner_homed || ctx->ringback)
+		empty = io_tw_push(&tctx->task_list, &req->io_task_work.node);
+	else
+		empty = mpscq_push(&tctx->task_list, &req->io_task_work.node);
+	if (!empty)
 		return;
 
 	/*
@@ -224,14 +303,32 @@ void io_req_normal_work_add(struct io_kiocb *req)
 	if (ctx->flags & IORING_SETUP_TASKRUN_FLAG)
 		atomic_or(IORING_SQ_TASKRUN, &ctx->rings->sq_flags);
 
-	/* SQPOLL doesn't need the task_work added, it'll run it itself */
-	if (ctx->flags & IORING_SETUP_SQPOLL) {
+	/*
+	 * Only poller-homed work is consumed by io_sq_tw(). The creator stays
+	 * pinned until ring free, even after its tctx is detached on exit/exec.
+	 */
+	if ((ctx->flags & IORING_SETUP_SQPOLL) && !owner_homed) {
 		__set_notify_signal(tctx->task);
+		if (ctx->ringback) {
+			if (io_ringback_owner_mode(ctx))
+				io_ringback_wake(ctx);
+			/* MWAIT: no IPI above; a poller in MWAIT needs one. */
+			io_ringback_mwait_kick(ctx, tctx->task);
+		}
 		return;
 	}
 
-	if (likely(!task_work_add(tctx->task, &tctx->task_work, ctx->notify_method)))
+	mode = owner_homed ? TWA_SIGNAL : ctx->notify_method;
+	/* RingBack OWNER mode: coalesce kicks to an owner polling its CQ. */
+	lazy = owner_homed && ctx->ringback && io_ringback_lazy_kick(ctx);
+	if (lazy)
+		mode = TWA_SIGNAL_NO_IPI;
+	if (likely(!task_work_add(tctx->task, &tctx->task_work, mode))) {
+		/* Arm only after TIF_NOTIFY_SIGNAL is published. */
+		if (lazy)
+			io_ringback_arm_kick(ctx);
 		return;
+	}
 
 	io_fallback_tw(tctx);
 }
@@ -313,8 +410,15 @@ static int __io_run_local_work(struct io_ring_ctx *ctx, io_tw_token_t tw,
 	unsigned int loops = 0;
 	int ret = 0;
 
-	if (WARN_ON_ONCE(ctx->submitter_task != current))
+	if (WARN_ON_ONCE(!io_allowed_defer_tw_run(ctx)))
 		return -EEXIST;
+	/*
+	 * Only the owner's runs: the stall check is about an owner not
+	 * entering.
+	 */
+	if (ctx->ringback && ctx->ringback_owner == current)
+		WRITE_ONCE(ctx->ringback_local_runs,
+			   ctx->ringback_local_runs + 1);
 	if (ctx->flags & IORING_SETUP_TASKRUN_FLAG)
 		atomic_andnot(IORING_SQ_TASKRUN, &ctx->rings->sq_flags);
 again:
@@ -356,7 +460,9 @@ int io_run_local_work(struct io_ring_ctx *ctx, int min_events, int max_events)
 	struct io_tw_state ts = {};
 	int ret;
 
-	mutex_lock(&ctx->uring_lock);
+	/* A preempted RingBack poller may hold the lock: boost/retry. */
+	if (!ctx->ringback || !io_ringback_tw_lock(ctx))
+		mutex_lock(&ctx->uring_lock);
 	ret = __io_run_local_work(ctx, ts, min_events, max_events);
 	mutex_unlock(&ctx->uring_lock);
 	return ret;

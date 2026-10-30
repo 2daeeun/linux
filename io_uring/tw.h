@@ -34,6 +34,7 @@ __cold void io_cancel_local_task_work(struct io_ring_ctx *ctx);
 int io_run_local_work_locked(struct io_ring_ctx *ctx, int min_events);
 
 void io_req_local_work_add(struct io_kiocb *req, unsigned flags);
+bool io_req_ringback_local_work_add(struct io_kiocb *req, unsigned int flags);
 void io_req_normal_work_add(struct io_kiocb *req);
 void tctx_task_work_run(struct io_uring_task *tctx, unsigned int max_entries, unsigned int *count);
 
@@ -41,6 +42,12 @@ static inline void __io_req_task_work_add(struct io_kiocb *req, unsigned flags)
 {
 	if (req->ctx->flags & IORING_SETUP_DEFER_TASKRUN)
 		io_req_local_work_add(req, flags);
+	else if (unlikely(READ_ONCE(req->ctx->ringback_owner_mode) ||
+			  /* Set once, before the ring is used. */
+			  (data_race(req->ctx->int_flags) &
+			   IO_RING_F_RINGBACK_LOCAL)) &&
+		 io_req_ringback_local_work_add(req, flags))
+		return;
 	else
 		io_req_normal_work_add(req);
 }
@@ -103,9 +110,28 @@ static inline void io_tw_lock(struct io_ring_ctx *ctx, io_tw_token_t tw)
 	lockdep_assert_held(&ctx->uring_lock);
 }
 
+bool io_ringback_is_poller(struct io_ring_ctx *ctx);
+
+/*
+ * RingBack: the creator also runs ->work_list of its SQPOLL ring, and with
+ * ringback_defer=2 so does the poller (in POLL mode). uring_lock serializes
+ * them.
+ */
+static inline bool io_ringback_local_runner(struct io_ring_ctx *ctx)
+{
+	if (!ctx->ringback)
+		return false;
+	if (ctx->ringback_owner == current)
+		return true;
+	/* RINGBACK_LOCAL is set once, before the ring is used. */
+	return (data_race(ctx->int_flags) & IO_RING_F_RINGBACK_LOCAL) &&
+	       (current->flags & PF_IO_WORKER) && io_ringback_is_poller(ctx);
+}
+
 static inline bool io_allowed_defer_tw_run(struct io_ring_ctx *ctx)
 {
-	return likely(ctx->submitter_task == current);
+	return likely(ctx->submitter_task == current) ||
+	       io_ringback_local_runner(ctx);
 }
 
 static inline bool io_allowed_run_tw(struct io_ring_ctx *ctx)

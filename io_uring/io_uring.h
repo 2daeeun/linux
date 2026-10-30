@@ -224,7 +224,9 @@ static inline void io_lockdep_assert_cq_locked(struct io_ring_ctx *ctx)
 	if (ctx->flags & IORING_SETUP_DEFER_TASKRUN)
 		lockdep_assert_held(&ctx->uring_lock);
 
-	if (ctx->flags & IORING_SETUP_IOPOLL) {
+	if ((ctx->flags & IORING_SETUP_IOPOLL) ||
+	    (ctx->int_flags & IO_RING_F_LOCKLESS_CQ)) {
+		/* IOPOLL, and RingBack rings with a lockless CQ */
 		lockdep_assert_held(&ctx->uring_lock);
 	} else if (!(ctx->int_flags & IO_RING_F_TASK_COMPLETE)) {
 		lockdep_assert_held(&ctx->completion_lock);

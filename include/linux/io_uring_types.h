@@ -11,6 +11,7 @@
 
 struct iou_loop_params;
 struct io_uring_bpf_ops;
+struct io_ringback;
 
 enum {
 	/*
@@ -324,6 +325,12 @@ enum {
 	IO_RING_F_IOWQ_LIMITS_SET	= BIT(12),
 	/* restrictions were inherited from the task that created the ring */
 	IO_RING_F_RESTRICT_INHERITED	= BIT(13),
+	/*
+	 * RingBack ring-local completions: read/write completions go to
+	 * ->work_list in both modes; the poller runs it in POLL mode, the
+	 * creator in OWNER.
+	 */
+	IO_RING_F_RINGBACK_LOCAL		= BIT(14),
 };
 
 struct iou_ctx {};
@@ -335,8 +342,14 @@ struct io_ring_ctx {
 		unsigned int		flags;
 		/* internal state flags IO_RING_F_* flags , mostly read-only */
 		unsigned int		int_flags;
+		/* RingBack: mirrors IO_RBK_OWNER for inline hot-path tests. */
+		bool			ringback_owner_mode;
 
 		struct task_struct	*submitter_task;
+		/* RingBack: pinned creator; tctx is guarded by uring_lock. */
+		struct task_struct	*ringback_owner;
+		struct io_uring_task	*ringback_owner_tctx;
+		struct io_ringback	*ringback;
 		struct io_rings		*rings;
 		/* cache of ->restrictions.bpf_filters->filters */
 		struct io_bpf_filter __rcu	**bpf_filters;
@@ -391,6 +404,11 @@ struct io_ring_ctx {
 		 * cacheline is contended enough as it is.
 		 */
 		struct llist_node	*work_head;
+		/*
+		 * RingBack: ->work_list runs, read racily by the poller's stall
+		 * check.
+		 */
+		unsigned long		ringback_local_runs;
 
 		struct io_file_table	file_table;
 		struct io_rsrc_data	buf_table;

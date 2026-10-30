@@ -205,6 +205,7 @@ static void __io_uring_show_fdinfo(struct io_ring_ctx *ctx, struct seq_file *m)
 	seq_printf(m, "SqThreadCpu:\t%d\n", sq_cpu);
 	seq_printf(m, "SqTotalTime:\t%llu\n", sq_total_time);
 	seq_printf(m, "SqWorkTime:\t%llu\n", sq_work_time);
+	io_ringback_fdinfo(ctx, m);
 	seq_printf(m, "UserFiles:\t%u\n", ctx->file_table.data.nr);
 	for (i = 0; i < ctx->file_table.data.nr; i++) {
 		struct file *f = NULL;

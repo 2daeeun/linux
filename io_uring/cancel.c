@@ -108,7 +108,10 @@ int io_try_cancel(struct io_uring_task *tctx, struct io_cancel_data *cd,
 	struct io_ring_ctx *ctx = cd->ctx;
 	int ret;
 
-	WARN_ON_ONCE(!io_wq_current_is_worker() && tctx != current->io_uring);
+	/* An owner-homed cancel SQE may still be issued by the SQ thread. */
+	WARN_ON_ONCE(!io_wq_current_is_worker() && tctx != current->io_uring &&
+		     !(tctx && ctx->ringback_owner == tctx->task &&
+		       current == rcu_access_pointer(ctx->sq_data->thread)));
 
 	ret = io_async_cancel_one(tctx, cd);
 	/*
@@ -521,7 +524,7 @@ __cold bool io_uring_try_cancel_requests(struct io_ring_ctx *ctx,
 	bool ret = false;
 
 	/* set it so io_req_local_work_add() would wake us up */
-	if (ctx->flags & IORING_SETUP_DEFER_TASKRUN) {
+	if ((ctx->flags & IORING_SETUP_DEFER_TASKRUN) || ctx->ringback) {
 		atomic_set(&ctx->cq_wait_nr, 1);
 		smp_mb();
 	}
@@ -552,8 +555,8 @@ __cold bool io_uring_try_cancel_requests(struct io_ring_ctx *ctx,
 		}
 	}
 
-	if ((ctx->flags & IORING_SETUP_DEFER_TASKRUN) &&
-	    io_allowed_defer_tw_run(ctx))
+	if (((ctx->flags & IORING_SETUP_DEFER_TASKRUN) ||
+	     io_local_work_pending(ctx)) && io_allowed_defer_tw_run(ctx))
 		ret |= io_run_local_work(ctx, INT_MAX, INT_MAX) > 0;
 	mutex_lock(&ctx->uring_lock);
 	ret |= io_cancel_defer_files(ctx, tctx, cancel_all);
@@ -592,6 +595,47 @@ __cold void io_uring_cancel_generic(bool cancel_all, struct io_sq_data *sqd)
 
 	if (!current->io_uring)
 		return;
+	if (!sqd) {
+		xa_for_each(&tctx->xa, index, node) {
+			ctx = node->ctx;
+			if (ctx->ringback_owner != current)
+				continue;
+			/*
+			 * Stop remote ref acquisition before the first inflight
+			 * test, even when it is zero. uring_lock joins any
+			 * submitting batch; after detach no poller can access
+			 * tctx freed by exec, nor enqueue into the io-wq that
+			 * we are about to shut down. Existing requests retain
+			 * their owner refs and cancellation mapping. Later SQEs
+			 * use the upstream poller tctx instead.
+			 */
+			/*
+			 * A preempted RingBack poller may hold the lock:
+			 * boost/retry.
+			 */
+			if (!ctx->ringback || !io_ringback_tw_lock(ctx))
+				mutex_lock(&ctx->uring_lock);
+			ctx->ringback_owner_tctx = NULL;
+			mutex_unlock(&ctx->uring_lock);
+			/*
+			 * No further rescue may target a creator leaving its
+			 * tctx.
+			 */
+			io_ringback_stop(ctx);
+			/*
+			 * Ring-local completions are untracked: run them now.
+			 * Late producers finished in the RCU wait of the stop
+			 * above.
+			 */
+			if (io_local_work_pending(ctx)) {
+				if (!io_ringback_tw_lock(ctx))
+					mutex_lock(&ctx->uring_lock);
+				while (io_local_work_pending(ctx))
+					(void)io_run_local_work_locked(ctx, 0);
+				mutex_unlock(&ctx->uring_lock);
+			}
+		}
+	}
 	if (tctx->io_wq)
 		io_wq_exit_start(tctx->io_wq);
 
@@ -610,8 +654,12 @@ __cold void io_uring_cancel_generic(bool cancel_all, struct io_sq_data *sqd)
 
 		if (!sqd) {
 			xa_for_each(&tctx->xa, index, node) {
-				/* sqpoll task will cancel all its requests */
-				if (node->ctx->sq_data)
+				/*
+				 * The poller cannot cancel requests homed to
+				 * this owner.
+				 */
+				if (node->ctx->sq_data &&
+				    node->ctx->ringback_owner != current)
 					continue;
 				loop |= io_uring_try_cancel_requests(node->ctx,
 							current->io_uring,
@@ -652,6 +700,12 @@ end_wait:
 	} while (1);
 
 	io_uring_clean_tctx(tctx);
+	/*
+	 * Exit (unlike exec) waits only for tracked requests. Any remaining
+	 * untracked owner-homed request still pins the task/tctx;
+	 * task_work_add() failure drains it through io_tctx_fallback_work(), as
+	 * upstream does.
+	 */
 	if (cancel_all) {
 		/*
 		 * We shouldn't run task_works after cancel, so just leave

@@ -133,6 +133,7 @@ static int __io_msg_ring_data(struct io_ring_ctx *target_ctx,
 			      struct io_msg *msg, unsigned int issue_flags)
 {
 	u32 flags = 0;
+	bool locked;
 	int ret;
 
 	if (msg->src_fd || msg->flags & ~IORING_MSG_RING_FLAGS_PASS)
@@ -154,13 +155,18 @@ static int __io_msg_ring_data(struct io_ring_ctx *target_ctx,
 		return ret;
 
 	ret = -EOVERFLOW;
-	if (target_ctx->flags & IORING_SETUP_IOPOLL) {
+	/*
+	 * A lockless CQ is written under uring_lock: IOPOLL rings, and RingBack
+	 * rings with a lockless CQ (task_complete rings went remote above).
+	 */
+	locked = data_race(target_ctx->int_flags) & IO_RING_F_LOCKLESS_CQ;
+	if (locked) {
 		if (unlikely(io_lock_external_ctx(target_ctx, issue_flags)))
 			return -EAGAIN;
 	}
 	if (io_post_aux_cqe(target_ctx, msg->user_data, msg->len, flags))
 		ret = 0;
-	if (target_ctx->flags & IORING_SETUP_IOPOLL)
+	if (locked)
 		io_double_unlock_ctx(target_ctx);
 	return ret;
 }

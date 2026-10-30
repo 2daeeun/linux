@@ -31,7 +31,7 @@ static int io_wake_function(struct wait_queue_entry *curr, unsigned int mode,
 
 int io_run_task_work_sig(struct io_ring_ctx *ctx)
 {
-	if (io_local_work_pending(ctx)) {
+	if (io_local_work_pending(ctx) && io_allowed_defer_tw_run(ctx)) {
 		__set_current_state(TASK_RUNNING);
 		if (io_run_local_work(ctx, INT_MAX, IO_LOCAL_TW_DEFAULT_MAX) > 0)
 			return 0;
@@ -95,7 +95,8 @@ static enum hrtimer_restart io_cqring_min_timer_wakeup(struct hrtimer *timer)
 	 * to normal sleeps. Any request completion post min_wait should wake
 	 * the task and return.
 	 */
-	if (ctx->flags & IORING_SETUP_DEFER_TASKRUN) {
+	if ((ctx->flags & IORING_SETUP_DEFER_TASKRUN) ||
+	    (ctx->ringback && iowq->wq.private == ctx->ringback_owner)) {
 		atomic_set(&ctx->cq_wait_nr, 1);
 		smp_mb();
 		if (io_local_work_pending(ctx))
@@ -170,7 +171,8 @@ static inline int io_cqring_wait_schedule(struct io_ring_ctx *ctx,
 {
 	if (unlikely(READ_ONCE(ctx->check_cq)))
 		return 1;
-	if (unlikely(io_local_work_pending(ctx)))
+	if (unlikely(io_local_work_pending(ctx)) &&
+	    io_allowed_defer_tw_run(ctx))
 		return 1;
 	if (unlikely(task_work_pending(current)))
 		return 1;
@@ -198,7 +200,7 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 
 	if (!io_allowed_run_tw(ctx))
 		return -EEXIST;
-	if (io_local_work_pending(ctx))
+	if (io_local_work_pending(ctx) && io_allowed_defer_tw_run(ctx))
 		io_run_local_work(ctx, min_events,
 				  max(IO_LOCAL_TW_DEFAULT_MAX, min_events));
 	io_run_task_work();
@@ -260,20 +262,37 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 			atomic_set(&ctx->cq_wait_nr, nr_wait);
 			set_current_state(TASK_INTERRUPTIBLE);
 		} else {
+			/* RingBack: also count ->work_list adds (lazy wake). */
+			if (io_ringback_local_runner(ctx))
+				atomic_set(&ctx->cq_wait_nr, nr_wait);
 			prepare_to_wait_exclusive(&ctx->cq_wait, &iowq.wq,
 							TASK_INTERRUPTIBLE);
 		}
 
 		ret = io_cqring_wait_schedule(ctx, &iowq, ext_arg, start_time);
 		__set_current_state(TASK_RUNNING);
-		atomic_set(&ctx->cq_wait_nr, IO_CQ_WAKE_INIT);
+		/* Only its own waiter disarms a RingBack owner's countdown. */
+		if ((ctx->flags & IORING_SETUP_DEFER_TASKRUN) ||
+		    !ctx->ringback || io_ringback_local_runner(ctx)) {
+			atomic_set(&ctx->cq_wait_nr, IO_CQ_WAKE_INIT);
+			if (ctx->ringback) {
+				/*
+				 * RingBack: order the disarm before the
+				 * ->work_list check below, against a producer's
+				 * push before its countdown read; otherwise it
+				 * may credit this waiter with a run that never
+				 * comes and skip the poller's MWAIT kick.
+				 */
+				smp_mb();
+			}
+		}
 
 		/*
 		 * Run task_work after scheduling and before io_should_wake().
 		 * If we got woken because of task_work being processed, run it
 		 * now rather than let the caller do another wait loop.
 		 */
-		if (io_local_work_pending(ctx))
+		if (io_local_work_pending(ctx) && io_allowed_defer_tw_run(ctx))
 			io_run_local_work(ctx, nr_wait, nr_wait);
 		io_run_task_work();
 

@@ -1190,7 +1190,9 @@ __cold void io_iopoll_try_reap_events(struct io_ring_ctx *ctx)
 	}
 	mutex_unlock(&ctx->uring_lock);
 
-	if (ctx->flags & IORING_SETUP_DEFER_TASKRUN)
+	/* Also RingBack ring-local completions left on ->work_list. */
+	if ((ctx->flags & IORING_SETUP_DEFER_TASKRUN) ||
+	    io_local_work_pending(ctx))
 		io_cancel_local_task_work(ctx);
 }
 
@@ -2158,6 +2160,7 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 {
 	io_unregister_bpf_ops(ctx);
 	io_sq_thread_finish(ctx);
+	io_ringback_free(ctx);
 
 	mutex_lock(&ctx->uring_lock);
 	io_sqe_buffers_unregister(ctx);
@@ -2173,6 +2176,8 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 		put_cred(ctx->sq_creds);
 	if (ctx->submitter_task)
 		put_task_struct(ctx->submitter_task);
+	if (ctx->ringback_owner)
+		put_task_struct(ctx->ringback_owner);
 
 	WARN_ON_ONCE(!list_empty(&ctx->ltimeout_list));
 
@@ -2318,6 +2323,7 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 	struct io_tctx_node *node;
 	int ret;
 
+	io_ringback_stop(ctx);
 	mutex_lock(&ctx->uring_lock);
 	io_terminate_zcrx(ctx);
 	mutex_unlock(&ctx->uring_lock);
@@ -2337,7 +2343,8 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 
 		/* The SQPOLL thread never reaches this path */
 		do {
-			if (ctx->flags & IORING_SETUP_DEFER_TASKRUN)
+			if ((ctx->flags & IORING_SETUP_DEFER_TASKRUN) ||
+			    io_local_work_pending(ctx))
 				io_cancel_local_task_work(ctx);
 			cond_resched();
 		} while (io_uring_try_cancel_requests(ctx, NULL, true, false));
@@ -2586,6 +2593,91 @@ struct file *io_uring_ctx_get_file(unsigned int fd, bool registered)
 }
 
 
+static void io_ringback_owner_submit(struct io_ring_ctx *ctx)
+{
+	struct task_struct *tsk;
+	const struct cred *creds = NULL;
+	bool off_cpu, owner_mode;
+	int submitted = 0;
+
+	if (ctx->ringback_owner != current)
+		return;
+	/*
+	 * Advisory test uses the published head, never an unlocked SQ cursor.
+	 */
+	if (READ_ONCE(ctx->rings->sq.tail) == READ_ONCE(ctx->rings->sq.head)) {
+		/*
+		 * Ring-local completions: an enter without SQEs still reaps
+		 * them.
+		 */
+		if (unlikely(io_local_work_pending(ctx)))
+			io_run_local_work(ctx, 0, IO_LOCAL_TW_DEFAULT_MAX);
+		return;
+	}
+	owner_mode = io_ringback_owner_mode(ctx);
+	off_cpu = false;
+	if (!owner_mode) {
+		rcu_read_lock();
+		tsk = rcu_dereference(ctx->sq_data->thread);
+		/*
+		 * Outside OWNER mode, only a preempted poller is bypassed, also
+		 * in the dual mode. A sleeping POLL thread keeps the upstream
+		 * SQ_WAKEUP path: the handoff is triggered by the scheduler
+		 * taking the poller's CPU, never by its idle sleep (unlike the
+		 * 2021 IORING_ENTER_SQ_DEPUTY proposal, which submits on
+		 * wake-up).
+		 */
+		off_cpu = tsk && task_is_running(tsk) && !task_curr(tsk);
+		/*
+		 * A2L-style baseline: no contention-driven bypass, only its
+		 * load policy.
+		 */
+		if (io_ringback_a2l(ctx))
+			off_cpu = false;
+		rcu_read_unlock();
+	}
+	if (owner_mode) {
+		/*
+		 * Wait for the switch's one outstanding poller batch, if any.
+		 */
+		if (!io_ringback_tw_lock(ctx))
+			mutex_lock(&ctx->uring_lock);
+	} else if (!off_cpu || !mutex_trylock(&ctx->uring_lock)) {
+		return;
+	}
+
+	/*
+	 * The poller can resume at any time. uring_lock, shared with its whole
+	 * batch, is the only authority to consume SQEs or change
+	 * cached_sq_head. Re-read pending entries in io_submit_sqes(),
+	 * including wait-only enters with to_submit == 0. OWNER mode must
+	 * submit here, even while its parked poller is on CPU. Otherwise a
+	 * failed trylock leaves the upstream wake/wait path intact.
+	 */
+	if (ctx->ringback_owner_tctx == current->io_uring &&
+	    ctx->ringback_owner_tctx && !percpu_ref_is_dying(&ctx->refs) &&
+	    !(ctx->flags & IORING_SETUP_R_DISABLED)) {
+		if (ctx->sq_creds != current_cred())
+			creds = override_creds(ctx->sq_creds);
+		submitted = io_submit_sqes(ctx, ctx->sq_entries);
+		if (creds)
+			revert_creds(creds);
+		if (owner_mode && submitted > 0)
+			io_ringback_submitted(ctx, submitted);
+		else if (submitted > 0)
+			io_ringback_dual_submitted(ctx, submitted);
+	}
+	/*
+	 * Ring-local completions: run them under this lock, as a DEFER enter
+	 * does.
+	 */
+	if (io_local_work_pending(ctx))
+		(void)io_run_local_work_locked(ctx, 0);
+	mutex_unlock(&ctx->uring_lock);
+	if (submitted > 0 && wq_has_sleeper(&ctx->sqo_sq_wait))
+		wake_up(&ctx->sqo_sq_wait);
+}
+
 SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 		u32, min_complete, u32, flags, const void __user *, argp,
 		size_t, argsz)
@@ -2615,9 +2707,8 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 	}
 
 	/*
-	 * For SQ polling, the thread will do all submissions and completions.
-	 * Just return the requested submit count, and wake the thread if
-	 * we were asked to.
+	 * For SQ polling, the thread submits unless the owner takes over.
+	 * Return the requested submit count and wake the thread if requested.
 	 */
 	ret = 0;
 	if (ctx->flags & IORING_SETUP_SQPOLL) {
@@ -2625,8 +2716,19 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 			ret = -EOWNERDEAD;
 			goto out;
 		}
-		if (flags & IORING_ENTER_SQ_WAKEUP)
+		io_ringback_owner_submit(ctx);
+		/*
+		 * An OWNER-mode RingBack poller rechecks on its own timer. Only
+		 * the creator submits in OWNER mode: rescue other submitters'
+		 * SQEs.
+		 */
+		if ((flags & IORING_ENTER_SQ_WAKEUP) &&
+		    io_ringback_owner_mode(ctx)) {
+			if (ctx->ringback_owner != current)
+				io_ringback_wake(ctx);
+		} else if (flags & IORING_ENTER_SQ_WAKEUP) {
 			wake_up(&ctx->sq_data->wait);
+		}
 		if (flags & IORING_ENTER_SQ_WAIT)
 			io_sqpoll_wait_sq(ctx);
 
@@ -3047,6 +3149,17 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 	if (ret)
 		goto err;
 
+	/*
+	 * Immutable creator identity must be visible before the poller starts.
+	 */
+	if (ctx->flags & IORING_SETUP_SQPOLL) {
+		ret = io_ringback_init(ctx);
+		if (ret)
+			goto err;
+		if (ctx->ringback)
+			ctx->ringback_owner = get_task_struct(current);
+	}
+
 	ret = io_sq_offload_create(ctx, p);
 	if (ret)
 		goto err;
@@ -3072,6 +3185,19 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 	if (ret)
 		goto err_fput;
 	tctx = current->io_uring;
+	if (ctx->ringback_owner) {
+		/*
+		 * Opt in per ring. Publish only after creator tctx registration
+		 * so exit always finds this ring. A task ref alone does not pin
+		 * tctx across exec: cancellation detaches it under uring_lock
+		 * first. Retain creator identity through ring exit for
+		 * already-homed work, regardless of later module parameter
+		 * writes or tctx detachment.
+		 */
+		mutex_lock(&ctx->uring_lock);
+		ctx->ringback_owner_tctx = tctx;
+		mutex_unlock(&ctx->uring_lock);
+	}
 
 	/*
 	 * Install ring fd as the very last thing, so we don't risk someone
