@@ -5571,6 +5571,20 @@ bool single_task_running(void)
 }
 EXPORT_SYMBOL(single_task_running);
 
+/*
+ * Like single_task_running(), but a fair task that went to sleep and stays
+ * queued only for delayed dequeue does not count: it competes for nothing.
+ * Same caution about the time-of-check-to-time-of-use race.
+ */
+bool single_task_runnable(void)
+{
+	struct rq *rq = raw_rq();
+
+	return rq->nr_running -
+	       (rq->cfs.h_nr_queued - rq->cfs.h_nr_runnable) == 1;
+}
+EXPORT_SYMBOL(single_task_runnable);
+
 unsigned long long nr_context_switches_cpu(int cpu)
 {
 	return cpu_rq(cpu)->nr_switches;
