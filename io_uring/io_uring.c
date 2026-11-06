@@ -1169,7 +1169,8 @@ void __io_submit_flush_completions(struct io_ring_ctx *ctx)
  */
 __cold void io_iopoll_try_reap_events(struct io_ring_ctx *ctx)
 {
-	if (!(ctx->flags & IORING_SETUP_IOPOLL))
+	/* RingBack rings may have polled requests without being IOPOLL. */
+	if (!(ctx->flags & IORING_SETUP_IOPOLL) && !ctx->ringback)
 		return;
 
 	mutex_lock(&ctx->uring_lock);
@@ -1311,6 +1312,8 @@ static void io_iopoll_req_issued(struct io_kiocb *req, unsigned int issue_flags)
 		if ((ctx->flags & IORING_SETUP_SQPOLL) &&
 		    wq_has_sleeper(&ctx->sq_data->wait))
 			wake_up(&ctx->sq_data->wait);
+		if (ctx->ringback)
+			io_ringback_polled_added(ctx);
 
 		mutex_unlock(&ctx->uring_lock);
 	}
@@ -2346,6 +2349,10 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 			if ((ctx->flags & IORING_SETUP_DEFER_TASKRUN) ||
 			    io_local_work_pending(ctx))
 				io_cancel_local_task_work(ctx);
+			/* RingBack polled requests left in flight. */
+			if (ctx->ringback &&
+			    !list_empty_careful(&ctx->iopoll_list))
+				io_iopoll_try_reap_events(ctx);
 			cond_resched();
 		} while (io_uring_try_cancel_requests(ctx, NULL, true, false));
 
@@ -2602,10 +2609,20 @@ static void io_ringback_owner_submit(struct io_ring_ctx *ctx)
 
 	if (ctx->ringback_owner != current)
 		return;
+	/* Parked OWNER mode: this enter may wake the poller to resume. */
+	if (io_ringback_owner_mode(ctx))
+		io_ringback_idle_scan(ctx);
 	/*
 	 * Advisory test uses the published head, never an unlocked SQ cursor.
 	 */
 	if (READ_ONCE(ctx->rings->sq.tail) == READ_ONCE(ctx->rings->sq.head)) {
+		/* Polled requests the poller left in OWNER mode. */
+		if (unlikely(io_ringback_owner_must_poll(ctx))) {
+			if (!io_ringback_tw_lock(ctx))
+				mutex_lock(&ctx->uring_lock);
+			io_ringback_owner_reap(ctx);
+			mutex_unlock(&ctx->uring_lock);
+		}
 		/*
 		 * Ring-local completions: an enter without SQEs still reaps
 		 * them.
@@ -2667,6 +2684,9 @@ static void io_ringback_owner_submit(struct io_ring_ctx *ctx)
 		else if (submitted > 0)
 			io_ringback_dual_submitted(ctx, submitted);
 	}
+	/* Polled requests the poller left, in OWNER mode or bypassed. */
+	if (unlikely(!list_empty(&ctx->iopoll_list)))
+		io_ringback_owner_reap(ctx);
 	/*
 	 * Ring-local completions: run them under this lock, as a DEFER enter
 	 * does.

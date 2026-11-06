@@ -41,6 +41,20 @@ bool io_ringback_a2l(struct io_ring_ctx *ctx);
 void io_ringback_dual_submitted(struct io_ring_ctx *ctx,
 				unsigned int submitted);
 void io_ringback_wake(struct io_ring_ctx *ctx);
+void io_ringback_idle_scan(struct io_ring_ctx *ctx);
+bool io_ringback_polled_issue(struct io_kiocb *req, struct file *file);
+int io_ringback_owner_reap(struct io_ring_ctx *ctx);
+void io_ringback_polled_added(struct io_ring_ctx *ctx);
+
+/*
+ * Polled completions: in OWNER mode a waiting owner polls the requests the
+ * poller left instead of sleeping.
+ */
+static inline bool io_ringback_owner_must_poll(struct io_ring_ctx *ctx)
+{
+	return ctx->ringback_owner == current && io_ringback_owner_mode(ctx) &&
+	       !list_empty_careful(&ctx->iopoll_list);
+}
 bool io_ringback_redirect(struct io_kiocb *req);
 bool io_ringback_defer_ok(struct io_kiocb *req);
 void io_ringback_defer_kick(struct io_ring_ctx *ctx, bool waiter);

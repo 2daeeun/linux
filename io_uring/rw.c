@@ -22,6 +22,7 @@
 #include "rsrc.h"
 #include "poll.h"
 #include "rw.h"
+#include "sqpoll.h"
 
 static void io_complete_rw(struct kiocb *kiocb, long res);
 static void io_complete_rw_iopoll(struct kiocb *kiocb, long res);
@@ -601,10 +602,17 @@ static void io_complete_rw_iopoll(struct kiocb *kiocb, long res)
 	if (kiocb->ki_flags & IOCB_WRITE)
 		io_req_end_write(req);
 
-	if (res == -EAGAIN && io_rw_should_reissue(req))
+	if (res == -EAGAIN && io_rw_should_reissue(req)) {
 		req->flags |= REQ_F_REISSUE | REQ_F_BL_NO_RECYCLE;
-	else if (unlikely(final_res != req->cqe.res))
+	} else if (unlikely(final_res != req->cqe.res)) {
+		/*
+		 * RingBack promoted this request from interrupt completion:
+		 * fail its links as that path does.
+		 */
+		if (req->ctx->ringback)
+			req_set_fail(req);
 		req->cqe.res = final_res;
+	}
 
 	/* order with io_iopoll_complete() checking ->iopoll_completed */
 	smp_store_release(&req->iopoll_completed, 1);
@@ -889,6 +897,21 @@ static int io_rw_init_file(struct io_kiocb *req, fmode_t mode, int rw_type)
 	} else {
 		if (kiocb->ki_flags & IOCB_HIPRI)
 			return -EINVAL;
+		/*
+		 * RingBack polled completions: direct I/O the poller issues
+		 * completes by polling, without making the ring IOPOLL.
+		 */
+		if (unlikely(ctx->ringback) &&
+		    (kiocb->ki_flags & IOCB_DIRECT) && file->f_op->iopoll &&
+		    !(req->flags & REQ_F_HAS_METADATA) &&
+		    io_ringback_polled_issue(req, file)) {
+			req->flags |= REQ_F_IOPOLL;
+			kiocb->private = NULL;
+			kiocb->ki_flags |= IOCB_HIPRI;
+			kiocb->ki_complete = io_complete_rw_iopoll;
+			req->iopoll_completed = 0;
+			req->cqe.flags = 0;
+		}
 	}
 
 	if (req->flags & REQ_F_HAS_METADATA) {

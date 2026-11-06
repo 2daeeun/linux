@@ -13,6 +13,7 @@
 
 #include "io_uring.h"
 #include "napi.h"
+#include "sqpoll.h"
 #include "wait.h"
 
 static int io_wake_function(struct wait_queue_entry *curr, unsigned int mode,
@@ -257,6 +258,68 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 	trace_io_uring_cqring_wait(ctx, min_events);
 	do {
 		unsigned long check_cq;
+
+		/*
+		 * RingBack polled completions: requests the poller left in
+		 * flight at a switch to OWNER mode complete only by polling;
+		 * the waiting owner polls them instead of sleeping.
+		 */
+		if (unlikely(ctx->ringback) &&
+		    io_ringback_owner_must_poll(ctx)) {
+			ktime_t now;
+
+			if (!io_ringback_tw_lock(ctx))
+				mutex_lock(&ctx->uring_lock);
+			io_ringback_owner_reap(ctx);
+			mutex_unlock(&ctx->uring_lock);
+			/* Do not starve other completions meanwhile. */
+			if (io_local_work_pending(ctx) &&
+			    io_allowed_defer_tw_run(ctx))
+				io_run_local_work(ctx, nr_wait, nr_wait);
+			io_run_task_work();
+			check_cq = READ_ONCE(ctx->check_cq);
+			if (unlikely(check_cq)) {
+				if (check_cq & BIT(IO_CHECK_CQ_OVERFLOW_BIT))
+					io_cqring_do_overflow_flush(ctx);
+				if (check_cq & BIT(IO_CHECK_CQ_DROPPED_BIT)) {
+					ret = -EBADR;
+					break;
+				}
+			}
+			if (io_should_wake(&iowq)) {
+				ret = 0;
+				break;
+			}
+			if (task_sigpending(current)) {
+				ret = -EINTR;
+				break;
+			}
+			now = io_get_time(ctx);
+			/*
+			 * After min_wait, as io_cqring_min_timer_wakeup(): any
+			 * posted CQE ends the wait, and without a general
+			 * timeout so does the expiry itself.
+			 */
+			if (iowq.min_timeout &&
+			    ktime_compare(now, ktime_add_ns(iowq.min_timeout,
+							    start_time)) >= 0) {
+				if (io_cqring_events(ctx)) {
+					ret = 0;
+					break;
+				}
+				if (iowq.timeout == KTIME_MAX) {
+					ret = -ETIME;
+					break;
+				}
+			}
+			if (iowq.timeout != KTIME_MAX &&
+			    ktime_compare(now, iowq.timeout) >= 0) {
+				ret = -ETIME;
+				break;
+			}
+			cond_resched();
+			continue;
+		}
 
 		if (ctx->flags & IORING_SETUP_DEFER_TASKRUN) {
 			atomic_set(&ctx->cq_wait_nr, nr_wait);
