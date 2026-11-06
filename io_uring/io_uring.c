@@ -2627,7 +2627,8 @@ static void io_ringback_owner_submit(struct io_ring_ctx *ctx)
 		 * Ring-local completions: an enter without SQEs still reaps
 		 * them.
 		 */
-		if (unlikely(io_local_work_pending(ctx)))
+		if (unlikely(io_local_work_pending(ctx)) &&
+		    !io_ringback_prefer_poller(ctx, current))
 			io_run_local_work(ctx, 0, IO_LOCAL_TW_DEFAULT_MAX);
 		return;
 	}
@@ -2691,7 +2692,8 @@ static void io_ringback_owner_submit(struct io_ring_ctx *ctx)
 	 * Ring-local completions: run them under this lock, as a DEFER enter
 	 * does.
 	 */
-	if (io_local_work_pending(ctx))
+	if (io_local_work_pending(ctx) &&
+	    !io_ringback_prefer_poller(ctx, current))
 		(void)io_run_local_work_locked(ctx, 0);
 	mutex_unlock(&ctx->uring_lock);
 	if (submitted > 0 && wq_has_sleeper(&ctx->sqo_sq_wait))

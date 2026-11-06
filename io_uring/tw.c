@@ -90,15 +90,8 @@ void tctx_task_work_run(struct io_uring_task *tctx, unsigned int max_entries,
 		if (req->ctx != ctx) {
 			ctx_flush_and_put(ctx, ts);
 			ctx = req->ctx;
-			if (!ctx->ringback || !io_ringback_tw_lock(ctx)) {
-				/*
-				 * Lock ceiling: raise at the lock, not at the
-				 * pending check.
-				 */
-				if (ctx->ringback)
-					io_ringback_tw_raise(ctx);
+			if (!ctx->ringback || !io_ringback_tw_lock(ctx))
 				mutex_lock(&ctx->uring_lock);
-			}
 			percpu_ref_get(&ctx->refs);
 			ts.cancel = io_should_terminate_tw(ctx);
 		}
@@ -169,14 +162,15 @@ static bool io_tw_push(struct mpscq *q, struct llist_node *node)
 }
 
 /*
- * @ringback: a RingBack ring in OWNER mode, whose waiter is the creator.
+ * @ringback: a RingBack ring, whose waiter is the creator (either mode).
  * Returns whether a waiter of this wait cycle exists (armed, or woken by this
  * add): it runs the list itself once it wakes.
  */
 static bool __io_req_local_work_add(struct io_kiocb *req, unsigned int flags,
-				    bool ringback)
+				    bool ringback, bool *pushed_empty)
 {
 	struct io_ring_ctx *ctx = req->ctx;
+	bool empty;
 	int nr_wait;
 
 	/* pairs with synchronize_rcu() in io_ring_exit_work() */
@@ -196,11 +190,30 @@ static bool __io_req_local_work_add(struct io_kiocb *req, unsigned int flags,
 	 * to sleep will observe the work added to the list, which is similar to
 	 * the wait/wake task state sync.
 	 */
-	if (mpscq_push(&ctx->work_list, &req->io_task_work.node)) {
+	empty = mpscq_push(&ctx->work_list, &req->io_task_work.node);
+	if (empty) {
 		io_ctx_mark_taskrun(ctx);
 		if (data_race(ctx->int_flags) & IO_RING_F_HAS_EVFD)
 			io_eventfd_signal(ctx, false, flags & IOU_F_TWQ_IN_WAKE);
 	}
+	if (pushed_empty)
+		*pushed_empty = empty;
+	/*
+	 * RingBack, sqpoll_safe_lean: the push that made the list non-empty
+	 * decided the wake for the whole list (the owner drains all of it, the
+	 * poller runs all of it, a stopping poller hands all of it off).
+	 */
+	if (ringback && !empty && io_ringback_lean())
+		return false;
+
+	/*
+	 * RingBack POLL mode: the running poller runs the list, and its CQEs
+	 * wake an armed owner by count; leave the owner's wait cycle untouched.
+	 * The push above is the full barrier before the task_curr() load; the
+	 * paths on which the poller stops running hand off (io_rbk_handoff()).
+	 */
+	if (ringback && io_ringback_poller_runs(ctx))
+		return false;
 
 	/*
 	 * No one is waiting (IO_CQ_WAKE_INIT), or this cycle's wake up has
@@ -235,7 +248,7 @@ static bool __io_req_local_work_add(struct io_kiocb *req, unsigned int flags,
 
 void io_req_local_work_add(struct io_kiocb *req, unsigned int flags)
 {
-	(void)__io_req_local_work_add(req, flags, false);
+	(void)__io_req_local_work_add(req, flags, false, NULL);
 }
 
 /*
@@ -247,21 +260,24 @@ bool io_req_ringback_local_work_add(struct io_kiocb *req, unsigned int flags)
 {
 	/* A runner may complete and free @req once it is pushed. */
 	struct io_ring_ctx *ctx = req->ctx;
-	bool waiter;
+	bool waiter, empty;
 
 	/*
 	 * Eligibility through the kick: io_ringback_stop() waits for this,
 	 * and io_ring_ctx_free()'s synchronize_rcu() keeps @ctx alive.
 	 */
 	guard(rcu)();
-	if (!io_ringback_defer_ok(req))
+	if (!io_ringback_defer_ok(req) || io_ringback_route_poller(req))
 		return false;
 	/*
 	 * No lazy countdown: the waiting owner's CQEs can also come from other
 	 * paths (redirect, poll), which do not count it down.
 	 */
 	waiter = __io_req_local_work_add(req, flags & ~IOU_F_TWQ_LAZY_WAKE,
-					 true);
+					 true, &empty);
+	/* sqpoll_safe_lean: the first push of a non-empty run kicked already. */
+	if (!empty && io_ringback_lean())
+		return true;
 	io_ringback_defer_kick(ctx, waiter);
 	return true;
 }

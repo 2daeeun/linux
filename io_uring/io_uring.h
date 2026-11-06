@@ -164,7 +164,8 @@ static inline bool io_should_wake(struct io_wait_queue *iowq)
 	 * started waiting. For timeouts, we always want to return to userspace,
 	 * regardless of event count.
 	 */
-	dist = READ_ONCE(rings->cq.tail) - (int) iowq->cq_tail;
+	/* The min-timeout callback lowers ->cq_tail while we may run. */
+	dist = READ_ONCE(rings->cq.tail) - (int) READ_ONCE(iowq->cq_tail);
 	return dist >= 0 || atomic_read(&ctx->cq_timeouts) != iowq->nr_timeouts;
 }
 
@@ -584,5 +585,20 @@ static inline bool io_has_work(struct io_ring_ctx *ctx)
 {
 	return test_bit(IO_CHECK_CQ_OVERFLOW_BIT, &ctx->check_cq) ||
 	       io_local_work_pending(ctx);
+}
+
+bool io_ringback_prefer_poller(struct io_ring_ctx *ctx, struct task_struct *tsk);
+
+/*
+ * Work that should wake, or keep awake, the waiter @tsk: an overflow always; a
+ * pending ->work_list unless @tsk is a RingBack owner whose running poller
+ * runs the list (its CQEs wake the owner by count).
+ */
+static inline bool io_has_work_for(struct io_ring_ctx *ctx,
+				   struct task_struct *tsk)
+{
+	return test_bit(IO_CHECK_CQ_OVERFLOW_BIT, &ctx->check_cq) ||
+	       (io_local_work_pending(ctx) &&
+		(!ctx->ringback || !io_ringback_prefer_poller(ctx, tsk)));
 }
 #endif

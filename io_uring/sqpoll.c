@@ -43,9 +43,9 @@ static bool ringback_enable;
 module_param_named(sqpoll_safe, ringback_enable, bool, 0644);
 MODULE_PARM_DESC(sqpoll_safe, "RingBack POLL/OWNER switching for new unshared SQPOLL rings (default: 0)");
 
-static unsigned int ringback_rt = 1;
+static unsigned int ringback_rt = 3;
 module_param_named(sqpoll_safe_rt, ringback_rt, uint, 0644);
-MODULE_PARM_DESC(sqpoll_safe_rt, "SCHED_IDLE lock-debt repayment: 0 NORMAL nice 19, 1 FIFO 1 (default), 2 no boost with mutex wait (proxy execution), 3 no repayment with trylock/RETRY");
+MODULE_PARM_DESC(sqpoll_safe_rt, "The owner's wait for uring_lock held by the poller: 3 trylock with RETRY and release wakeups (default), 2 mutex wait (priority inheritance only with proxy execution); 0 (NORMAL nice 19) and 1 (FIFO 1) are the remote debt boosts of earlier versions, kept for diagnostics only. v6.5: the idle-class poller is never raised or boosted in the default configuration");
 
 static bool ringback_redirect = true;
 module_param_named(sqpoll_safe_redirect, ringback_redirect, bool, 0644);
@@ -63,13 +63,13 @@ static unsigned int ringback_kick_us;
 module_param_named(sqpoll_safe_kick_us, ringback_kick_us, uint, 0644);
 MODULE_PARM_DESC(sqpoll_safe_kick_us, "OWNER completion kick delay in us (0: immediate, default: 0)");
 
-static unsigned int ringback_owner_max_us = 2000;
+static unsigned int ringback_owner_max_us = 500;
 module_param_named(sqpoll_safe_owner_max_us, ringback_owner_max_us, uint, 0644);
-MODULE_PARM_DESC(sqpoll_safe_owner_max_us, "OWNER-mode recheck period doubles while the CPU stays contended, up to this many us (0: fixed period, default: 2000)");
+MODULE_PARM_DESC(sqpoll_safe_owner_max_us, "OWNER-mode recheck period doubles while the CPU stays contended, up to this many us (0: fixed period; with sqpoll_safe_idlewake the parked poller sleeps for the sqpoll_safe_owner_safety_us period instead; default: 500)");
 
-static unsigned int ringback_defer;
+static unsigned int ringback_defer = 1;
 module_param_named(sqpoll_safe_defer, ringback_defer, uint, 0644);
-MODULE_PARM_DESC(sqpoll_safe_defer, "Ring-local deferral of read/write completions through ->work_list as with DEFER_TASKRUN (experimental): 1 only the creator's own completions in OWNER mode, rings without eventfd or poll waiters; 2 every completion in both modes, POLL run by the poller, for rings created while set; 3 as 2 with a lockless CQ (default: 0)");
+MODULE_PARM_DESC(sqpoll_safe_defer, "Ring-local deferral of read/write completions through ->work_list as with DEFER_TASKRUN: 1 only the creator's own completions in OWNER mode, rings without eventfd or poll waiters; POLL-mode completions take the upstream SQPOLL task_work path and those a preempted poller leaves are run by the owner's rescue (sqpoll_safe_steal) (default); 2 every eligible read/write completion (not linked, not multishot) in both modes, POLL run by the poller, for rings created while set (v6.4; about 4-6% slower than 1 at very high per-ring rates, see RINGBACK_V6_5_DESIGN.md); 3 as 2 with a lockless CQ; 0 none");
 
 static bool sqpoll_cap_all;
 module_param(sqpoll_cap_all, bool, 0644);
@@ -108,9 +108,9 @@ static bool ringback_dual;
 module_param_named(sqpoll_safe_dual, ringback_dual, bool, 0644);
 MODULE_PARM_DESC(sqpoll_safe_dual, "Mode-free handoff (dual mode): OWNER mode lasts exactly while the poller is preempted (it ends on the poller's next loop, without hold time, backoff or voluntary switches); a sleeping poller keeps the upstream wake-up path; pair with sqpoll_safe_idle=1 (default: 0)");
 
-static bool ringback_mwait;
+static bool ringback_mwait = true;
 module_param_named(sqpoll_safe_mwait, ringback_mwait, bool, 0644);
-MODULE_PARM_DESC(sqpoll_safe_mwait, "Wait for SQ tail stores with MONITOR/MWAIT in C1 instead of spinning on an empty single ring; x86 only, otherwise spins (default: 0)");
+MODULE_PARM_DESC(sqpoll_safe_mwait, "Wait for SQ tail stores with MONITOR/MWAIT in C1 instead of spinning on an empty single ring; x86 only, otherwise spins (default: 1)");
 
 static unsigned int ringback_a2l_us;
 module_param_named(sqpoll_safe_a2l_us, ringback_a2l_us, uint, 0644);
@@ -124,17 +124,46 @@ static unsigned int ringback_a2l_on = 8;
 module_param_named(sqpoll_safe_a2l_on, ringback_a2l_on, uint, 0644);
 MODULE_PARM_DESC(sqpoll_safe_a2l_on, "A2L-style: owner enter batch size at or above which the poller resumes (default: 8)");
 
-static unsigned int ringback_ceiling;
-module_param_named(sqpoll_safe_ceiling, ringback_ceiling, uint, 0644);
-MODULE_PARM_DESC(sqpoll_safe_ceiling, "Lock ceiling for a SCHED_IDLE poller: raise itself to SCHED_FIFO 1 while it holds uring_lock (submit batch, task_work and ring-local completion runs) and return to SCHED_IDLE at unlock, so that a wakeup cannot preempt a lock holder that would otherwise not run again while the CPU is contended: 1 only when another task is runnable on its CPU, 2 always, 3 always but to SCHED_NORMAL at the owner's nice instead of FIFO (soft ceiling: the holder may be preempted yet runs again within a slice) (default: 0)");
-
 static bool ringback_lazy_rescue;
 module_param_named(sqpoll_safe_lazy_rescue, ringback_lazy_rescue, bool, 0644);
+/*
+ * Ring-local completions in POLL mode are left to the running poller
+ * (io_ringback_poller_runs()); 0 restores the two-runner behaviour of v6.4.
+ */
+static bool ringback_prefer = true;
+module_param_named(sqpoll_safe_prefer, ringback_prefer, bool, 0644);
+/*
+ * Parked OWNER mode: a CPU idle only because a task sleeps there in I/O wait
+ * (an owner waiting for its completions) is not free; that task comes back
+ * within microseconds and would preempt a poller resumed there.
+ */
+static bool ringback_hint_iowait = true;
+module_param_named(sqpoll_safe_hint_iowait, ringback_hint_iowait, bool, 0644);
+/*
+ * Ring-local completions: a push onto a non-empty ->work_list does no wake or
+ * kick work; the push that made the list non-empty did it for the whole list.
+ */
+static bool ringback_lean = true;
+module_param_named(sqpoll_safe_lean, ringback_lean, bool, 0644);
+MODULE_PARM_DESC(sqpoll_safe_lean, "Ring-local completions: only the push that makes ->work_list non-empty evaluates the wake, the preference and the MWAIT kick (default: 1)");
+/* Diagnosis only: POLL-mode completions of a running poller go to its task_work. */
+static bool ringback_route;
+module_param_named(sqpoll_safe_route, ringback_route, bool, 0644);
+/*
+ * ringback_defer=1 (and route): at a POLL->OWNER switch the poller-homed
+ * read/write completions already on the preempted poller's task_work list
+ * are run by the owner's rescue instead of waiting for the poller's CPU.
+ */
+static bool ringback_steal = true;
+module_param_named(sqpoll_safe_steal, ringback_steal, bool, 0644);
+MODULE_PARM_DESC(sqpoll_safe_steal, "OWNER mode: the owner's rescue runs the read/write completions left on the preempted poller's task_work list (default: 1)");
+MODULE_PARM_DESC(sqpoll_safe_route, "Diagnosis: while the poller runs, its read/write completions use its normal task_work instead of ->work_list (default: 0)");
+MODULE_PARM_DESC(sqpoll_safe_hint_iowait, "Parked OWNER mode: idle-CPU hints and hint resumes ignore a CPU on which a task sleeps in I/O wait (default: 1)");
 MODULE_PARM_DESC(sqpoll_safe_lazy_rescue, "Lazy rescue: a switch to OWNER queues no rescue task_work (no IPI) unless redirected completions wait; ring-local completions wake the owner on their own and NEED_WAKEUP makes a conforming application enter. A 2 ms safety timer rescues SQEs that make no progress for an application that never enters (default: 0)");
 
-static bool ringback_idlewake;
+static bool ringback_idlewake = true;
 module_param_named(sqpoll_safe_idlewake, ringback_idlewake, bool, 0644);
-MODULE_PARM_DESC(sqpoll_safe_idlewake, "Parked OWNER mode: the poller drops its periodic rechecks (only the sqpoll_safe_owner_safety_us safety wake stays) and the owner's enter wakes it when one of the poller's allowed CPUs is idle; it then resumes polling at once if its own CPU is uncontended (default: 0)");
+MODULE_PARM_DESC(sqpoll_safe_idlewake, "Parked OWNER mode: the poller drops its periodic rechecks (only the sqpoll_safe_owner_safety_us safety wake stays) and the owner's enter wakes it when one of the poller's allowed CPUs is idle; it then resumes polling at once if its own CPU is uncontended (default: 1)");
 
 static unsigned int ringback_idlewake_us = 100;
 module_param_named(sqpoll_safe_idlewake_us, ringback_idlewake_us, uint, 0644);
@@ -194,6 +223,8 @@ enum {
 	IO_RBK_OWNER,
 	IO_RBK_DEBT,
 	IO_RBK_KICK,
+	/* Held by whoever consumes the poller's task_work list (poller or rescue). */
+	IO_RBK_TWRUN,
 };
 
 /* Why an idle-class empty poll ended. */
@@ -212,9 +243,15 @@ struct io_ringback {
 	struct preempt_notifier notifier;
 #endif
 	struct irq_work irq;
+	/* Wake-only handoff of ring-local completions to the owner. */
+	struct irq_work wake_irq;
 	/* Deferred kick of a running owner for NO_IPI completions. */
 	struct hrtimer kick;
 	atomic64_t lazy_kicks;
+	/* Wake-only handoffs of ring-local completions from the notifier. */
+	atomic64_t handoffs;
+	/* Read/write completions run from the preempted poller's task_work list. */
+	atomic64_t stolen;
 	/*
 	 * POLL->OWNER switches at a debt-free point (no batch, no task_work).
 	 */
@@ -223,6 +260,8 @@ struct io_ringback {
 	wait_queue_head_t wait;
 	atomic_t wake_seq;
 	unsigned long state;
+	/* Notifier registered: the handoffs are armed (release/acquire). */
+	bool ready;
 	bool in_batch;
 	bool in_tw;
 	unsigned int idle_checks;
@@ -314,20 +353,6 @@ struct io_ringback {
 	 * Owner-written: ->work_list runs done by the rescue, not by an enter.
 	 */
 	unsigned long defer_rescue_runs;
-	/*
-	 * Lock ceiling, poller-only: raised now, soft (fair class) raise, the
-	 * poller's own nice, custom slice (0: default) and reset-on-fork to
-	 * restore, raises, failures and raised time.
-	 */
-	bool ceiling_on;
-	bool ceiling_soft;
-	int ceiling_nice;
-	u64 ceiling_runtime;
-	bool ceiling_reset_on_fork;
-	u64 ceiling_start;
-	atomic64_t ceilings;
-	atomic64_t ceiling_fail;
-	atomic64_t ceiling_ns;
 	/*
 	 * Lazy rescue: switches without an IPI, and the safety timer. The
 	 * lock orders the callback's stop decision with the poller's arming
@@ -446,6 +471,11 @@ static void io_rbk_queue(struct io_ringback *rbk);
  * rechecks. Rate-limited per ring, and skipped while the poller is runnable or
  * an earlier hint is pending. At most 16 CPUs of the enter's node are tested.
  */
+static bool io_rbk_cpu_napping(int cpu)
+{
+	return READ_ONCE(ringback_hint_iowait) && nr_iowait_cpu(cpu);
+}
+
 void io_ringback_idle_scan(struct io_ring_ctx *ctx)
 {
 	struct io_ringback *rbk = ctx->ringback;
@@ -454,7 +484,8 @@ void io_ringback_idle_scan(struct io_ring_ctx *ctx)
 	int cpu, hint = -1;
 	u64 now;
 
-	if (!rbk || !READ_ONCE(ringback_idlewake) ||
+	/* A2L-style: the load policy alone decides when polling resumes. */
+	if (!rbk || !READ_ONCE(ringback_idlewake) || io_rbk_policy_fixed() ||
 	    READ_ONCE(rbk->idle_hint) >= 0)
 		return;
 	now = ktime_get_ns();
@@ -468,7 +499,7 @@ void io_ringback_idle_scan(struct io_ring_ctx *ctx)
 	if (tsk && !task_is_running(tsk)) {
 		for_each_cpu_and(cpu, tsk->cpus_ptr,
 				 cpumask_of_node(numa_node_id())) {
-			if (idle_cpu(cpu)) {
+			if (idle_cpu(cpu) && !io_rbk_cpu_napping(cpu)) {
 				hint = cpu;
 				break;
 			}
@@ -562,6 +593,106 @@ void io_ringback_polled_added(struct io_ring_ctx *ctx)
 }
 
 /*
+ * Ring-local completions in POLL mode: a scheduling preference, separate from
+ * the drain authorization in io_ringback_local_runner(). True while the LOCAL
+ * ring's poller is current on its CPU (MWAIT included): then the poller runs
+ * ->work_list and its CQEs wake an armed owner by count, so a producer need
+ * not wake the owner and the owner need not drain. It is a snapshot. A poller
+ * committed to its empty-SQ sleep (state set, then the list checked) is not
+ * "running": the push before this load is seen by that check, or this load
+ * sees the state, as in io_ringback_defer_kick(). Every other path on which the
+ * poller stops running with the list non-empty hands off to the owner
+ * (io_rbk_handoff() from the preempt notifier, the rescue of an OWNER switch,
+ * the terminal drain at exit), so a stale "runs" only delays the owner. False
+ * before the notifier is registered, in OWNER mode, while stopping and under
+ * the A2L-style policy (a preempted A2L poller never switches); the same
+ * tests io_ringback_owner_submit() makes before bypassing a poller.
+ */
+bool io_ringback_poller_runs(struct io_ring_ctx *ctx)
+{
+	struct io_ringback *rbk = ctx->ringback;
+	struct task_struct *tsk;
+	bool runs = false;
+
+	if (!rbk || !(data_race(ctx->int_flags) & IO_RING_F_RINGBACK_LOCAL) ||
+	    !READ_ONCE(ringback_prefer))
+		return false;
+	if (!smp_load_acquire(&rbk->ready) || io_ringback_owner_mode(ctx) ||
+	    test_bit(IO_RBK_STOPPING, &rbk->state) || io_rbk_policy_fixed())
+		return false;
+	rcu_read_lock();
+	tsk = rcu_dereference(ctx->sq_data->thread);
+	if (tsk)
+		runs = task_curr(tsk) && task_is_running(tsk);
+	rcu_read_unlock();
+	return runs;
+}
+
+bool io_ringback_lean(void)
+{
+	return READ_ONCE(ringback_lean);
+}
+
+/* Diagnosis (sqpoll_safe_route): leave a running poller's completion to its task_work. */
+bool io_ringback_route_poller(struct io_kiocb *req)
+{
+	struct io_ring_ctx *ctx = req->ctx;
+
+	return READ_ONCE(ringback_route) && req->tctx &&
+	       req->tctx->task != ctx->ringback_owner &&
+	       io_ringback_poller_runs(ctx);
+}
+
+/* The owner should leave ->work_list to the poller right now. */
+bool io_ringback_prefer_poller(struct io_ring_ctx *ctx, struct task_struct *tsk)
+{
+	return ctx->ringback && tsk == ctx->ringback_owner &&
+	       io_ringback_poller_runs(ctx);
+}
+
+static void io_rbk_wake_irq(struct irq_work *work)
+{
+	struct io_ringback *rbk = container_of(work, struct io_ringback,
+					       wake_irq);
+
+	wake_up_state(rbk->ctx->ringback_owner, TASK_INTERRUPTIBLE);
+}
+
+/*
+ * From the preempt notifier: the poller leaves the CPU with ring-local
+ * completions a producer may have left to it in POLL mode: a sleep that does
+ * not check the list first (a mutex, an event wait, a park) or a preemption
+ * under the A2L policy; the empty-SQ sleep is covered by
+ * io_ringback_poller_runs() itself.
+ * Wake the owner (no rescue: nothing to submit, and the A2L policy forbids
+ * one). An owner waiting in
+ * io_cqring_wait() then drains them itself while the preference stays false
+ * (the poller is not current); if the poller resumes first, it runs them or
+ * hands off again. An owner that does not wait keeps its usual consumers (the
+ * kicked poller, its next enter). Ordering: the
+ * scheduler publishes rq->curr = next before this notifier (__schedule() ->
+ * context_switch() -> prepare_task_switch()); the barrier orders that store
+ * before the list load, against a producer's push (full barrier) before its
+ * task_curr() load. The wake is deferred: wake_up_state() takes the owner's
+ * pi_lock and rq lock, which the notifier may hold.
+ */
+static void io_rbk_handoff(struct io_ringback *rbk)
+{
+	smp_mb();
+	/*
+	 * OWNER mode: the preference is false, so the owner is woken for its
+	 * ring-local completions already, and the switch to OWNER queued a
+	 * rescue for what was left to the poller before it.
+	 */
+	if (test_bit(IO_RBK_OWNER, &rbk->state))
+		return;
+	if (io_local_work_pending(rbk->ctx)) {
+		atomic64_inc(&rbk->handoffs);
+		irq_work_queue(&rbk->wake_irq);
+	}
+}
+
+/*
  * After a ring-local enqueue, under the producer's RCU read section. The
  * push's full barrier pairs with the poller clearing OWNER, so either this
  * sees POLL or the poller sees the entry. @waiter: an owner waiting in
@@ -633,13 +764,15 @@ void io_ringback_mwait_kick(struct io_ring_ctx *ctx, struct task_struct *tsk)
 /*
  * Ring-local completions, from the owner's rescue: run its ring-local
  * completions with uring_lock held. These runs are not progress of the owner's
- * own enters, so the poller's stall check discounts them.
+ * own enters, so the poller's stall check discounts them. Left to the poller
+ * while it runs the list (io_ringback_poller_runs()).
  */
 static void io_rbk_run_local(struct io_ring_ctx *ctx)
 {
 	struct io_ringback *rbk = ctx->ringback;
 
-	if (!io_local_work_pending(ctx) || ctx->ringback_owner != current)
+	if (!io_local_work_pending(ctx) || ctx->ringback_owner != current ||
+	    io_ringback_poller_runs(ctx))
 		return;
 	(void)io_run_local_work_locked(ctx, 0);
 	WRITE_ONCE(rbk->defer_rescue_runs, rbk->defer_rescue_runs + 1);
@@ -833,9 +966,14 @@ static void io_rbk_to_owner(struct io_ringback *rbk, bool voluntary)
 	/* Polled rings: polled requests left in flight need a rescuer too. */
 	if (lazy || READ_ONCE(ringback_dual) || rbk->polled)
 		io_rbk_safety_arm(rbk);
-	if (lazy && mpscq_empty(&rbk->redirect)) {
-		atomic64_inc(&rbk->lazy_skips);
-		return;
+	if (lazy) {
+		/* Order rq->curr = next before the list loads (io_rbk_handoff()). */
+		smp_mb();
+		if (mpscq_empty(&rbk->redirect) &&
+		    !io_local_work_pending(ctx)) {
+			atomic64_inc(&rbk->lazy_skips);
+			return;
+		}
 	}
 	io_rbk_queue(rbk);
 }
@@ -1212,6 +1350,79 @@ static void io_rbk_reap_polled(struct io_ringback *rbk)
 	}
 }
 
+static unsigned int io_sq_tw(int max_entries);
+
+/*
+ * OWNER mode, from the owner's rescue with uring_lock held and the poller off
+ * CPU: run the read/write completions the poller left on its own task_work
+ * list when it was preempted (later ones are redirected, io_ringback_redirect()).
+ * IO_RBK_TWRUN makes this and the poller's io_sq_tw() the list's only
+ * consumers in turn. Other task_work stays with the poller, as for redirect.
+ */
+static void io_rbk_steal_tw(struct io_ringback *rbk, struct task_struct *tsk)
+{
+	struct io_ring_ctx *ctx = rbk->ctx;
+	struct io_uring_task *tctx = tsk->io_uring;
+	struct io_tw_state ts = { .cancel = io_should_terminate_tw(ctx) };
+	const struct cred *creds = NULL;
+	struct llist_node *node;
+	bool foreign = false;
+	unsigned int n = 0;
+
+	if (!READ_ONCE(ringback_steal) || !tctx ||
+	    mpscq_empty(&tctx->task_list) ||
+	    test_and_set_bit_lock(IO_RBK_TWRUN, &rbk->state))
+		return;
+	if (ctx->sq_creds != current_cred())
+		creds = override_creds(ctx->sq_creds);
+	while ((node = mpscq_pop(&tctx->task_list, &tctx->task_head))) {
+		struct io_kiocb *req = container_of(node, struct io_kiocb,
+						    io_task_work.node);
+
+		if (req->ctx != ctx ||
+		    req->io_task_work.func != io_req_rw_complete) {
+			/* The poller's to run: requeue it for the poller. */
+			preempt_disable();
+			mpscq_push(&tctx->task_list, node);
+			preempt_enable();
+			foreign = true;
+			break;
+		}
+		req->io_task_work.func((struct io_tw_req){req}, ts);
+		n++;
+	}
+	if (creds)
+		revert_creds(creds);
+	clear_bit_unlock(IO_RBK_TWRUN, &rbk->state);
+	if (n)
+		atomic64_add(n, &rbk->stolen);
+	if (foreign) {
+		__set_notify_signal(tsk);
+	} else if (!mpscq_empty(&tctx->task_list)) {
+		/* A producer is between tail xchg and linking: come back later. */
+		set_bit(IO_RBK_REQUEST, &rbk->state);
+	}
+}
+
+/* The poller's task_work, unless the owner's rescue is running it. */
+static unsigned int io_rbk_sq_tw(struct io_ringback *rbk, int max_entries,
+				 bool wait)
+{
+	unsigned int count;
+
+	if (!rbk)
+		return io_sq_tw(max_entries);
+	while (test_and_set_bit_lock(IO_RBK_TWRUN, &rbk->state)) {
+		if (!wait)
+			return 0;
+		/* Exit: the owner's rescue holds it for one bounded run. */
+		cond_resched();
+	}
+	count = io_sq_tw(max_entries);
+	clear_bit_unlock(IO_RBK_TWRUN, &rbk->state);
+	return count;
+}
+
 static void io_rbk_rescue(struct callback_head *cb)
 {
 	struct io_ringback *rbk = container_of(cb, struct io_ringback, work);
@@ -1260,7 +1471,8 @@ static void io_rbk_rescue(struct callback_head *cb)
 		 * POLL again with the poller on CPU: finish redirected work and
 		 * ring-local completions left from OWNER mode only.
 		 */
-		if (mpscq_empty(&rbk->redirect) && !io_local_work_pending(ctx))
+		if (mpscq_empty(&rbk->redirect) &&
+		    (!io_local_work_pending(ctx) || io_ringback_poller_runs(ctx)))
 			goto put_task;
 		if (!io_rbk_trylock_retry(rbk))
 			goto put_task;
@@ -1287,6 +1499,7 @@ static void io_rbk_rescue(struct callback_head *cb)
 	}
 	io_rbk_run_redirect(rbk);
 	io_rbk_run_local(ctx);
+	io_rbk_steal_tw(rbk, tsk);
 	io_rbk_reap_polled(rbk);
 	if (ctx->ringback_owner_tctx && ctx->ringback_owner == current &&
 	    ctx->ringback_owner_tctx == current->io_uring &&
@@ -1399,10 +1612,11 @@ static void io_rbk_sched_out(struct preempt_notifier *pn,
 		return;
 	if (!task_is_runnable(current)) {
 		/*
-		 * Observe a remote boost before deciding whether sleep needs
-		 * demotion.
+		 * Voluntary sleep (empty SQ, park, a mutex): hand pending
+		 * ring-local completions to the owner. Its barrier also orders
+		 * a remote boost before the demotion decision below.
 		 */
-		smp_mb();
+		io_rbk_handoff(rbk);
 		if (READ_ONCE(rbk->boosted))
 			io_rbk_queue(rbk);
 		return;
@@ -1419,9 +1633,13 @@ static void io_rbk_sched_out(struct preempt_notifier *pn,
 		atomic64_inc(&rbk->preempt_locked);
 	/*
 	 * A2L-style: only the load policy switches; lock-debt repayment stays.
+	 * An entry left to this poller while the policy was off is handed to
+	 * the owner (wake only: no rescue submits under A2L).
 	 */
-	if (READ_ONCE(ringback_a2l_us))
+	if (READ_ONCE(ringback_a2l_us)) {
+		io_rbk_handoff(rbk);
 		return;
+	}
 	io_rbk_to_owner(rbk, false);
 }
 
@@ -1458,6 +1676,7 @@ int io_ringback_init(struct io_ring_ctx *ctx)
 	mutex_init(&rbk->policy_lock);
 	init_waitqueue_head(&rbk->wait);
 	init_irq_work(&rbk->irq, io_rbk_irq);
+	init_irq_work(&rbk->wake_irq, io_rbk_wake_irq);
 	init_task_work(&rbk->work, io_rbk_rescue);
 	mpscq_init(&rbk->redirect, &rbk->redirect_head);
 	hrtimer_setup(&rbk->kick, io_rbk_kick_fn, CLOCK_MONOTONIC,
@@ -1500,9 +1719,16 @@ void io_ringback_stop(struct io_ring_ctx *ctx)
 	raw_spin_unlock_irq(&rbk->safety_lock);
 	hrtimer_cancel(&rbk->safety);
 	irq_work_sync(&rbk->irq);
+	irq_work_sync(&rbk->wake_irq);
 	io_rbk_return(rbk);
 	/* After the RCU grace period in io_rbk_return(): nobody re-arms it. */
 	hrtimer_cancel(&rbk->kick);
+	/*
+	 * A creator that went to sleep leaving the list to the poller just
+	 * before STOPPING: wake it; the preference is false now.
+	 */
+	if (io_local_work_pending(ctx))
+		wake_up_state(ctx->ringback_owner, TASK_INTERRUPTIBLE);
 	if (ctx->sq_data) {
 		rcu_read_lock();
 		tsk = rcu_dereference(ctx->sq_data->thread);
@@ -1558,7 +1784,7 @@ void io_ringback_fdinfo(struct io_ring_ctx *ctx, struct seq_file *m)
 			owner_ns += ktime_get_ns() -
 				    READ_ONCE(rbk->owner_start);
 	} while (read_seqcount_retry(&rbk->mode_seq, seq));
-	seq_printf(m, "SqSafe:\tpreempts=%lld rescues=%lld submitted=%lld trylock_fail=%lld boosts=%lld boosted_ns=%llu poll_to_owner=%lld owner_to_poll=%lld owner_ns=%llu owner_submitted=%lld preempt_locked=%lld redirected=%lld boosted_runtime_ns=%lld lazy_kicks=%lld vol_to_owner=%lld boost_rt_max_ns=%llu boost_rt_hist=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu poll_submitted=%lld owner_wakes=%lld defer_rescues=%lld defer_spin=%d dual_submitted=%lld mwaits=%lld a2l_offs=%lld a2l_ons=%lld ceilings=%lld ceiling_fail=%lld ceiling_ns=%lld lazy_skips=%lld safety_rescues=%lld mwait_kicks=%lld yields=%lld idle_wakes=%lld idle_hits=%lld idle_misses=%lld polled_issued=%lld polled_reaped_by_owner=%lld idle_flaps=%lld\n",
+	seq_printf(m, "SqSafe:\tpreempts=%lld rescues=%lld submitted=%lld trylock_fail=%lld boosts=%lld boosted_ns=%llu poll_to_owner=%lld owner_to_poll=%lld owner_ns=%llu owner_submitted=%lld preempt_locked=%lld redirected=%lld boosted_runtime_ns=%lld lazy_kicks=%lld vol_to_owner=%lld boost_rt_max_ns=%llu boost_rt_hist=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu poll_submitted=%lld owner_wakes=%lld defer_rescues=%lld defer_spin=%d dual_submitted=%lld mwaits=%lld a2l_offs=%lld a2l_ons=%lld lazy_skips=%lld safety_rescues=%lld mwait_kicks=%lld yields=%lld idle_wakes=%lld idle_hits=%lld idle_misses=%lld polled_issued=%lld polled_reaped_by_owner=%lld idle_flaps=%lld handoffs=%lld stolen=%lld\n",
 		   atomic64_read(&rbk->preempts), atomic64_read(&rbk->rescues),
 		   atomic64_read(&rbk->submitted),
 		   atomic64_read(&rbk->trylock_fail),
@@ -1578,9 +1804,7 @@ void io_ringback_fdinfo(struct io_ring_ctx *ctx, struct seq_file *m)
 		   READ_ONCE(rbk->defer_spin),
 		   atomic64_read(&rbk->dual_submitted),
 		   atomic64_read(&rbk->mwaits), atomic64_read(&rbk->a2l_offs),
-		   atomic64_read(&rbk->a2l_ons), atomic64_read(&rbk->ceilings),
-		   atomic64_read(&rbk->ceiling_fail),
-		   atomic64_read(&rbk->ceiling_ns),
+		   atomic64_read(&rbk->a2l_ons),
 		   atomic64_read(&rbk->lazy_skips),
 		   atomic64_read(&rbk->safety_rescues),
 		   atomic64_read(&rbk->mwait_kicks),
@@ -1590,7 +1814,9 @@ void io_ringback_fdinfo(struct io_ring_ctx *ctx, struct seq_file *m)
 		   atomic64_read(&rbk->idle_misses),
 		   atomic64_read(&rbk->polled_issued),
 		   atomic64_read(&rbk->polled_reaped_by_owner),
-		   atomic64_read(&rbk->idle_flaps));
+		   atomic64_read(&rbk->idle_flaps),
+		   atomic64_read(&rbk->handoffs),
+		   atomic64_read(&rbk->stolen));
 	seq_printf(m, "SqK12:\ton=%d entries=%lld idle_ns=%lld inflight_block=%lld setattr_fail=%lld exit_sq=%lld exit_tw=%lld exit_event=%lld exit_owner=%lld exit_timeout=%lld lease_expired=%lld\n",
 		   READ_ONCE(rbk->idlepoll_on),
 		   atomic64_read(&rbk->idlepoll_entries),
@@ -1606,110 +1832,16 @@ void io_ringback_fdinfo(struct io_ring_ctx *ctx, struct seq_file *m)
 }
 
 /*
- * Lock ceiling: a SCHED_IDLE poller that holds uring_lock must not be preempted
- * by a wakeup, because it would then not run again while its CPU is contended
- * and the owner would wait for the lock. Raise to FIFO for the lock section
- * only (always, or only when another task is runnable on this CPU); lower at
- * the end of the section. The remote switch-debt boost is not used together
- * with this (rt=3); a FIFO holder preempted by an RT task falls back to RETRY.
+ * End of a uring_lock section of the idle-class poller. Under full preemption
+ * a fair wakeup preempts an idle entity at once; lazy preemption only flags
+ * the poller (resched_curr_lazy) until the next tick. Give the CPU up here when
+ * another task is runnable, as the idle class promises and as the removed soft
+ * ceiling's lowering used to do.
  */
-static void io_sq_ceiling_raise(struct io_ringback *rbk)
+static void io_rbk_yield_if_contended(void)
 {
-	struct sched_attr attr = {
-		.size = sizeof(attr),
-		.sched_policy = SCHED_FIFO,
-		.sched_priority = 1,
-	};
-	unsigned int mode = READ_ONCE(ringback_ceiling);
-
-	if (!mode || rbk->ceiling_on || current->policy != SCHED_IDLE)
-		return;
-	if (mode == 1 && !io_sq_contended())
-		return;
-	if (mode == 3) {
-		/*
-		 * Soft ceiling: owner-nice matching instead of an RT class. The
-		 * holder is an ordinary fair task of the owner's weight for the
-		 * section: a CFS wakeup can still preempt it, and then the
-		 * owner waits until the holder is scheduled again (no latency
-		 * guarantee, unlike FIFO), but FIFO sections at tens of
-		 * thousands per second gave the CFS tasks of the CPU rare
-		 * stalls of tens of milliseconds that fair sections should not.
-		 */
-		attr.sched_policy = SCHED_NORMAL;
-		attr.sched_priority = 0;
-		attr.sched_nice = task_nice(rbk->ctx->ringback_owner);
-		/*
-		 * Keep a custom slice of the poller through the fair section.
-		 */
-		if (current->se.custom_slice)
-			attr.sched_runtime = current->se.slice;
-	}
-	/* Preserve the poller's own attributes for the lowering. */
-	rbk->ceiling_soft = mode == 3;
-	rbk->ceiling_nice = task_nice(current);
-	rbk->ceiling_runtime = current->se.custom_slice ? current->se.slice : 0;
-	rbk->ceiling_reset_on_fork = current->sched_reset_on_fork;
-	if (rbk->ceiling_reset_on_fork)
-		attr.sched_flags = SCHED_FLAG_RESET_ON_FORK;
-	if (sched_setattr_nocheck(current, &attr)) {
-		atomic64_inc(&rbk->ceiling_fail);
-		return;
-	}
-	rbk->ceiling_on = true;
-	rbk->ceiling_start = ktime_get_ns();
-	atomic64_inc(&rbk->ceilings);
-}
-
-static void io_sq_ceiling_lower(struct io_ringback *rbk)
-{
-	struct sched_attr attr = {
-		.size = sizeof(attr),
-		.sched_policy = SCHED_IDLE,
-		/*
-		 * A soft raise changed the nice to the owner's: restore the
-		 * saved one. A FIFO raise left it alone: read the current
-		 * value, so a renice during the section is kept as before.
-		 */
-		.sched_nice = rbk->ceiling_soft ? rbk->ceiling_nice :
-			      task_nice(current),
-		.sched_runtime = rbk->ceiling_runtime,
-		.sched_flags = rbk->ceiling_reset_on_fork ?
-			       SCHED_FLAG_RESET_ON_FORK : 0,
-	};
-
-	if (!rbk->ceiling_on)
-		return;
-	rbk->ceiling_on = false;
-	atomic64_add(ktime_get_ns() - rbk->ceiling_start, &rbk->ceiling_ns);
-	if (sched_setattr_nocheck(current, &attr)) {
-		atomic64_inc(&rbk->ceiling_fail);
-		return;
-	}
-	/*
-	 * Soft ceiling: SCHED_NORMAL -> SCHED_IDLE at the same nice keeps
-	 * p->prio, so prio_changed_fair() requests no reschedule (an RT -> fair
-	 * switch does, in switched_to_fair()). A task that woke during the
-	 * section would wait for the tick: give the CPU up now instead, as the
-	 * idle class promises.
-	 */
-	if (rbk->ceiling_soft && io_sq_contended())
+	if (io_sq_contended())
 		schedule();
-}
-
-/*
- * Lock ceiling, from the task_work runner right before it takes uring_lock:
- * work that arrived after the poller's pending check would otherwise run as an
- * idle-class holder. No cost once raised; the run's end in io_sq_thread()
- * lowers it. Not during the poller's exit drain, which has no lowering.
- */
-void io_ringback_tw_raise(struct io_ring_ctx *ctx)
-{
-	struct io_ringback *rbk = ctx->ringback;
-
-	if (io_ringback_is_poller(ctx) &&
-	    !test_bit(IO_RBK_STOPPING, &rbk->state))
-		io_sq_ceiling_raise(rbk);
 }
 
 static bool io_rbk_lock(struct io_ringback *rbk)
@@ -1725,21 +1857,6 @@ static bool io_rbk_lock(struct io_ringback *rbk)
 	if (test_bit(IO_RBK_OWNER, &rbk->state)) {
 		preempt_enable();
 		return false;
-	}
-	if (READ_ONCE(ringback_ceiling) && current->policy == SCHED_IDLE) {
-		/*
-		 * Lock ceiling: raise before taking the lock, so that no CFS
-		 * wakeup can preempt this idle-class holder at any point of the
-		 * batch.
-		 */
-		preempt_enable();
-		io_sq_ceiling_raise(rbk);
-		if (!mutex_trylock(&rbk->ctx->uring_lock)) {
-			io_sq_ceiling_lower(rbk);
-			return false;
-		}
-		WRITE_ONCE(rbk->in_batch, true);
-		return true;
 	}
 	if (!mutex_trylock(&rbk->ctx->uring_lock)) {
 		preempt_enable();
@@ -1778,9 +1895,9 @@ static void io_rbk_unlock(struct io_ringback *rbk)
 	 * one.
 	 */
 	WRITE_ONCE(rbk->in_batch, false);
-	io_sq_ceiling_lower(rbk);
 	/* Keep a debt boost through io_sq_tw(), not merely the batch unlock. */
 	io_rbk_released(rbk);
+	io_rbk_yield_if_contended();
 }
 
 void io_sq_thread_unpark(struct io_sq_data *sqd)
@@ -2218,8 +2335,13 @@ static bool io_rbk_try_poll(struct io_ringback *rbk)
 	 * poller. Resume at once, without hold time, if the CPU it runs on is
 	 * uncontended; otherwise a later scan or the safety wake retries.
 	 */
-	if (READ_ONCE(rbk->idle_hint) >= 0 && xchg(&rbk->idle_hint, -1) >= 0) {
-		if (contended) {
+	if (io_rbk_policy_fixed()) {
+		/* A2L-style: a hint from before the policy was set is stale. */
+		if (READ_ONCE(rbk->idle_hint) >= 0)
+			WRITE_ONCE(rbk->idle_hint, -1);
+	} else if (READ_ONCE(rbk->idle_hint) >= 0 &&
+		   xchg(&rbk->idle_hint, -1) >= 0) {
+		if (contended || io_rbk_cpu_napping(raw_smp_processor_id())) {
 			atomic64_inc(&rbk->idle_misses);
 		} else {
 			atomic64_inc(&rbk->idle_hits);
@@ -2280,15 +2402,14 @@ static void io_rbk_poller_reap(struct io_ringback *rbk)
 	if (list_empty_careful(&ctx->iopoll_list))
 		return;
 	WRITE_ONCE(rbk->in_tw, true);
-	io_sq_ceiling_raise(rbk);
 	if (mutex_trylock(&ctx->uring_lock)) {
 		if (!list_empty(&ctx->iopoll_list))
 			io_do_iopoll(ctx, true);
 		mutex_unlock(&ctx->uring_lock);
 		io_rbk_released(rbk);
 	}
-	io_sq_ceiling_lower(rbk);
 	WRITE_ONCE(rbk->in_tw, false);
+	io_rbk_yield_if_contended();
 }
 
 static void io_rbk_owner_wait(struct io_sq_data *sqd, struct io_ringback *rbk)
@@ -2629,8 +2750,11 @@ static int io_sq_thread(void *data)
 
 	mutex_lock(&sqd->lock);
 #ifdef CONFIG_PREEMPT_NOTIFIERS
-	if (rbk)
+	if (rbk) {
 		preempt_notifier_register(&rbk->notifier);
+		/* The handoffs are armed: the preference may now be true. */
+		smp_store_release(&rbk->ready, true);
+	}
 #endif
 	/*
 	 * Custom slice: a slice longer than the neighbours' lets their wakeups
@@ -2722,27 +2846,21 @@ static int io_sq_thread(void *data)
 		}
 		if (rbk)
 			rbk->lease_grace = false;
-		if (rbk) {
+		if (rbk)
 			WRITE_ONCE(rbk->in_tw, true);
-			/*
-			 * Lock ceiling: task_work takes uring_lock for its
-			 * completion batches.
-			 */
-			if (io_sq_tw_pending() || task_work_pending(current))
-				io_sq_ceiling_raise(rbk);
-		}
-		tw = io_sq_tw(IORING_TW_CAP_ENTRIES_VALUE);
+		tw = io_rbk_sq_tw(rbk, IORING_TW_CAP_ENTRIES_VALUE, false);
 		if (tw)
 			sqt_spin = true;
 		if (rbk) {
 			WRITE_ONCE(rbk->in_tw, false);
-			io_sq_ceiling_lower(rbk);
 			/*
 			 * That task_work ran under uring_lock: retry a waiting
 			 * owner.
 			 */
-			if (tw)
+			if (tw) {
 				io_rbk_released(rbk);
+				io_rbk_yield_if_contended();
+			}
 			io_rbk_repay(rbk);
 			/*
 			 * Back in POLL: any uring_lock holder may consume
@@ -2751,16 +2869,13 @@ static int io_sq_thread(void *data)
 			 */
 			if (!mpscq_empty(&rbk->redirect) &&
 			    !io_ringback_owner_mode(rbk->ctx)) {
-				io_sq_ceiling_raise(rbk);
 				if (mutex_trylock(&rbk->ctx->uring_lock)) {
 					io_rbk_run_redirect(rbk);
 					io_submit_flush_completions(rbk->ctx);
 					mutex_unlock(&rbk->ctx->uring_lock);
-					io_sq_ceiling_lower(rbk);
 					io_rbk_released(rbk);
+					io_rbk_yield_if_contended();
 					sqt_spin = true;
-				} else {
-					io_sq_ceiling_lower(rbk);
 				}
 			}
 			/*
@@ -2783,13 +2898,12 @@ static int io_sq_thread(void *data)
 					 * the next loop.
 					 */
 					WRITE_ONCE(rbk->in_tw, true);
-					io_sq_ceiling_raise(rbk);
 					if (mutex_trylock(&rbk->ctx->uring_lock)) {
 						(void)io_run_local_work_locked(rbk->ctx, 0);
 						mutex_unlock(&rbk->ctx->uring_lock);
 						io_rbk_released(rbk);
+						io_rbk_yield_if_contended();
 					}
-					io_sq_ceiling_lower(rbk);
 					WRITE_ONCE(rbk->in_tw, false);
 					sqt_spin = true;
 				} else {
@@ -2926,15 +3040,36 @@ static int io_sq_thread(void *data)
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 		preempt_notifier_unregister(&rbk->notifier);
 #endif
+		WRITE_ONCE(rbk->ready, false);
 		mutex_lock(&rbk->policy_lock);
 		io_rbk_restore(rbk, current);
 		io_rbk_policy_unlock(rbk);
 		io_rbk_return(rbk);
 	}
 	if (io_sq_tw_pending())
-		io_sq_tw(UINT_MAX);
+		io_rbk_sq_tw(rbk, UINT_MAX, true);
 
 	io_uring_cancel_generic(true, sqd);
+	if (rbk) {
+		struct io_ring_ctx *rctx = rbk->ctx;
+
+		/*
+		 * Terminal drain of the ring-local completions left to this
+		 * poller. STOPPING stops new ones (io_ringback_defer_ok()) and
+		 * the grace period in io_rbk_return() ended every producer that
+		 * may have left one, so the list is finite. Still the poller
+		 * (sqd->thread), so still authorized; the owner may never run
+		 * them: a creator spinning on the CQ does not wait, and an enter
+		 * after the thread is gone returns -EOWNERDEAD.
+		 */
+		if (io_local_work_pending(rctx) && io_allowed_defer_tw_run(rctx)) {
+			mutex_lock(&rctx->uring_lock);
+			while (io_local_work_pending(rctx))
+				(void)io_run_local_work_locked(rctx, INT_MAX);
+			mutex_unlock(&rctx->uring_lock);
+		}
+		wake_up_state(rctx->ringback_owner, TASK_INTERRUPTIBLE);
+	}
 	rcu_assign_pointer(sqd->thread, NULL);
 	put_task_struct(current);
 	list_for_each_entry(ctx, &sqd->ctx_list, sqd_list)

@@ -25,14 +25,15 @@ static int io_wake_function(struct wait_queue_entry *curr, unsigned int mode,
 	 * Cannot safely flush overflowed CQEs from here, ensure we wake up
 	 * the task, and the next invocation will do it.
 	 */
-	if (io_should_wake(iowq) || io_has_work(iowq->ctx))
+	if (io_should_wake(iowq) || io_has_work_for(iowq->ctx, iowq->wq.private))
 		return autoremove_wake_function(curr, mode, wake_flags, key);
 	return -1;
 }
 
 int io_run_task_work_sig(struct io_ring_ctx *ctx)
 {
-	if (io_local_work_pending(ctx) && io_allowed_defer_tw_run(ctx)) {
+	if (io_local_work_pending(ctx) && io_allowed_defer_tw_run(ctx) &&
+	    !io_ringback_prefer_poller(ctx, current)) {
 		__set_current_state(TASK_RUNNING);
 		if (io_run_local_work(ctx, INT_MAX, IO_LOCAL_TW_DEFAULT_MAX) > 0)
 			return 0;
@@ -78,7 +79,7 @@ static enum hrtimer_restart io_cqring_min_timer_wakeup(struct hrtimer *timer)
 	    ktime_compare(iowq->min_timeout, iowq->timeout) >= 0)
 		goto out_wake;
 	/* work we may need to run, wake function will see if we need to wake */
-	if (io_has_work(ctx))
+	if (io_has_work_for(ctx, iowq->wq.private))
 		goto out_wake;
 	/* got events since we started waiting, min timeout is done */
 	scoped_guard(rcu) {
@@ -100,12 +101,27 @@ static enum hrtimer_restart io_cqring_min_timer_wakeup(struct hrtimer *timer)
 	    (ctx->ringback && iowq->wq.private == ctx->ringback_owner)) {
 		atomic_set(&ctx->cq_wait_nr, 1);
 		smp_mb();
-		if (io_local_work_pending(ctx))
+		if (io_local_work_pending(ctx) &&
+		    !io_ringback_prefer_poller(ctx, iowq->wq.private))
 			goto out_wake;
 	}
 
 	/* any generated CQE posted past this time should wake us up */
-	iowq->cq_tail = iowq->cq_min_tail + 1;
+	WRITE_ONCE(iowq->cq_tail, iowq->cq_min_tail + 1);
+	/*
+	 * Publish the lowered target before a final recheck: a CQE posted by
+	 * another task (an SQPOLL thread) since the checks above was judged
+	 * against the old target by io_wake_function(). Pairs with the tail
+	 * store followed by the barrier in wq_has_sleeper() on the posting side:
+	 * either that wake sees the new target or this sees its tail.
+	 */
+	smp_mb();
+	if (io_has_work_for(ctx, iowq->wq.private))
+		goto out_wake;
+	scoped_guard(rcu) {
+		if (iowq->cq_min_tail != READ_ONCE(io_get_rings(ctx)->cq.tail))
+			goto out_wake;
+	}
 
 	hrtimer_update_function(&iowq->t, io_cqring_timer_wakeup);
 	hrtimer_set_expires(timer, iowq->timeout);
@@ -173,7 +189,8 @@ static inline int io_cqring_wait_schedule(struct io_ring_ctx *ctx,
 	if (unlikely(READ_ONCE(ctx->check_cq)))
 		return 1;
 	if (unlikely(io_local_work_pending(ctx)) &&
-	    io_allowed_defer_tw_run(ctx))
+	    io_allowed_defer_tw_run(ctx) &&
+	    !io_ringback_prefer_poller(ctx, current))
 		return 1;
 	if (unlikely(task_work_pending(current)))
 		return 1;
@@ -201,7 +218,8 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 
 	if (!io_allowed_run_tw(ctx))
 		return -EEXIST;
-	if (io_local_work_pending(ctx) && io_allowed_defer_tw_run(ctx))
+	if (io_local_work_pending(ctx) && io_allowed_defer_tw_run(ctx) &&
+	    !io_ringback_prefer_poller(ctx, current))
 		io_run_local_work(ctx, min_events,
 				  max(IO_LOCAL_TW_DEFAULT_MAX, min_events));
 	io_run_task_work();
@@ -274,7 +292,8 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 			mutex_unlock(&ctx->uring_lock);
 			/* Do not starve other completions meanwhile. */
 			if (io_local_work_pending(ctx) &&
-			    io_allowed_defer_tw_run(ctx))
+			    io_allowed_defer_tw_run(ctx) &&
+			    !io_ringback_prefer_poller(ctx, current))
 				io_run_local_work(ctx, nr_wait, nr_wait);
 			io_run_task_work();
 			check_cq = READ_ONCE(ctx->check_cq);
@@ -355,7 +374,8 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 		 * If we got woken because of task_work being processed, run it
 		 * now rather than let the caller do another wait loop.
 		 */
-		if (io_local_work_pending(ctx) && io_allowed_defer_tw_run(ctx))
+		if (io_local_work_pending(ctx) && io_allowed_defer_tw_run(ctx) &&
+		    !io_ringback_prefer_poller(ctx, current))
 			io_run_local_work(ctx, nr_wait, nr_wait);
 		io_run_task_work();
 
