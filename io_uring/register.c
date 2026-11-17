@@ -25,6 +25,7 @@
 #include "rsrc.h"
 #include "sqpoll.h"
 #include "register.h"
+#include "rbcount.h"
 #include "cancel.h"
 #include "kbuf.h"
 #include "napi.h"
@@ -512,6 +513,9 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	/* limited to DEFER_TASKRUN for now */
 	if (!(ctx->flags & IORING_SETUP_DEFER_TASKRUN))
 		return -EINVAL;
+	/* RingBack-Count writes CROWDED into sq_flags without uring_lock. */
+	if (rcu_access_pointer(ctx->rbc_reg))
+		return -EBUSY;
 	if (copy_from_user(p, arg, sizeof(*p)))
 		return -EFAULT;
 	if (p->flags & ~RESIZE_FLAGS)
@@ -749,13 +753,8 @@ static int io_register_mem_region(struct io_ring_ctx *ctx, void __user *uarg)
 	return 0;
 }
 
-static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
-			       void __user *arg, unsigned nr_args)
-	__releases(ctx->uring_lock)
-	__acquires(ctx->uring_lock)
+static int io_register_allowed(struct io_ring_ctx *ctx, unsigned opcode)
 {
-	int ret;
-
 	/*
 	 * We don't quiesce the refs for register anymore and so it can't be
 	 * dying as we're holding a file ref here.
@@ -778,6 +777,19 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 		if (!test_bit(opcode, ctx->restrictions.register_op))
 			return -EACCES;
 	}
+	return 0;
+}
+
+static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
+			       void __user *arg, unsigned nr_args)
+	__releases(ctx->uring_lock)
+	__acquires(ctx->uring_lock)
+{
+	int ret;
+
+	ret = io_register_allowed(ctx, opcode);
+	if (ret)
+		return ret;
 
 	switch (opcode) {
 	case IORING_REGISTER_BUFFERS:
@@ -1045,13 +1057,30 @@ SYSCALL_DEFINE4(io_uring_register, unsigned int, fd, unsigned int, opcode,
 		return PTR_ERR(file);
 	ctx = file->private_data;
 
+	if (opcode == IORING_REGISTER_RB_WORKER ||
+	    opcode == IORING_UNREGISTER_RB_WORKER) {
+		/*
+		 * A disabled ring is exempt from its register restrictions;
+		 * refuse it first so that enabling it concurrently cannot let a
+		 * restricted registration through.
+		 */
+		ret = -EINVAL;
+		if (!(smp_load_acquire(&ctx->flags) & IORING_SETUP_R_DISABLED)) {
+			ret = io_register_allowed(ctx, opcode);
+			if (!ret)
+				ret = io_rbc_register(ctx, opcode, arg,
+						      nr_args);
+		}
+		goto out;
+	}
+
 	mutex_lock(&ctx->uring_lock);
 	ret = __io_uring_register(ctx, opcode, arg, nr_args);
 
 	trace_io_uring_register(ctx, opcode, ctx->file_table.data.nr,
 				ctx->buf_table.nr, ret);
 	mutex_unlock(&ctx->uring_lock);
-
+out:
 	if (!use_registered_ring)
 		fput(file);
 	return ret;

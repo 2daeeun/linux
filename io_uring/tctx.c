@@ -62,6 +62,7 @@ void io_uring_free_tctx(struct task_struct *tsk)
 		}
 		WARN_ON_ONCE(tctx->io_wq);
 		WARN_ON_ONCE(tctx->cached_refs);
+		WARN_ON_ONCE(tctx->rbc_reg);
 
 		percpu_counter_destroy(&tctx->inflight);
 		kfree(tctx);

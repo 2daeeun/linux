@@ -75,6 +75,7 @@
 #include "tctx.h"
 #include "register.h"
 #include "sqpoll.h"
+#include "rbcount.h"
 #include "fdinfo.h"
 #include "kbuf.h"
 #include "rsrc.h"
@@ -2432,6 +2433,7 @@ static __cold void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
 	unsigned long index;
 	struct cred *creds;
 
+	io_rbc_ctx_exit(ctx);
 	mutex_lock(&ctx->uring_lock);
 	percpu_ref_kill(&ctx->refs);
 	xa_for_each(&ctx->personalities, index, creds)
@@ -2723,6 +2725,21 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 	if (unlikely(smp_load_acquire(&ctx->flags) & IORING_SETUP_R_DISABLED))
 		goto out;
 
+	if (unlikely(flags & IORING_ENTER_WAIT_SPARE)) {
+		struct ext_arg ext_arg = { .argsz = argsz };
+
+		ret = -EINVAL;
+		if (to_submit || min_complete ||
+		    (flags & ~IORING_RBC_WAIT_FLAGS))
+			goto out;
+		ret = io_get_ext_arg(ctx, flags, argp, &ext_arg);
+		if (!ret)
+			ret = io_rbc_wait_spare(ctx, flags, &ext_arg);
+		goto out;
+	}
+	if (unlikely(rcu_access_pointer(ctx->rbc_reg)))
+		io_rbc_enter(ctx);
+
 	if (io_has_loop_ops(ctx)) {
 		ret = io_run_loop(ctx);
 		goto out;
@@ -2818,6 +2835,8 @@ iopoll_locked:
 		}
 	}
 out:
+	if (unlikely(rcu_access_pointer(ctx->rbc_reg)))
+		io_rbc_enter_done(ctx);
 	if (!(flags & IORING_ENTER_REGISTERED_RING))
 		fput(file);
 	return ret;

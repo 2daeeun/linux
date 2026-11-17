@@ -576,6 +576,8 @@ struct io_sqring_offsets {
 #define IORING_SQ_NEED_WAKEUP	(1U << 0) /* needs io_uring_enter wakeup */
 #define IORING_SQ_CQ_OVERFLOW	(1U << 1) /* CQ ring is overflown */
 #define IORING_SQ_TASKRUN	(1U << 2) /* task should enter the kernel */
+/* RingBack-Count: the kernel asks this ring's worker to take no new requests */
+#define IORING_SQ_RB_CROWDED	(1U << 3)
 
 struct io_cqring_offsets {
 	__u32 head;
@@ -607,6 +609,7 @@ struct io_cqring_offsets {
 #define IORING_ENTER_ABS_TIMER		(1U << 5)
 #define IORING_ENTER_EXT_ARG_REG	(1U << 6)
 #define IORING_ENTER_NO_IOWAIT		(1U << 7)
+#define IORING_ENTER_WAIT_SPARE		(1U << 8)
 
 /*
  * Passed in for io_uring_setup(2). Copied back with updated info on success
@@ -645,6 +648,7 @@ struct io_uring_params {
 #define IORING_FEAT_MIN_TIMEOUT		(1U << 15)
 #define IORING_FEAT_RW_ATTR		(1U << 16)
 #define IORING_FEAT_NO_IOWAIT		(1U << 17)
+#define IORING_FEAT_RB_WORKER		(1U << 18)
 
 /*
  * io_uring_register(2) opcodes and arguments
@@ -723,12 +727,24 @@ enum io_uring_register_op {
 	/* register bpf filtering programs */
 	IORING_REGISTER_BPF_FILTER		= 37,
 
+	/* register/unregister this ring's RingBack-Count worker */
+	IORING_REGISTER_RB_WORKER		= 38,
+	IORING_UNREGISTER_RB_WORKER		= 39,
+
 	/* this goes last */
 	IORING_REGISTER_LAST,
 
 	/* flag added to the opcode to use a registered ring fd */
 	IORING_REGISTER_USE_REGISTERED_RING	= 1U << 31
 };
+
+/* argument of IORING_REGISTER_RB_WORKER, nr_args == 1 */
+struct io_uring_rb_worker_reg {
+	__u32	flags;		/* IORING_RB_WORKER_* */
+	__u32	resv[3];
+};
+
+#define IORING_RB_WORKER_BASE	(1U << 0)	/* never asked to park */
 
 /* io-wq worker categories */
 enum io_wq_type {

@@ -35,6 +35,7 @@
 #include "cancel.h"
 #include "rw.h"
 #include "sqpoll.h"
+#include "rbcount.h"
 
 #define IORING_SQPOLL_CAP_ENTRIES_VALUE 8
 #define IORING_TW_CAP_ENTRIES_VALUE	32
@@ -1514,6 +1515,8 @@ static void io_rbk_rescue(struct callback_head *cb)
 	io_submit_flush_completions(ctx);
 	mutex_unlock(&ctx->uring_lock);
 	if (ret > 0) {
+		if (unlikely(rcu_access_pointer(ctx->rbc_reg)))
+			io_rbc_activity(ctx);
 		atomic64_add(ret, &rbk->submitted);
 		if (wq_has_sleeper(&ctx->sqo_sq_wait))
 			wake_up(&ctx->sqo_sq_wait);
@@ -2161,6 +2164,8 @@ static int __io_sq_thread(struct io_ring_ctx *ctx, struct io_sq_data *sqd,
 		} else {
 			mutex_unlock(&ctx->uring_lock);
 		}
+		if (ret > 0 && unlikely(rcu_access_pointer(ctx->rbc_reg)))
+			io_rbc_activity(ctx);
 
 		if (to_submit && wq_has_sleeper(&ctx->sqo_sq_wait))
 			wake_up(&ctx->sqo_sq_wait);

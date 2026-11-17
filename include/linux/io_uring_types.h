@@ -12,6 +12,7 @@
 struct iou_loop_params;
 struct io_uring_bpf_ops;
 struct io_ringback;
+struct io_rbc_reg;
 
 enum {
 	/*
@@ -146,6 +147,7 @@ struct io_uring_task {
 	const struct io_ring_ctx 	*last;
 	struct task_struct		*task;
 	struct io_wq			*io_wq;
+	struct io_rbc_reg		*rbc_reg; /* protected by io_rbc_mutex */
 	/*
 	 * Consumer cursor for ->task_list. Only popped by the task itself,
 	 * or by ->fallback_work once the task can no longer run task_work.
@@ -350,6 +352,7 @@ struct io_ring_ctx {
 		struct task_struct	*ringback_owner;
 		struct io_uring_task	*ringback_owner_tctx;
 		struct io_ringback	*ringback;
+		struct io_rbc_reg __rcu	*rbc_reg;
 		struct io_rings		*rings;
 		/* cache of ->restrictions.bpf_filters->filters */
 		struct io_bpf_filter __rcu	**bpf_filters;

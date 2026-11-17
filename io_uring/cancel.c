@@ -20,6 +20,7 @@
 #include "futex.h"
 #include "cancel.h"
 #include "wait.h"
+#include "rbcount.h"
 
 struct io_cancel {
 	struct file			*file;
@@ -439,6 +440,7 @@ bool io_match_task_safe(struct io_kiocb *head, struct io_uring_task *tctx,
 
 void __io_uring_cancel(bool cancel_all)
 {
+	io_rbc_task_exit();
 	io_uring_unreg_ringfd();
 	io_uring_cancel_generic(cancel_all, NULL);
 }

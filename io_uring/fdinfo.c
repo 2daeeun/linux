@@ -13,6 +13,7 @@
 #include "filetable.h"
 #include "sqpoll.h"
 #include "fdinfo.h"
+#include "rbcount.h"
 #include "cancel.h"
 #include "rsrc.h"
 #include "opdef.h"
@@ -270,4 +271,6 @@ __cold void io_uring_show_fdinfo(struct seq_file *m, struct file *file)
 		__io_uring_show_fdinfo(ctx, m);
 		mutex_unlock(&ctx->uring_lock);
 	}
+	/* RingBack-Count state needs no uring_lock; print it even if busy. */
+	io_rbc_fdinfo(ctx, m);
 }
