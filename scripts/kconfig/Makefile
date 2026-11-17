@@ -168,6 +168,9 @@ common-objs	:= confdata.o expr.o lexer.lex.o menu.o parser.tab.o \
 
 $(obj)/lexer.lex.o: $(obj)/parser.tab.h
 HOSTCFLAGS_lexer.lex.o	:= -I $(src)
+# flex 2.6.10 defines the backing-up variables even when the scanner never
+# backs up, and the kconfig scanner does not
+HOSTCFLAGS_lexer.lex.o	+= -Wno-unused-variable
 HOSTCFLAGS_parser.tab.o	:= -I $(src)
 
 # conf: Used for defconfig, oldconfig and related targets
