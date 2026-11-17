@@ -20,6 +20,7 @@ extern int nr_processes(void);
 extern unsigned int nr_running(void);
 extern bool single_task_running(void);
 extern bool single_task_runnable(void);
+extern unsigned int sched_cpu_busy_nr(int cpu);
 extern unsigned int nr_iowait(void);
 extern unsigned int nr_iowait_cpu(int cpu);
 

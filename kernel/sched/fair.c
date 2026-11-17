@@ -6595,6 +6595,8 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
 
 static void set_delayed(struct sched_entity *se)
 {
+	int idle;
+
 	/*
 	 * Delayed se of cfs_rq have no tasks queued on them.
 	 * Do not adjust h_nr_runnable since __dequeue_task()
@@ -6616,16 +6618,23 @@ static void set_delayed(struct sched_entity *se)
 	 */
 	pref_llc_running_dec(rq_of(cfs_rq_of(se)), task_of(se));
 	se->sched_delayed = 1;
+	idle = task_has_idle_policy(task_of(se));
 
 	for_each_sched_entity(se) {
 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
 
 		cfs_rq->h_nr_runnable--;
+		if (idle)
+			cfs_rq->h_nr_idle_runnable--;
+		if (cfs_rq_is_idle(cfs_rq))
+			idle = 1;
 	}
 }
 
 static void clear_delayed(struct sched_entity *se)
 {
+	int idle;
+
 	se->sched_delayed = 0;
 
 	/*
@@ -6643,11 +6652,16 @@ static void clear_delayed(struct sched_entity *se)
 	 * this does nothing.
 	 */
 	pref_llc_running_inc(rq_of(cfs_rq_of(se)), task_of(se));
+	idle = task_has_idle_policy(task_of(se));
 
 	for_each_sched_entity(se) {
 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
 
 		cfs_rq->h_nr_runnable++;
+		if (idle)
+			cfs_rq->h_nr_idle_runnable++;
+		if (cfs_rq_is_idle(cfs_rq))
+			idle = 1;
 	}
 }
 
@@ -8183,6 +8197,8 @@ static unsigned long enqueue_hierarchy(struct task_struct *p, int flags)
 		cfs_rq->h_nr_runnable += h_nr_runnable;
 		cfs_rq->h_nr_queued++;
 		cfs_rq->h_nr_idle += h_nr_idle;
+		if (h_nr_idle)
+			cfs_rq->h_nr_idle_runnable += h_nr_runnable;
 
 		if (cfs_rq_is_idle(cfs_rq))
 			h_nr_idle = 1;
@@ -8324,6 +8340,8 @@ static void dequeue_hierarchy(struct task_struct *p, int flags)
 		cfs_rq->h_nr_runnable -= h_nr_runnable;
 		cfs_rq->h_nr_queued--;
 		cfs_rq->h_nr_idle -= h_nr_idle;
+		if (h_nr_idle)
+			cfs_rq->h_nr_idle_runnable -= h_nr_runnable;
 
 		if (cfs_rq_is_idle(cfs_rq))
 			h_nr_idle = 1;
@@ -15791,6 +15809,7 @@ int sched_group_set_idle(struct task_group *tg, long idle)
 		struct cfs_rq *grp_cfs_rq = tg_cfs_rq(tg, i);
 		bool was_idle = cfs_rq_is_idle(grp_cfs_rq);
 		long idle_task_delta;
+		long idle_runnable_delta;
 		struct rq_flags rf;
 
 		rq_lock_irqsave(rq, &rf);
@@ -15801,8 +15820,12 @@ int sched_group_set_idle(struct task_group *tg, long idle)
 
 		idle_task_delta = grp_cfs_rq->h_nr_queued -
 				  grp_cfs_rq->h_nr_idle;
-		if (!cfs_rq_is_idle(grp_cfs_rq))
+		idle_runnable_delta = grp_cfs_rq->h_nr_runnable -
+				      grp_cfs_rq->h_nr_idle_runnable;
+		if (!cfs_rq_is_idle(grp_cfs_rq)) {
 			idle_task_delta *= -1;
+			idle_runnable_delta *= -1;
+		}
 
 		for_each_sched_entity(se) {
 			struct cfs_rq *cfs_rq = cfs_rq_of(se);
@@ -15811,6 +15834,7 @@ int sched_group_set_idle(struct task_group *tg, long idle)
 				break;
 
 			cfs_rq->h_nr_idle += idle_task_delta;
+			cfs_rq->h_nr_idle_runnable += idle_runnable_delta;
 
 			/* Already accounted at parent level and above. */
 			if (cfs_rq_is_idle(cfs_rq))

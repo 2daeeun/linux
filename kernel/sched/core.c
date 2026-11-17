@@ -5585,6 +5585,22 @@ bool single_task_runnable(void)
 }
 EXPORT_SYMBOL(single_task_runnable);
 
+/*
+ * RingBack-Count: tasks queued on @cpu that are neither idle-class nor in
+ * delayed dequeue. A lockless sample of a remote run queue.
+ */
+unsigned int sched_cpu_busy_nr(int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	s64 nr;
+
+	nr = (s64)READ_ONCE(rq->nr_running) -
+		READ_ONCE(rq->cfs.h_nr_queued) +
+		READ_ONCE(rq->cfs.h_nr_runnable) -
+		READ_ONCE(rq->cfs.h_nr_idle_runnable);
+	return nr > 0 ? nr : 0;
+}
+
 unsigned long long nr_context_switches_cpu(int cpu)
 {
 	return cpu_rq(cpu)->nr_switches;
