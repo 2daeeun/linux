@@ -4,6 +4,7 @@
 #include <linux/hashtable.h>
 #include <linux/hrtimer.h>
 #include <linux/kernel.h>
+#include <linux/kernel_stat.h>
 #include <linux/math64.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
@@ -76,6 +77,13 @@ struct io_rbc_group {
 	u32			holdg_r;
 	u8			*excl_k;
 	u64			*excl_since, *excl_set_ns;
+	/*
+	 * Per CPU: since when it has been free without a break. Samples alone
+	 * cannot tell: a worker that is busy most of the time still leaves its
+	 * CPU empty at some samples. A CPU counts as continuously free only
+	 * while its context switch count stays the same between samples.
+	 */
+	u64			*free_since, *free_sw;
 	u8			*nbuf;
 	/* Updated under lock, sampled by fdinfo with data_race(). */
 	u64 parks, refusals, grants, bits, rotations, settles, excl_marks;
@@ -182,7 +190,7 @@ static void io_rbc_stop(struct io_rbc_group *g, u64 now)
 }
 
 struct io_rbc_scan {
-	bool over, spare, same_free;
+	bool over, spare, same_free, held;
 	int first_free;
 };
 
@@ -193,6 +201,7 @@ static struct io_rbc_scan io_rbc_scan(struct io_rbc_group *g, u64 now)
 	struct io_rbc_reg *reg;
 	u64 mine = 0, free = 0;
 	u64 start = ktime_get_ns();
+	u64 hold = io_rbc_ns(READ_ONCE(sqpoll_safe_count_hold_us));
 	bool crowded = false;
 	int cpu;
 
@@ -234,11 +243,22 @@ static struct io_rbc_scan io_rbc_scan(struct io_rbc_group *g, u64 now)
 		if (n >= 2 && !excluded)
 			crowded = true;
 		if (!n) {
+			u64 sw = nr_context_switches_cpu(cpu);
+
 			free |= BIT_ULL(i);
 			if (scan.first_free < 0)
 				scan.first_free = cpu;
 			if (g->free_cpu == cpu)
 				scan.same_free = true;
+			/* Any task that ran here since the last sample switched in. */
+			if (!g->free_since[cpu] || g->free_sw[cpu] != sw) {
+				g->free_since[cpu] = now;
+				g->free_sw[cpu] = sw;
+			}
+			if (now - g->free_since[cpu] >= hold)
+				scan.held = true;
+		} else {
+			g->free_since[cpu] = 0;
 		}
 	}
 	for (i = 0; i < nr; i++) {
@@ -351,7 +371,7 @@ static bool io_rbc_eval(struct io_rbc_group *g, u64 now, bool entry)
 			io_rbc_clear_bit(g);
 	}
 	if (!list_empty(&g->waitq) && scan.spare) {
-		if (!g->free_run || !scan.same_free) {
+		if (!g->free_run) {
 			g->free_run = true;
 			g->free_cpu = scan.first_free;
 			g->free_start_ns = now;
@@ -359,7 +379,11 @@ static bool io_rbc_eval(struct io_rbc_group *g, u64 now, bool entry)
 	} else {
 		g->free_run = false;
 	}
-	if (!entry && g->free_run && !list_empty(&g->waitq) &&
+	/*
+	 * Grant when spare has been seen at every sample for the hold time and
+	 * one CPU has been free for the hold time without a break.
+	 */
+	if (!entry && g->free_run && scan.held && !list_empty(&g->waitq) &&
 	    now - g->free_start_ns >=
 	    io_rbc_ns(READ_ONCE(sqpoll_safe_count_hold_us)) &&
 	    now - g->last_grant_ns >= io_rbc_holdg(g)) {
@@ -497,6 +521,8 @@ out:
 static void io_rbc_free_arrays(struct io_rbc_group *g)
 {
 	kfree(g->nbuf);
+	kfree(g->free_sw);
+	kfree(g->free_since);
 	kfree(g->excl_set_ns);
 	kfree(g->excl_since);
 	kfree(g->excl_k);
@@ -521,8 +547,11 @@ static struct io_rbc_group *io_rbc_alloc_group(void)
 	g->excl_k = kcalloc(nr_cpu_ids, sizeof(*g->excl_k), GFP_KERNEL);
 	g->excl_since = kcalloc(nr_cpu_ids, sizeof(*g->excl_since), GFP_KERNEL);
 	g->excl_set_ns = kcalloc(nr_cpu_ids, sizeof(*g->excl_set_ns), GFP_KERNEL);
+	g->free_since = kcalloc(nr_cpu_ids, sizeof(*g->free_since), GFP_KERNEL);
+	g->free_sw = kcalloc(nr_cpu_ids, sizeof(*g->free_sw), GFP_KERNEL);
 	g->nbuf = kcalloc(nr_cpu_ids, sizeof(*g->nbuf), GFP_KERNEL);
-	if (!g->excl_k || !g->excl_since || !g->excl_set_ns || !g->nbuf)
+	if (!g->excl_k || !g->excl_since || !g->excl_set_ns || !g->free_since ||
+	    !g->free_sw || !g->nbuf)
 		goto free_arrays;
 	spin_lock_init(&g->lock);
 	INIT_LIST_HEAD(&g->regs);
