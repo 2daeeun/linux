@@ -286,17 +286,30 @@ static struct io_rbc_scan io_rbc_scan(struct io_rbc_group *g, u64 now)
 	return scan;
 }
 
+/*
+ * The extra worker to shrink next: one that is on a CPU now if there is one
+ * (it reaches its next request boundary soonest; a worker waiting on a run
+ * queue cannot act on the bit until it runs), the most recently started or
+ * granted among equals.
+ */
 static struct io_rbc_reg *io_rbc_victim(struct io_rbc_group *g,
 					struct io_rbc_reg *exclude)
 {
 	struct io_rbc_reg *reg, *victim = NULL;
+	bool victim_cur = false;
 
 	list_for_each_entry(reg, &g->regs, node) {
+		bool cur;
+
 		if (reg == exclude || (reg->flags & IORING_RB_WORKER_BASE) ||
 		    reg->queued || !io_rbc_runnable(reg->task))
 			continue;
-		if (!victim || reg->start_ns > victim->start_ns)
+		cur = READ_ONCE(reg->task->on_cpu);
+		if (!victim || (cur && !victim_cur) ||
+		    (cur == victim_cur && reg->start_ns > victim->start_ns)) {
 			victim = reg;
+			victim_cur = cur;
+		}
 	}
 	return victim;
 }
@@ -484,6 +497,24 @@ void io_rbc_activity(struct io_ring_ctx *ctx)
 	if (reg)
 		io_rbc_note_activity(reg->grp);
 	rcu_read_unlock();
+}
+
+/*
+ * Workers first: while workers of this ring's group are parked in WAIT_SPARE,
+ * a CPU that becomes free is for the longest-waiting worker, not for a
+ * poller. RingBack keeps the ring in OWNER mode meanwhile. A lockless sample.
+ */
+bool io_rbc_has_waiters(struct io_ring_ctx *ctx)
+{
+	struct io_rbc_reg *reg;
+	bool ret = false;
+
+	rcu_read_lock();
+	reg = rcu_dereference(ctx->rbc_reg);
+	if (reg)
+		ret = !list_empty_careful(&reg->grp->waitq);
+	rcu_read_unlock();
+	return ret;
 }
 
 void io_rbc_enter_done(struct io_ring_ctx *ctx)

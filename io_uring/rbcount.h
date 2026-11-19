@@ -22,6 +22,7 @@ void io_rbc_ctx_exit(struct io_ring_ctx *ctx);
 void io_rbc_enter(struct io_ring_ctx *ctx);
 void io_rbc_enter_done(struct io_ring_ctx *ctx);
 void io_rbc_activity(struct io_ring_ctx *ctx);
+bool io_rbc_has_waiters(struct io_ring_ctx *ctx);
 int io_rbc_wait_spare(struct io_ring_ctx *ctx, u32 flags,
 		      struct ext_arg *ext_arg);
 void io_rbc_fdinfo(struct io_ring_ctx *ctx, struct seq_file *m);

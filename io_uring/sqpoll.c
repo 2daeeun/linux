@@ -489,6 +489,9 @@ void io_ringback_idle_scan(struct io_ring_ctx *ctx)
 	if (!rbk || !READ_ONCE(ringback_idlewake) || io_rbk_policy_fixed() ||
 	    READ_ONCE(rbk->idle_hint) >= 0)
 		return;
+	/* RingBack-Count: an idle CPU goes to a parked worker first. */
+	if (io_rbc_has_waiters(ctx))
+		return;
 	now = ktime_get_ns();
 	if (now - READ_ONCE(rbk->idle_scan_ns) <
 	    (u64)READ_ONCE(ringback_idlewake_us) * NSEC_PER_USEC ||
@@ -2272,7 +2275,7 @@ static u64 io_rbk_check_ns(void);
 
 static bool io_rbk_try_poll(struct io_ringback *rbk)
 {
-	bool resume = false, stalled, contended;
+	bool resume = false, stalled, contended, workers_first;
 	u64 now;
 
 	mutex_lock(&rbk->policy_lock);
@@ -2354,8 +2357,16 @@ static bool io_rbk_try_poll(struct io_ringback *rbk)
 			resume = true;
 		}
 	}
+	/*
+	 * RingBack-Count: while workers of this ring's group are parked, a free
+	 * CPU is theirs; do not return to POLL mode (a stalled owner and a
+	 * stopping ring still hand over).
+	 */
+	workers_first = io_rbc_has_waiters(rbk->ctx);
+	if (workers_first)
+		resume = false;
 	if (test_bit(IO_RBK_STOPPING, &rbk->state) || stalled || resume ||
-	    (!io_rbk_policy_fixed() &&
+	    (!workers_first && !io_rbk_policy_fixed() &&
 	     rbk->idle_checks >= io_rbk_checks() &&
 	     now - rbk->idle_start >=
 	     (u64)READ_ONCE(ringback_hold_us) * NSEC_PER_USEC)) {
